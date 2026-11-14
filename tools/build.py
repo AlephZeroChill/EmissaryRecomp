@@ -202,8 +202,8 @@ def build_game(args, game, build):
         (build / 'native/CMakeCache.txt').unlink(missing_ok=True)
     compilers_stamp.write_text(compilers)
     run(args.cmake, '-S', wc / 'runtime', '-B', build / 'native', '-G', 'Ninja',
-        '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={shutil.which("clang")}',
-        f'-DCMAKE_CXX_COMPILER={shutil.which("clang++")}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}', *args.native_arg)
+        '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={Path(shutil.which("clang")).as_posix()}',
+        f'-DCMAKE_CXX_COMPILER={Path(shutil.which("clang++")).as_posix()}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}', *args.native_arg)
     run(args.cmake, '--build', build / 'native', '--target', 'WiiCompiled', '--parallel', args.jobs)
     # Portable like Play\: settings, saves and logs go to native/UserData, whose config points the game at the disc.
     (build / 'native/portable.txt').write_text('Settings, saves and logs stay in the UserData folder next to this file.\n')
