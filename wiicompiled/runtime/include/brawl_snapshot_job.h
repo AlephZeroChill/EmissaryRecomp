@@ -15,6 +15,9 @@
 /* ---- MSVC / portability shims ------------------------------------------- */
 #ifdef _MSC_VER
 #include <intrin.h>
+#endif
+#ifdef _WIN32
+/* The Windows C runtimes (MSVC's and the UCRT that llvm-mingw links) have no C11 aligned_alloc. */
 #include <malloc.h>
 #define JOB_ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
 #define JOB_ALIGNED_FREE(ptr) _aligned_free(ptr)
