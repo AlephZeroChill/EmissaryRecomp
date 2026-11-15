@@ -266,7 +266,9 @@ bool GuestFiberManager::CreateGuestFiber(uint32_t guestThreadAddr, uint32_t entr
     // it can exhaust the guarded coroutine stack as unrelated host work (such
     // as a window resize) adds a little more nesting. Keep enough headroom for
     // those chains while the guest stack remains separately bounded.
-    constexpr size_t kHostStackSize = 1024 * 1024;
+    // Brawl Online's core runs on the game's threads at its hooks (the session, the bridge's
+    // requests): room for its frames on top of the guest's.
+    constexpr size_t kHostStackSize = 8 * 1024 * 1024;
     gf.fiber = HostContext::Create(kHostStackSize, FiberProc,
                                    reinterpret_cast<void*>(static_cast<uintptr_t>(guestThreadAddr)));
     

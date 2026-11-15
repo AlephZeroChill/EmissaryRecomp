@@ -306,7 +306,6 @@ void Run(CpuContext* ctx, uint32_t entry) {
             for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
             if(BrawlOnlineCore::FrameEnd(ctx)) {f.pc=0x80017508u;continue;}
         }
-        if(coreEnabled && pc==0x8002BA84u) BrawlOnlineCore::PadThreadUpdated(ctx);
         if(rollbackLoopDepth && pc==0x80017508u) {
             for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
             if(coreEnabled) BrawlOnlineCore::LoopEnd(ctx);

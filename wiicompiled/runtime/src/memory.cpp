@@ -293,6 +293,12 @@ GuestFlat::Backing ClassifyBacking(uint32_t baseAddress) {
          baseAddress < Memory::kMem1UncachedBase + Memory::kMem1Size)) {
         return GuestFlat::Backing::Mem1;
     }
+    // MEM1's mirrors (Config::WiiDefaults): every 32 MiB of 0x80000000-0x87FFFFFF and 0xC0000000-0xC7FFFFFF.
+    if (((baseAddress & 0xF8000000u) == Memory::kMem1CachedBase ||
+         (baseAddress & 0xF8000000u) == Memory::kMem1UncachedBase) &&
+        (baseAddress & 0x01FFFFFFu) < Memory::kMem1Size) {
+        return GuestFlat::Backing::Mem1;
+    }
 
     // Expanded MEM2 holds Brawl's prelinked modules above the retail 64 MiB.
     // Physical, cached and uncached views alias the same backing.
@@ -385,6 +391,25 @@ Memory::Config Memory::Config::WiiDefaults() {
         .baseAddress = Memory::kMem1UncachedBase,
         .sizeBytes = Memory::kMem1Size,
     });
+
+    // MEM1's mirrors, as Dolphin has them: an effective address in 0x80000000-0x87FFFFFF (or
+    // 0xC0000000-0xC7FFFFFF) reads MEM1 at its low 25 bits (Dolphin's MMU masks a physical address
+    // below 0x08000000 with its 32 MiB RAM mask). Brawl reads one: leaving a stage select with no
+    // port that pressed (P+ online's automatic A), it indexes a table at 0x806B91C8 by a pad
+    // status read from port -1, 0x805BA480 * 8, i.e. 0x8348B5C8 = MEM1 0x0148B5C8 on Dolphin,
+    // and the value read decides a branch. Views of the same backing, so nothing new to snapshot.
+    for (uint32_t mirror = 0x02000000u; mirror < 0x08000000u; mirror += 0x02000000u) {
+        config.regions.push_back(RegionConfig{
+            .name = "MEM1_MIRROR",
+            .baseAddress = Memory::kMem1CachedBase + mirror,
+            .sizeBytes = Memory::kMem1Size,
+        });
+        config.regions.push_back(RegionConfig{
+            .name = "MEM1_UNCACHED_MIRROR",
+            .baseAddress = Memory::kMem1UncachedBase + mirror,
+            .sizeBytes = Memory::kMem1Size,
+        });
+    }
 
     config.regions.push_back(RegionConfig{
         .name = "MEM2_PHYS",

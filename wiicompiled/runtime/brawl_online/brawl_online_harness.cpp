@@ -12,17 +12,20 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <dbghelp.h>
 using Socket = SOCKET;
 #else
 #include <arpa/inet.h>
@@ -41,6 +44,7 @@ using Socket = int;
 #include "BrawlOnline/Online/OnlineClient.h"
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Online/Rooms.h"
+#include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
 
 namespace B = BrawlOnlineBridge;
@@ -131,6 +135,90 @@ std::string Hex(const uint8_t* p, size_t n) {
     return s;
 }
 
+std::vector<uint8_t> FromHex(const std::string& h) {
+    if (h.size() % 2) throw Error("odd hex length");
+    std::vector<uint8_t> out(h.size() / 2);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = uint8_t(std::stoul(h.substr(2 * i, 2), nullptr, 16));
+    return out;
+}
+
+bool Bool(const Object& o, const char* key, bool def) {
+    const picojson::value* v = Find(o, key);
+    if (!v) return def;
+    if (v->is<bool>()) return v->get<bool>();
+    if (v->is<double>()) return v->get<double>() != 0;
+    throw Error(std::string("'") + key + "' must be a boolean");
+}
+
+// game_pads (HarnessServer.cpp CmdGamePads): the match's pads, recorded and injected per frame.
+Object GamePads(const Object& a) {
+    if (Find(a, "record")) Gprb::PadsSetRecording(Bool(a, "record", false));
+    if (Bool(a, "clear", false)) Gprb::PadsInjectClear();
+    if (const picojson::value* rows = Find(a, "inject")) {
+        if (!rows->is<picojson::array>()) throw Error("'inject' must be a list of [frame, hex]");
+        for (const auto& rv : rows->get<picojson::array>()) {
+            if (!rv.is<picojson::array>() || rv.get<picojson::array>().size() != 2 ||
+                !rv.get<picojson::array>()[1].is<std::string>())
+                throw Error("each inject row must be [frame, hex]");
+            const auto& row = rv.get<picojson::array>();
+            const std::vector<uint8_t> bytes = FromHex(row[1].get<std::string>());
+            if (bytes.size() != Gprb::PAD_SLOTS_SIZE) throw Error("bad inject row");
+            Gprb::PadSlots slots;
+            std::copy(bytes.begin(), bytes.end(), slots.begin());
+            Gprb::PadsInjectAdd(static_cast<u32>(row[0].get<double>()), slots);
+        }
+    }
+    if (Find(a, "ports")) Gprb::PadsInjectSetPorts(static_cast<u32>(U64(a, "ports")));
+    if (Find(a, "anchor")) Gprb::PadsSetAnchor(static_cast<u32>(U64(a, "anchor")));
+    Object r;
+    if (Find(a, "since")) {
+        picojson::array out;
+        for (const auto& [frame, slots] : Gprb::PadsRecorded(static_cast<u32>(U64(a, "since")))) {
+            picojson::array row;
+            row.emplace_back(Num(frame));
+            row.emplace_back(picojson::value(Hex(slots.data(), slots.size())));
+            out.emplace_back(std::move(row));
+        }
+        r["rows"] = picojson::value(std::move(out));
+    }
+    r["injected"] = Num(Gprb::PadsInjectedCount());
+    return r;
+}
+
+// frame_trace (HarnessServer.cpp CmdFrameTrace): [game_frame, persistent, logic_steps, ticks,
+// rng x3, fighters_crc, range_hash, game_set, resim, fighters].
+Object FrameTrace(const Object& a) {
+    std::optional<u32> epoch;
+    if (Find(a, "epoch")) epoch = static_cast<u32>(U64(a, "epoch"));
+    const auto rows = Gprb::FrameTraceRows(epoch, static_cast<u32>(U64(a, "since", 0)),
+                                           static_cast<u32>(U64(a, "max", 0)));
+    picojson::array out;
+    out.reserve(rows.size());
+    char hash[24];
+    for (const auto& t : rows) {
+        picojson::array row;
+        row.emplace_back(Num(t.game_frame));
+        row.emplace_back(Num(t.persistent));
+        row.emplace_back(Num(t.logic_steps));
+        row.emplace_back(Num(double(t.ticks)));
+        for (u32 v : t.rng) row.emplace_back(Num(v));
+        row.emplace_back(Num(t.fighters_crc));
+        std::snprintf(hash, sizeof(hash), "%016llx", (unsigned long long)t.range_hash);
+        row.emplace_back(picojson::value(std::string(hash)));
+        row.emplace_back(Num(t.game_set));
+        row.emplace_back(picojson::value(t.resim));
+        picojson::array f;
+        for (const auto& port : t.fighters)
+            for (u32 v : port) f.emplace_back(Num(v));
+        row.emplace_back(picojson::value(std::move(f)));
+        out.emplace_back(std::move(row));
+    }
+    Object r;
+    r["epoch"] = Num(Gprb::FrameTraceEpoch());
+    r["rows"] = picojson::value(std::move(out));
+    return r;
+}
+
 Object Status() {
     Object r;
     const uint64_t polls = s_polls.load();
@@ -149,7 +237,12 @@ Object Status() {
 }
 
 Object Dispatch(const std::string& cmd, const Object& a) {
-    if (cmd == "ping" || cmd == "hello") return {};
+    if (cmd == "ping" || cmd == "hello") {
+        Object r;
+        r["pong"] = picojson::value(true);
+        r["version"] = Num(1);  // Dolphin's harness protocol, v1
+        return r;
+    }
     if (cmd == "status") return Status();
     if (cmd == "read_mem" || cmd == "read_u32") {
         const uint32_t addr = uint32_t(U64(a, "addr"));
@@ -225,10 +318,31 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         return r;
     }
     if (cmd == "gprb_status") return Gprb::Session::Status().get<Object>();
+    // The online tests' comparisons (Dolphin's HarnessServer.cpp, the same core calls).
+    if (cmd == "gprb_checksums")
+        return Gprb::Session::Checksums(static_cast<s64>(U64(a, "since", 0))).get<Object>();
+    if (cmd == "game_pads") return GamePads(a);
+    if (cmd == "frame_trace") return FrameTrace(a);
+    if (cmd == "frame_trace_config") {
+        std::vector<std::pair<u32, u32>> ranges;
+        if (const picojson::value* r = Find(a, "ranges"); r && r->is<picojson::array>()) {
+            for (const auto& e : r->get<picojson::array>()) {
+                const auto& v = e.get<picojson::array>();
+                if (v.size() != 2) throw Error("ranges entries must be [addr, size]");
+                ranges.emplace_back(static_cast<u32>(v[0].get<double>()), static_cast<u32>(v[1].get<double>()));
+            }
+        }
+        Gprb::FrameTraceConfigure(Bool(a, "enabled", true), std::move(ranges));
+        return Object{};
+    }
     if (cmd == "game_bridge_status") return Online::GameBridge::Status();
     if (cmd == "rooms_status") return Online::Rooms::Status();
     if (cmd == "online_status") return Online::Client::OnlineStatus();
     if (cmd == "mm_status") return Online::Client::MatchmakingStatus();
+    if (cmd == "mm_cancel") {
+        Online::Client::Cleanup();
+        return Online::Client::MatchmakingStatus();
+    }
     if (cmd == "online_session_backend") {
         if (const auto error = Online::Session::Select(Str(a, "backend"))) throw Error(*error);
         return Online::Client::MatchmakingStatus();
@@ -250,6 +364,61 @@ Object Dispatch(const std::string& cmd, const Object& a) {
     throw Error("unknown command " + cmd);
 }
 
+// One connection: JSON lines in, JSON lines out (Dolphin's harness framing).
+void ServeClient(Socket c) {
+    int yes = 1;
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes));
+    std::fprintf(stderr, "[brawl-online] harness: client connected\n");
+    std::string buf;
+    char chunk[65536];
+    int n = 0;
+    for (;;) {
+        n = int(recv(c, chunk, sizeof(chunk), 0));
+        if (n <= 0) break;
+        buf.append(chunk, size_t(n));
+        size_t nl;
+        while ((nl = buf.find('\n')) != std::string::npos) {
+            const std::string line = buf.substr(0, nl);
+            buf.erase(0, nl + 1);
+            picojson::value req;
+            const std::string perr = picojson::parse(req, line);
+            Object resp;
+            if (!perr.empty() || !req.is<Object>()) {
+                resp["ok"] = picojson::value(false);
+                resp["error"] = picojson::value("request must be a JSON object");
+            } else {
+                const Object& o = req.get<Object>();
+                if (const auto* id = Find(o, "id")) resp["id"] = *id;
+                try {
+                    const auto cmd = o.find("cmd");
+                    resp["result"] = picojson::value(Dispatch(cmd != o.end() ? cmd->second.to_str() : "", o));
+                    resp["ok"] = picojson::value(true);
+                } catch (const std::exception& e) {
+                    resp["ok"] = picojson::value(false);
+                    resp["error"] = picojson::value(std::string(e.what()));
+                } catch (...) {
+                    resp["ok"] = picojson::value(false);
+                    resp["error"] = picojson::value("unknown error");
+                }
+            }
+            const std::string out = picojson::value(resp).serialize() + "\n";
+            size_t sent = 0;
+            while (sent < out.size()) {
+                const int k = int(send(c, out.data() + sent, int(out.size() - sent), 0));
+                if (k <= 0) break;
+                sent += size_t(k);
+            }
+        }
+    }
+#ifdef _WIN32
+    const int err = n < 0 ? WSAGetLastError() : 0;
+#else
+    const int err = n < 0 ? errno : 0;
+#endif
+    std::fprintf(stderr, "[brawl-online] harness: client gone (recv %d, error %d)\n", n, err);
+    closesocket(c);
+}
+
 void Serve(uint16_t port) {
 #ifdef _WIN32
     WSADATA wsa;
@@ -262,7 +431,7 @@ void Serve(uint16_t port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(listener, 1) != 0) {
+    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(listener, 8) != 0) {
         std::fprintf(stderr, "[brawl-online] harness: cannot listen on 127.0.0.1:%u\n", port);
         return;
     }
@@ -270,45 +439,162 @@ void Serve(uint16_t port) {
     for (;;) {
         const Socket c = accept(listener, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
-        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes));
-        std::string buf;
-        char chunk[65536];
-        for (;;) {
-            const int n = int(recv(c, chunk, sizeof(chunk), 0));
-            if (n <= 0) break;
-            buf.append(chunk, size_t(n));
-            size_t nl;
-            while ((nl = buf.find('\n')) != std::string::npos) {
-                const std::string line = buf.substr(0, nl);
-                buf.erase(0, nl + 1);
-                picojson::value req;
-                const std::string perr = picojson::parse(req, line);
-                Object resp;
-                if (!perr.empty() || !req.is<Object>()) {
-                    resp["ok"] = picojson::value(false);
-                    resp["error"] = picojson::value("request must be a JSON object");
-                } else {
-                    const Object& o = req.get<Object>();
-                    if (const auto* id = Find(o, "id")) resp["id"] = *id;
-                    try {
-                        resp["result"] = picojson::value(Dispatch(o.count("cmd") ? o.at("cmd").to_str() : "", o));
-                        resp["ok"] = picojson::value(true);
-                    } catch (const std::exception& e) {
-                        resp["ok"] = picojson::value(false);
-                        resp["error"] = picojson::value(std::string(e.what()));
-                    }
-                }
-                const std::string out = picojson::value(resp).serialize() + "\n";
-                send(c, out.data(), int(out.size()), 0);
-            }
-        }
-        closesocket(c);
+        std::thread(ServeClient, c).detach();
     }
 }
 
 }  // namespace
 
+#ifdef _WIN32
+namespace {
+// An exception nothing before this handles (the runtime's own handlers run first): what and where,
+// and a minidump beside the user folder's logs, for lldb -c.
+LONG CALLBACK LastChanceHandler(EXCEPTION_POINTERS* e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || code == DBG_PRINTEXCEPTION_C ||
+        code == 0xE06D7363 || code == 0x20474343 || (code & 0xF0000000) == 0x40000000)
+        return EXCEPTION_CONTINUE_SEARCH;  // thread names, debug prints, C++ throws (MSVC's, libgcc's "GCC "): not crashes
+    static std::atomic<int> once{0};
+    if (once.fetch_add(1) > 3) return EXCEPTION_CONTINUE_SEARCH;
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto at = reinterpret_cast<uintptr_t>(e->ExceptionRecord->ExceptionAddress);
+    std::fprintf(stderr, "[brawl-online] exception 0x%08lx at 0x%llx (exe+0x%llx) thread %lu", code,
+                 (unsigned long long)at, (unsigned long long)(at - base), GetCurrentThreadId());
+    if (code == EXCEPTION_ACCESS_VIOLATION && e->ExceptionRecord->NumberParameters >= 2)
+        std::fprintf(stderr, " (%s 0x%llx)", e->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                     (unsigned long long)e->ExceptionRecord->ExceptionInformation[1]);
+    void* frames[48];
+    const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    std::fputs(" stack:", stderr);
+    for (USHORT i = 0; i < n; ++i)
+        std::fprintf(stderr, " 0x%llx", (unsigned long long)(reinterpret_cast<uintptr_t>(frames[i]) - base));
+    std::fputs("\n", stderr);
+    std::fflush(stderr);
+    BrawlOnlineBridge::DumpGuestCpu();
+    if (const char* dir = std::getenv("BRAWL_ONLINE_CORE")) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s\\Logs\\recomp-%lu.dmp", dir, GetCurrentProcessId());
+        const HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), e, FALSE};
+            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                              MINIDUMP_TYPE(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory), &mei,
+                              nullptr, nullptr);
+            CloseHandle(f);
+            std::fprintf(stderr, "[brawl-online] minidump %s\n", path);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+}  // namespace
+#endif
+
 namespace BrawlOnlineBridge {
+
+void CoreWatchCrashes() {
+#ifdef _WIN32
+    AddVectoredExceptionHandler(0, LastChanceHandler);
+#endif
+}
+
+void CoreWatchExit() {
+#ifdef _WIN32
+    // Who ends the process: exit()'s caller as offsets in the executable (llvm-symbolizer).
+    std::atexit([] {
+        void* frames[48];
+        const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+        const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        std::fprintf(stderr, "[brawl-online] exit() on thread %lu, stack:", GetCurrentThreadId());
+        for (USHORT i = 0; i < n; ++i)
+            std::fprintf(stderr, " 0x%llx", (unsigned long long)(reinterpret_cast<uintptr_t>(frames[i]) - base));
+        std::fputs("\n", stderr);
+        std::fflush(stderr);
+    });
+#endif
+}
+
+void CoreHoldWinsock() {
+#ifdef _WIN32
+    // Winsock is reference counted per process: a WSACleanup more than its WSAStartups (ENet and
+    // Dolphin's SocketContext pair them per use) closes every socket the program has, the game's
+    // own included. Dolphin's frontend holds references for its whole run; so does this.
+    WSADATA wsa;
+    for (int i = 0; i < 64; ++i) WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+}
+
+// BRAWL_ONLINE_PROFILE=1: a sampling profile of the game's thread (the one at the loop top) into
+// <BRAWL_ONLINE_CORE>/Logs/profile-<pid>.txt every 5 s: per function (start address in its module,
+// from the x64 unwind tables), samples in it (self) and with it on the stack (total). Resolve the
+// executable's offsets with WiiCompiled.map.
+void CoreProfileStart() {
+#ifdef _WIN32
+    static std::atomic<bool> started{false};
+    if (!std::getenv("BRAWL_ONLINE_PROFILE") || started.exchange(true)) return;
+    HANDLE target = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &target,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+        return;
+    const char* dir = std::getenv("BRAWL_ONLINE_CORE");
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s\\Logs\\profile-%lu.txt", dir ? dir : ".", GetCurrentProcessId());
+    std::thread([target, file = std::string(path)] {
+        struct Count { uint64_t self = 0, total = 0; };
+        std::unordered_map<uint64_t, Count> counts;
+        uint64_t samples = 0;
+        auto written = std::chrono::steady_clock::now();
+        std::vector<uint64_t> seen;
+        for (;;) {
+            Sleep(1);
+            if (SuspendThread(target) == DWORD(-1)) return;
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(target, &ctx)) {
+                ++samples;
+                seen.clear();
+                for (int depth = 0; depth < 64 && ctx.Rip; ++depth) {
+                    DWORD64 image = 0;
+                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+                    const uint64_t start = fn ? image + fn->BeginAddress : ctx.Rip;
+                    if (depth == 0) ++counts[start].self;
+                    if (std::find(seen.begin(), seen.end(), start) == seen.end()) {
+                        seen.push_back(start);
+                        ++counts[start].total;
+                    }
+                    if (!fn) {
+                        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                        ctx.Rsp += 8;
+                        continue;
+                    }
+                    void* handler_data = nullptr;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+                }
+            }
+            ResumeThread(target);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - written < std::chrono::seconds(5)) continue;
+            written = now;
+            std::vector<std::pair<uint64_t, Count>> rows(counts.begin(), counts.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second.total > y.second.total; });
+            if (std::FILE* f = std::fopen(file.c_str(), "w")) {
+                std::fprintf(f, "samples %llu\n", (unsigned long long)samples);
+                for (const auto& [addr, c] : rows) {
+                    HMODULE mod = nullptr;
+                    char name[MAX_PATH] = "?";
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(addr), &mod))
+                        GetModuleFileNameA(mod, name, sizeof(name));
+                    const char* base = std::strrchr(name, '\\');
+                    std::fprintf(f, "%8llu %8llu %s+0x%llx\n", (unsigned long long)c.total, (unsigned long long)c.self,
+                                 base ? base + 1 : name, (unsigned long long)(addr - reinterpret_cast<uintptr_t>(mod)));
+                }
+                std::fclose(f);
+            }
+        }
+    }).detach();
+#endif
+}
 
 void CoreHarnessStart() {
     const char* port = std::getenv("BRAWL_ONLINE_HARNESS_PORT");
@@ -330,6 +616,8 @@ void CoreHarnessPads(Pad* pads) {
         for (int port = 0; port < 4; ++port) {
             auto& p = s_ports[size_t(port)];
             B::Pad pad{};
+            // A controller on port 1 only, as Dolphin's harness instances have (its other ports read
+            // "no controller", error 0xFF): the game's pad memory is the same on both.
             pad.connected = port == 0;
             if (p.set) pad = *p.set;
             if (!p.script.empty() && poll >= p.script_start && poll < p.script_start + p.script.size())

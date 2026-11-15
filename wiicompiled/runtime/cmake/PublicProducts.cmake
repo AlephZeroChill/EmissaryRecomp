@@ -194,6 +194,12 @@ function(mkw_configure_product target)
         # Brawl Online's core and its region sets (Dolphin's Data/Sys/Rollback) beside the executable.
         # Link only: the core's own compile settings (UNICODE, C++23...) stay out of the runtime's.
         target_link_libraries(${target} PRIVATE $<LINK_ONLY:mkw_brawl_online_core>)
+        if(WIN32)
+            # The game's main thread runs the core's hooks too.
+            target_link_options(${target} PRIVATE -Wl,--stack,16777216)
+            target_link_libraries(${target} PRIVATE dbghelp)
+            target_link_options(${target} PRIVATE "-Wl,-Map,$<TARGET_FILE_DIR:${target}>/${target}.map")
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${MKW_BRAWL_ONLINE_SYS}" "$<TARGET_FILE_DIR:${target}>/Sys/Rollback")
     endif()

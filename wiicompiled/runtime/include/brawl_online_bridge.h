@@ -73,6 +73,14 @@ void CorePadThreadUpdated();                 // the pad thread's loop, after P+'
 // Brawl Online's test harness (BRAWL_ONLINE_HARNESS_PORT, brawl_online_harness.cpp): every poll of the
 // local controllers, its pads (pad_set, pad_script) replace them.
 void CoreHarnessStart();
+// Winsock references for the whole run (a WSACleanup too many elsewhere closes every socket).
+void CoreHoldWinsock();
+void CoreWatchExit();
+void CoreWatchCrashes();
+// BRAWL_ONLINE_PROFILE: sample the calling thread (the game loop's).
+void CoreProfileStart();
+// The guest CPU of this thread (pc, lr, ctr, GPRs) to stderr: for crash reports.
+void DumpGuestCpu();
 bool CoreHarnessActive();
 void CoreHarnessPads(Pad* pads);
 

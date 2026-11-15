@@ -11,8 +11,10 @@
 #include "det_clock.h"
 #include "frame_input.h"
 #include "memory.h"
+#include "settings_overlay.h"
 
 #include <cstdio>
+#include <exception>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -78,6 +80,7 @@ Snapshots s_snap;
 namespace BrawlOnlineBridge {
 
 void SnapshotRegions(const uint32_t* addrs, const uint32_t* sizes, size_t count) {
+    std::fprintf(stderr, "[brawl-online] snapshot regions: %zu\n", count);
     s_snap.watch.reset();
     s_snap.store.reset();
     s_snap.backing.clear();
@@ -140,6 +143,16 @@ void RestoreRegs(const void* key) {
     if (it != s_saved_regs.end()) Ctx() = it->second;
 }
 
+void DumpGuestCpu() {
+    const CpuContext* c = t_ctx ? t_ctx : g_currentCpuContext;
+    if (!c) { std::fputs("[brawl-online] no guest CPU on this thread\n", stderr); return; }
+    std::fprintf(stderr, "[brawl-online] guest pc %08x lr %08x ctr %08x cr %08x\n", c->pc, c->lr, c->ctr, c->cr);
+    for (int i = 0; i < 32; i += 8)
+        std::fprintf(stderr, "[brawl-online]  r%-2d %08x %08x %08x %08x %08x %08x %08x %08x\n", i, c->gpr[i], c->gpr[i + 1],
+                     c->gpr[i + 2], c->gpr[i + 3], c->gpr[i + 4], c->gpr[i + 5], c->gpr[i + 6], c->gpr[i + 7]);
+    std::fflush(stderr);
+}
+
 uint64_t TimeBase() { return DetClock::Now(); }
 void SetResimulating(bool active) { DetClock::SetRollbackResimulating(active); }
 void ResetPacing() { DetClock::ResetPacing(); }
@@ -170,6 +183,19 @@ bool Enabled() {
 
 void Start() {
     if (!Enabled()) return;
+    // An exception nothing catches (the snapshot store's own checks among them) says what it was.
+    std::set_terminate([] {
+        try {
+            if (auto e = std::current_exception()) std::rethrow_exception(e);
+            std::fputs("[brawl-online] terminate without an exception\n", stderr);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[brawl-online] uncaught exception: %s\n", e.what());
+        } catch (...) {
+            std::fputs("[brawl-online] uncaught exception of an unknown type\n", stderr);
+        }
+        std::fflush(stderr);
+        std::abort();
+    });
     DetClock::Enable();
     const char* comm = std::getenv("BRAWL_ONLINE_REPLAY_COMM");
     B::CoreStart(std::getenv("BRAWL_ONLINE_CORE"), comm ? comm : "");
@@ -191,9 +217,16 @@ void RunLoop(CpuContext* ctx, Pass pass) {
         case B::Action::Continue:
             pass(ctx);
             return;
-        case B::Action::Skip:
+        case B::Action::Skip: {
             B::CoreLoopEnd();
+            // A skipped pass still lets time go on, as it does in Dolphin (whose CPU keeps running
+            // the loop's hooks while the throttle paces it): one retrace, the game's other threads
+            // and the deterministic clock run meanwhile. The loop's registers are kept.
+            const CpuContext kept = *ctx;
+            InvokeIndirectCpu(0x801E892Cu, ctx);  // VIWaitForRetrace
+            *ctx = kept;
             return;
+        }
         case B::Action::Call:
             // The call returns to the loop top (lr), where the core's hook runs again.
             InvokeIndirectCpu(call, ctx);
@@ -239,6 +272,9 @@ void HarnessPads(void* gc_pads) {
     B::CoreHarnessPads(p);
     for (int i = 0; i < 4; ++i)
         pads[i] = {p[i].connected, p[i].button, p[i].stickX, p[i].stickY, p[i].substickX, p[i].substickY, p[i].triggerL, p[i].triggerR};
+    // A on the harness's pads lifts the startup cover, as a player's A does.
+    for (int i = 0; i < 4; ++i)
+        if (p[i].button & 0x0100) settings_overlay::NotifyStrapInputAccepted();
 }
 void PadThreadUpdated(CpuContext* ctx) {
     static bool seen = false;

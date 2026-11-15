@@ -217,6 +217,7 @@ public:
         return s;
     }
     void StopGame() override { B::StopGame(); }
+    bool HarnessActive() const override { return BrawlOnlineBridge::CoreHarnessActive(); }
     void QueueHostJob(std::function<void()> job) override { std::thread(std::move(job)).detach(); }
 };
 
@@ -236,6 +237,9 @@ namespace BrawlOnlineBridge {
 void CoreStart(const char* user_dir, const char* replay_comm) {
     if (s_started) return;
     s_started = true;
+    B::CoreHoldWinsock();
+    B::CoreWatchExit();
+    B::CoreWatchCrashes();
     BrawlOnline::SetEngine(&s_engine);
     BrawlOnline::SetHost(&s_host);
     BrawlOnline::InitCompat(user_dir);
@@ -255,6 +259,7 @@ void CoreShutdown() {
 }
 
 Action CoreLoopTop(uint32_t* call_target) {
+    CoreProfileStart();
     auto& system = Core::System::GetInstance();
     s_engine.action = Action::Normal;
     Online::GameAlive::Beat();

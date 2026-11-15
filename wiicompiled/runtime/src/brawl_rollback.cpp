@@ -474,7 +474,9 @@ void UpdateSystem(CpuContext* ctx,GuestFunction update) {
 
 void AnchorPads() {
     // Brawl Online's core takes the pad thread's read (GameplayRollback's pads).
-    if(BrawlOnlineCore::Enabled()) {BrawlOnlineCore::PadRead(g_currentCpuContext);return;}
+    // The pad thread's call of updateLow returns to 0x8002BA84 (P+'s own code at updateLow's end has
+    // run): Dolphin's PadsOnPadRead and GprbPadThreadLoopHook, in that order.
+    if(BrawlOnlineCore::Enabled()) {BrawlOnlineCore::PadRead(g_currentCpuContext);BrawlOnlineCore::PadThreadUpdated(g_currentCpuContext);return;}
     if(!session.resimulating) std::memcpy(latestLocalPad.data(),Memory::GetPointer(0x805BAD00+64*session.localPad,64),64);
     if (!session.active && !((session.live || session.hasRecordedCountdown) && crossplayStageSeen && !session.finished)) return;
     std::array<uint8_t,64> absent{};absent[0x38]=0xff;
