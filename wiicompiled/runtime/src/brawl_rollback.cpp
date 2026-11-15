@@ -8,6 +8,7 @@
 #include <memory>
 #include "brawl_rollback_udp.h"
 #include "brawl_online_ipc.h"
+#include "brawl_online_core.h"
 #include "memory.h"
 #include "ppc_runtime.h"
 #include "save_states.h"
@@ -472,6 +473,8 @@ void UpdateSystem(CpuContext* ctx,GuestFunction update) {
 }
 
 void AnchorPads() {
+    // Brawl Online's core takes the pad thread's read (GameplayRollback's pads).
+    if(BrawlOnlineCore::Enabled()) {BrawlOnlineCore::PadRead(g_currentCpuContext);return;}
     if(!session.resimulating) std::memcpy(latestLocalPad.data(),Memory::GetPointer(0x805BAD00+64*session.localPad,64),64);
     if (!session.active && !((session.live || session.hasRecordedCountdown) && crossplayStageSeen && !session.finished)) return;
     std::array<uint8_t,64> absent{};absent[0x38]=0xff;
@@ -536,6 +539,7 @@ void SeedMatchAtLoopTop() {
 
 // Controlled setup for the cross-engine harness; ordinary prototype runs are unchanged.
 void SeedCrossplayStage() {
+    if(BrawlOnlineCore::Enabled()) {BrawlOnlineCore::StageCreate(g_currentCpuContext);return;}
     BrawlOnline::Stage();
     const char* seed=std::getenv("BRAWL_PROTOCOL_SEED");
     if(!seed) seed=std::getenv("BRAWL_CROSSPLAY_SEED");if(!seed) return;
@@ -595,9 +599,10 @@ public:
         }
     }
 };
-bool DrivesLoop() {return session.active;}
+bool DrivesLoop() {return BrawlOnlineCore::Enabled()?BrawlOnlineCore::DrivesLoop():session.active;}
 void Run(CpuContext* ctx,GuestFunction gameProc) {gameProc(ctx);}
 void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
+    if(BrawlOnlineCore::Enabled()) {BrawlOnlineCore::RunLoop(ctx,gameProc);return;}
     SeedMatchAtLoopTop();
     BrawlOnline::Loop(crossplayStageSeen);
     CrossplaySetup();

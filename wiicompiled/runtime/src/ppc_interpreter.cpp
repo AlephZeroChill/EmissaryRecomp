@@ -10,6 +10,7 @@
 // one per use, and here each register remembers which form its last write left and is converted at a use of the
 // other form, the same PPC_PsFromScalarInline / PPC_PsToScalarInline conversions translated code makes.
 #include "ppc_interpreter.h"
+#include "brawl_online_core.h"
 #include "brawl_rollback.h"
 #include "brawl_online_ipc.h"
 
@@ -285,7 +286,8 @@ void Run(CpuContext* ctx, uint32_t entry) {
     uint64_t executed = 0;
     const auto& tracePcs = TracePcs();
     static thread_local unsigned rollbackLoopDepth=0;
-    static const bool rollbackEnabled=std::getenv("BRAWL_ROLLBACK_INPUT")!=nullptr || std::getenv("BRAWL_ONLINE_IPC")!=nullptr;
+    static const bool coreEnabled=BrawlOnlineCore::Enabled();
+    static const bool rollbackEnabled=std::getenv("BRAWL_ROLLBACK_INPUT")!=nullptr || std::getenv("BRAWL_ONLINE_IPC")!=nullptr || coreEnabled;
     for (;;) {
         const uint32_t pc = f.pc;
         if(pc==0x80949BC0u) BrawlOnline::Stage();
@@ -299,8 +301,15 @@ void Run(CpuContext* ctx, uint32_t entry) {
             for(auto& form:f.form) form=Form::Scalar;
             continue;
         }
+        // Brawl Online's core (Dolphin's Brawlback hooks): the frame end inside the pass.
+        if(coreEnabled && rollbackLoopDepth && pc==0x80017504u) {
+            for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
+            if(BrawlOnlineCore::FrameEnd(ctx)) {f.pc=0x80017508u;continue;}
+        }
+        if(coreEnabled && pc==0x8002BA84u) BrawlOnlineCore::PadThreadUpdated(ctx);
         if(rollbackLoopDepth && pc==0x80017508u) {
             for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
+            if(coreEnabled) BrawlOnlineCore::LoopEnd(ctx);
             g_instructions.fetch_add(executed,std::memory_order_relaxed);return;
         }
         if(rollbackLoopDepth && BrawlRollback::DrivesLoop()) {

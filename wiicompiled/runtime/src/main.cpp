@@ -1,3 +1,4 @@
+#include "brawl_online_core.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -1432,6 +1433,8 @@ int RuntimeMain(int argc, char** argv) {
         auto entry = ResolveEntry();
         Gecko::Install();  // mods' Gecko codes (UserData/SD/<mod>/RSBE01.GCT), before the game's first instruction
         GuestCodePatch::InterpretFromEnvironment();
+        // Brawl Online's core (BRAWL_ONLINE_CORE): its settings, logs and online start before the game.
+        BrawlOnlineCore::Start();
         InitializePersistentCpuContext();
         auto& cpu = GetPersistentCpuContext();
         SeedCpuContext(cpu);

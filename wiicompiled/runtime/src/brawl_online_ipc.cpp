@@ -1,6 +1,8 @@
 // Local control surface for the private Brawl Online protocol sidecar.
 // Enabled only by the launcher; TCP control binds exclusively to loopback.
 #include "brawl_online_ipc.h"
+#include "brawl_online_core.h"
+#include "abi_bridge.h"
 #include "frame_input.h"
 #include "memory.h"
 #include "save_states.h"
@@ -107,12 +109,14 @@ void Loop(bool stageSeen){
  if(barrier&&!start&&scene=="scMelee"&&gf>=at){start=true;Hold("start");}
 }
 void Stage(){
+ // Brawl Online's core pins the agreed substage here (GameplaySession::OnStageFileLoad).
+ if(BrawlOnlineCore::Enabled()){BrawlOnlineCore::StageFile(g_currentCpuContext);return;}
  // Apply the agreed substage before the first file load, not after the stage
  // has retained pointers into that file. Changing it at construction can
  // reload the archive over those live pointers (e.g. Smashville's lighting).
  // The constructor remains a setup boundary for paths without a file load.
  if(Enabled()&&(!MenuLoop()||armed)&&!stageSetup){Hold("stage");stageSetup=true;}
 }
-void SamplePads(FrameInput::GcPad* out){std::lock_guard<std::mutex> lock(padMutex);if(padsActive)for(unsigned p=0;p<4;++p)out[p]=pads[p];}
+void SamplePads(FrameInput::GcPad* out){BrawlOnlineCore::HarnessPads(out);std::lock_guard<std::mutex> lock(padMutex);if(padsActive)for(unsigned p=0;p<4;++p)out[p]=pads[p];}
 void WaitForGo(){if(!Enabled())return;auto since=std::chrono::steady_clock::now();while(!go){Poll();if(std::chrono::steady_clock::now()-since>std::chrono::seconds(60))throw std::runtime_error("online go timed out");std::this_thread::sleep_for(std::chrono::milliseconds(1));}}
 }

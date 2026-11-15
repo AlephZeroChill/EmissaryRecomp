@@ -78,6 +78,22 @@ set(NO_ASIO_BUILD ON CACHE BOOL "Use application transport" FORCE)
 add_subdirectory("${MKW_RUNTIME_SOURCE_DIR}/third_party/gekkonet/GekkoLib" "${CMAKE_CURRENT_BINARY_DIR}/gekkonet")
 target_include_directories(GekkoNet PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/third_party/gekkonet_compat")
 target_link_libraries(mkw_runtime_common PRIVATE GekkoNet)
+
+# Brawl Online's core in-process (BRAWL_ONLINE_ROOT: a checkout of brawlonline.net with core/ and the
+# dolphin/ parts it builds from; docs/design/brawl-online-core.md §10). It replaces the online
+# companion, mmclient and the control socket. The core side of the bridge builds with the core's
+# headers (C++23) in its own library; the runtime side (src/brawl_online_core.cpp) with the runtime's.
+set(BRAWL_ONLINE_ROOT "" CACHE PATH "A brawlonline.net checkout (core/, dolphin/) to build Brawl Online's core from")
+if(BRAWL_ONLINE_ROOT)
+    set(BRAWL_ONLINE_GEKKONET_TARGET GekkoNet CACHE STRING "" FORCE)
+    add_subdirectory("${BRAWL_ONLINE_ROOT}/core/standalone" "${CMAKE_CURRENT_BINARY_DIR}/brawl-online-core" EXCLUDE_FROM_ALL)
+    add_library(mkw_brawl_online_core STATIC "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_core_side.cpp"
+        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_harness.cpp")
+    target_include_directories(mkw_brawl_online_core PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include")
+    target_link_libraries(mkw_brawl_online_core PUBLIC brawl_online_core_standalone)
+    target_compile_definitions(mkw_runtime_common PRIVATE MKW_BRAWL_ONLINE_CORE=1)
+    set(MKW_BRAWL_ONLINE_SYS "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Rollback")
+endif()
 mkw_configure_object_target(mkw_runtime_common)
 target_compile_features(mkw_runtime_common PRIVATE cxx_std_20)
 target_compile_definitions(mkw_runtime_common PRIVATE
@@ -174,6 +190,13 @@ target_precompile_headers(mkw_base_shared PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/inc
 
 function(mkw_configure_product target)
     target_link_libraries(${target} PRIVATE GekkoNet)
+    if(TARGET mkw_brawl_online_core)
+        # Brawl Online's core and its region sets (Dolphin's Data/Sys/Rollback) beside the executable.
+        # Link only: the core's own compile settings (UNICODE, C++23...) stay out of the runtime's.
+        target_link_libraries(${target} PRIVATE $<LINK_ONLY:mkw_brawl_online_core>)
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MKW_BRAWL_ONLINE_SYS}" "$<TARGET_FILE_DIR:${target}>/Sys/Rollback")
+    endif()
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
     # plain baseline ISA independently of the selected product instruction floor.
