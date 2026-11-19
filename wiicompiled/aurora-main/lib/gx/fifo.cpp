@@ -1,5 +1,6 @@
 #include "fifo.hpp"
 #include "command_processor.hpp"
+#include "gx_worker.hpp"
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
 
@@ -14,13 +15,13 @@ namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
 
 namespace detail {
-uint8_t* sBufferData = nullptr;
-uint32_t sBufferSize = 0;
-uint32_t sBufferCapacity = 0;
-bool sInDisplayList = false;
-uint8_t* sDlBuffer = nullptr;
-uint32_t sDlSize = 0;
-uint32_t sDlWritePos = 0;
+thread_local uint8_t* sBufferData = nullptr;
+thread_local uint32_t sBufferSize = 0;
+thread_local uint32_t sBufferCapacity = 0;
+thread_local bool sInDisplayList = false;
+thread_local uint8_t* sDlBuffer = nullptr;
+thread_local uint32_t sDlSize = 0;
+thread_local uint32_t sDlWritePos = 0;
 } // namespace detail
 
 void init() {
@@ -74,6 +75,15 @@ static void note_drain_wait(uint64_t nanos) noexcept {
 }
 
 void drain() {
+  // GX thread on (gx_worker.hpp): the producer hands its bytes over in order and returns; the GX thread decodes them
+  // (after its own SEALED wait).
+  if (worker::producer()) {
+    if (detail::sBufferSize != 0) {
+      worker::submit_fifo(detail::sBufferData, detail::sBufferSize);
+      detail::sBufferSize = 0;
+    }
+    return;
+  }
   // SEALED, not DONE.
   const auto waited = aurora::wait_for_frame_worker_sealed();
   if (waited.count() > 0) UNLIKELY {

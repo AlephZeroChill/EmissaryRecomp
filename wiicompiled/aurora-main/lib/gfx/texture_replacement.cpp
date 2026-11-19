@@ -2,6 +2,7 @@
 
 #include "../internal.hpp"
 #include "../gx/gx.hpp"
+#include "../gx/gx_worker.hpp"
 #include "../gpu/gpu.hpp"
 #include "dds_io.hpp"
 #include "texture_convert.hpp"
@@ -83,7 +84,13 @@ absl::flat_hash_map<RuntimeTextureKey, CachedReplacement> s_replacementCache;
 absl::flat_hash_set<RuntimeTextureKey> s_failedKeys;
 absl::flat_hash_set<RuntimeTextureKey> s_reportedMisses;
 absl::flat_hash_map<const GXTlutObj*, TlutMetadata> s_pendingTluts;
+// The palettes loaded in each slot as the decoder sees them (find_replacement): written by load_tlut inline, or in order
+// on the GX thread when it is on. s_producerTluts is then the producer's own copy, as of the latest GXLoadTlut.
 std::array<TlutMetadata, MaxTluts> s_loadedTluts{};
+std::array<TlutMetadata, MaxTluts> s_producerTluts{};
+// Whether the palette mirrors can serve anything (build_index): false with no replacements, button icons or dumps,
+// which saves a palette copy per GXInitTlutObj and an ordered hand-off per GXLoadTlut.
+bool s_tlutMirrorNeeded = true;
 std::list<RuntimeTextureKey> s_replacementLru;
 std::filesystem::path s_replacementRoot;
 std::filesystem::path s_dumpRoot;
@@ -605,6 +612,10 @@ void build_index() noexcept {
       if (std::string_view(forced) == kButtonIconStyles[style]) s_buttonIconForced = static_cast<int>(style);
     set_button_icon_style(s_buttonIconForced);
   }
+  // The palette mirrors (register_tlut, load_tlut) serve only replacement lookups of palette textures and CI dumps.
+  s_tlutMirrorNeeded = g_config.allowTextureDumps || !s_replacementIndex.empty() ||
+                       std::any_of(s_buttonIconIndex.begin(), s_buttonIconIndex.end(),
+                                   [](const auto& icons) { return !icons.empty(); });
 }
 
 const ReplacementIndexEntry* find_replacement_path(const RuntimeTextureKey& key) noexcept {
@@ -732,6 +743,9 @@ void shutdown() noexcept {
   for (auto& tlut : s_loadedTluts) {
     tlut = {};
   }
+  for (auto& tlut : s_producerTluts) {
+    tlut = {};
+  }
   s_replacementLru.clear();
   s_replacementCacheBytes = 0;
   s_replacementRoot.clear();
@@ -741,7 +755,7 @@ void shutdown() noexcept {
 // Mirrors of the guest palettes, kept only so find_replacement can hash and the DDS dump decode a
 // CI palette. The renderer uploads from the guest pointer, so skip this work when replacement is off.
 void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uint16_t entries) noexcept {
-  if (!g_config.allowTextureReplacements) {
+  if (!g_config.allowTextureReplacements || !s_tlutMirrorNeeded) {
     return;
   }
   if (obj == nullptr || data == nullptr) {
@@ -768,40 +782,58 @@ void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uin
   };
 }
 
+bool tlut_mirror_active() noexcept { return g_config.allowTextureReplacements && s_tlutMirrorNeeded; }
+
 void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept {
-  if (!g_config.allowTextureReplacements) {
+  if (!g_config.allowTextureReplacements || !s_tlutMirrorNeeded) {
     return;
   }
   if (idx >= s_loadedTluts.size()) {
     return;
   }
 
+  // With the GX thread on (gx_worker.hpp), s_loadedTluts is what it decodes against: work the load out here against
+  // the producer's copy, then hand the slot's new contents over behind the commands before this load.
+  const bool queued = aurora::gx::worker::producer();
+  auto& slots = queued ? s_producerTluts : s_loadedTluts;
+  TlutMetadata loadedTlut{};
   // Consume the pending registration. The map is keyed by a guest object address that can be freed
   // or reused at any time, and entries used to live until shutdown.
   if (const auto it = s_pendingTluts.find(obj); it != s_pendingTluts.end()) {
-    s_loadedTluts[idx] = std::move(it->second);
+    loadedTlut = std::move(it->second);
     s_pendingTluts.erase(it);
-    return;
-  }
-
-  // The same object may legally be loaded into several hardware slots; only the first load finds the
-  // pending entry, so recover the palette from whichever slot already holds it.
-  for (const auto& loaded : s_loadedTluts) {
-    if (!loaded.valid || loaded.source != obj) {
-      continue;
+  } else {
+    // The same object may legally be loaded into several hardware slots; only the first load finds the
+    // pending entry, so recover the palette from whichever slot already holds it.
+    for (const auto& loaded : slots) {
+      if (!loaded.valid || loaded.source != obj) {
+        continue;
+      }
+      loadedTlut = {
+          .size = loaded.size,
+          .format = loaded.format,
+          .entries = loaded.entries,
+          .valid = loaded.valid,
+          .source = loaded.source,
+          .data = loaded.data.clone(),
+      };
+      break;
     }
-    s_loadedTluts[idx] = {
-        .size = loaded.size,
-        .format = loaded.format,
-        .entries = loaded.entries,
-        .valid = loaded.valid,
-        .source = loaded.source,
-        .data = loaded.data.clone(),
-    };
+  }
+  if (!queued) {
+    s_loadedTluts[idx] = std::move(loadedTlut);
     return;
   }
-
-  s_loadedTluts[idx] = {};
+  s_producerTluts[idx] = {
+      .size = loadedTlut.size,
+      .format = loadedTlut.format,
+      .entries = loadedTlut.entries,
+      .valid = loadedTlut.valid,
+      .source = loadedTlut.source,
+      .data = loadedTlut.data.clone(),
+  };
+  auto handOver = std::make_shared<TlutMetadata>(std::move(loadedTlut));
+  aurora::gx::worker::run_ordered([idx, handOver] { s_loadedTluts[idx] = std::move(*handOver); });
 }
 
 std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
@@ -845,7 +877,9 @@ void set_button_icon_style(int style) noexcept {
 int button_icon_style() noexcept { return s_buttonIconStyle.load(); }
 
 bool take_button_icon_style_change() noexcept {
-  if (!s_buttonIconStyleChanged.exchange(false)) return false;
+  // Read first: this runs for every draw (resolve_sampled_textures), and the exchange is a locked read-modify-write.
+  if (!s_buttonIconStyleChanged.load(std::memory_order_relaxed) || !s_buttonIconStyleChanged.exchange(false))
+    return false;
   s_appliedButtonIconStyle = s_buttonIconStyle.load();
   for (const auto& icons : s_buttonIconIndex) {
     for (const auto& [key, _] : icons) {

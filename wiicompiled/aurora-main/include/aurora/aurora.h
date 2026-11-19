@@ -161,6 +161,9 @@ void aurora_shutdown();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
+// aurora_end_frame for a frame nobody sees (a frame rollback replays to catch up): sealed, rendered and submitted the
+// same way, so its frame-latent EFB readbacks land on the same schedule, but no presentation image, present or capture.
+void aurora_end_frame_unpresented();
 typedef void (*AuroraFrameWorkerWaitCallback)();
 // Called from the producer thread at bounded intervals while Aurora waits for
 // the asynchronous frame worker. The callback must not enter Aurora.
@@ -174,6 +177,8 @@ void aurora_set_present_schedule(uint64_t baseNanos, uint64_t intervalNanos);
 // slot group from this, backing off after misses. Only paced presents may report.
 void aurora_report_producer_paced(bool paced);
 void aurora_request_frame_capture(uint32_t frame, const char* outputPath);
+// Diagnostics: with AURORA_DRAW_DUMP=<dir> set, the next whole frame's draws (decoded state per draw) go to <dir>/<name>.
+void aurora_request_draw_dump(const char* name);
 bool aurora_flush_efb_copies_to_ram();
 bool aurora_flush_efb_copy_to_ram(void* dest);
 // The frame on screen (the last display copy), scaled to width x height RGBA8. False when there is none yet.

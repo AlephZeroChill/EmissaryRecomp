@@ -285,10 +285,11 @@ struct PassContext {
 // A draw's fragment textures: one texture + sampler per slot, in slot order. Holds references so the
 // GPU objects outlive every draw that recorded them.
 inline constexpr uint32_t MaxBoundTextures = 8;
+using TextureBindingsRaw = std::array<SDL_GPUTextureSamplerBinding, MaxBoundTextures>;
 struct TextureBindings {
   std::array<gpu::Texture, MaxBoundTextures> textures;
   std::array<gpu::Sampler, MaxBoundTextures> samplers;
-  std::array<SDL_GPUTextureSamplerBinding, MaxBoundTextures> raw{};
+  TextureBindingsRaw raw{};
   uint32_t count = 0;
 };
 
@@ -307,6 +308,9 @@ bool begin_frame();
 bool resume_frame();
 void abort_frame() noexcept;
 void end_frame(gpu::Encoder& cmd);
+// Milliseconds the last end_frame/end_batch spent unmapping the staging buffer, recording its upload copies, and
+// mapping the next one (the frame worker's slow-frame log reports them).
+inline double g_lastStagingUnmapMs = 0, g_lastStagingCopyMs = 0, g_lastStagingMapMs = 0;
 void end_batch(gpu::Encoder& cmd);
 uint32_t current_frame() noexcept;
 
@@ -382,12 +386,17 @@ template <typename T>
 static Range push_indices(ArrayRef<T> data) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
 }
+// push_indices of `count` indices src[i] + offset, written straight into the index staging (same range).
+Range push_offset_indices(const uint16_t* src, size_t count, uint16_t offset);
 Range push_uniform(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
 Range push_storage(const uint8_t* data, size_t length);
+// Diagnostics (AURORA_DRAW_DUMP): the bytes of `range` in the current staging buffer `buffer` (0 vertices, 1 uniforms,
+// 2 indices, 3 storage), or null if out of range.
+const uint8_t* staged_bytes(int buffer, const Range& range) noexcept;
 template <typename T>
 static Range push_storage(ArrayRef<T> data) {
   return push_storage(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
@@ -421,6 +430,10 @@ bool bind_pipeline(PipelineRef ref, const PassContext& ctx, PipelineRef& current
 using TextureBindingsRef = HashType;
 TextureBindingsRef texture_bindings_ref(TextureBindings&& bindings);
 const TextureBindings& find_texture_bindings(TextureBindingsRef id);
+// The interned bindings whose raw handles are raw[0, count), if any (refreshed for this frame, as texture_bindings_ref
+// does), with the id texture_bindings_ref gives them: a caller that finds them takes no texture or sampler reference.
+std::pair<TextureBindingsRef, const TextureBindings*> find_texture_bindings(const TextureBindingsRaw& raw,
+                                                                           uint32_t count);
 
 const gpu::Sampler& sampler_ref(const SDL_GPUSamplerCreateInfo& descriptor);
 

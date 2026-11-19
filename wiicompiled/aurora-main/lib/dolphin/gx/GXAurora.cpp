@@ -40,6 +40,7 @@ void GXInsertDebugMarker(const char* label) {
 }
 
 void AuroraSetViewportPolicy(AuroraViewportPolicy policy) {
+  aurora::gx::worker::sync();  // reads and writes decoded state directly
   const bool changed = g_gxState.viewportPolicy != policy;
   if (changed) {
     // Finish commands using the old framebuffer mapping before changing it.
@@ -134,6 +135,7 @@ void GXSetViewportScissorRenderSafeArea(f32 aspect) {
 
   // Apply queued viewport changes before direct layout draws use the safe area.
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // reads decoded state
   auto mapped = aurora::gx::map_logical_render_state();
   const float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
 
@@ -178,20 +180,25 @@ void GXSetViewportScissorRenderSafeArea(f32 aspect) {
 void GXRestoreViewportScissorRender() {
   // Run queued GX draws before leaving the direct layout safe area.
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // reads decoded state
   WriteMappedRenderState(aurora::gx::map_logical_render_state());
 }
 
 void GXSetTexCopySrcRender(u16 left, u16 top, u16 wd, u16 ht) {
-  aurora::gx::g_gxState.texCopySrc = {left, top, wd, ht};
-  aurora::gx::g_gxState.texCopySrcRenderSpace = true;
+  aurora::gx::worker::run_ordered([left, top, wd, ht] {  // decoded state, in order
+    aurora::gx::g_gxState.texCopySrc = {left, top, wd, ht};
+    aurora::gx::g_gxState.texCopySrcRenderSpace = true;
+  });
 }
 
 void GXCreateFrameBuffer(u32 width, u32 height) {
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // changes the render target under the decoded draws
   aurora::gfx::begin_offscreen(width, height);
 }
 
 void GXRestoreFrameBuffer() {
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // changes the render target under the decoded draws
   aurora::gfx::end_offscreen();
 }

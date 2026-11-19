@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -80,6 +81,10 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   mips = clamp_mip_count(width, height, mips, label);
   auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
   auto& ref = *handle;
+  static const bool digests = std::getenv("AURORA_DRAW_DUMP") != nullptr;
+  if (digests && data.data() != nullptr && data.size() != 0 && data.size() != UINT32_MAX) UNLIKELY {
+    ref.debugDigest = xxh3_hash_s(data.data(), data.size());
+  }
 
   ConvertedTexture converted;
   if (ref.gxFormat != InvalidTextureFormat) {

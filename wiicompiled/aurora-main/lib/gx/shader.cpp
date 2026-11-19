@@ -9,6 +9,10 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <tuple>
 #include <vector>
 #include <mutex>
 #include <string_view>
@@ -2174,6 +2178,25 @@ GXShaders build_shader(const ShaderConfig& config) noexcept {
   const auto source = build_shader_source(config);
   const auto vertexLabel = fmt::format("GX Shader {:x} vs", hash);
   const auto fragmentLabel = fmt::format("GX Shader {:x} fs", hash);
+  // AURORA_SHADER_DUMP=<dir>: each GX shader's assembled source as <config hash>.vs / .fs. The hash is of the
+  // ShaderConfig, so the same draw state gets the same file name on every platform: diff the directories.
+  static const char* dumpDir = std::getenv("AURORA_SHADER_DUMP");
+  if (dumpDir != nullptr && dumpDir[0] != '\0') {
+    for (const auto& [suffix, iface, helpers, body] :
+         {std::tuple{"vs", &source.vertex, VertexHelpers, &source.vertexBody},
+          std::tuple{"fs", &source.fragment, FragmentHelpers, &source.fragmentBody}}) {
+      const std::string path = fmt::format("{}/{:016x}.{}", dumpDir, hash, suffix);
+      if (FILE* existing = std::fopen(path.c_str(), "r")) {  // the first build of a config wins, no rewrites
+        std::fclose(existing);
+        continue;
+      }
+      if (FILE* file = std::fopen(path.c_str(), "w")) {
+        const std::string text = gpu::shader::assemble(*iface, helpers, *body);
+        std::fwrite(text.data(), 1, text.size(), file);
+        std::fclose(file);
+      }
+    }
+  }
   return {
       .vertex = gpu::shader::create(source.vertex, VertexHelpers, source.vertexBody, vertexLabel.c_str()),
       .fragment = gpu::shader::create(source.fragment, FragmentHelpers, source.fragmentBody, fragmentLabel.c_str()),

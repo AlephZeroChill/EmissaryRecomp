@@ -719,6 +719,7 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
     // Same z correction effective_projection() folds into ubuf.proj, applied to the reference plane.
     const auto& vp = g_gxState.renderViewport;
     const bool flip = (vp.znear <= vp.zfar) == UseReversedZ;
+    resolve_zfreeze_plane();
     const auto& p = g_gxState.zFreezePlane;
     buf.append(flip ? Vec4<float>{-p.x(), -p.y(), -p.z(), 0.f} : Vec4<float>{p.x(), p.y(), p.z() + 1.f, 0.f});
   }

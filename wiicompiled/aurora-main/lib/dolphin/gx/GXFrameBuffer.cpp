@@ -325,6 +325,7 @@ GXRenderModeObj GXMpal480IntDf = {
 };
 
 void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor, u16 ver) {
+  aurora::gx::worker::sync();
   *rmout = *rmin;
   const auto renderSize = aurora::gfx::get_render_target_size();
   rmout->fbWidth = static_cast<u16>(std::min<uint32_t>(renderSize.x, UINT16_MAX));
@@ -332,45 +333,61 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
   rmout->xfbHeight = static_cast<u16>(std::min<uint32_t>(renderSize.y, UINT16_MAX));
 }
 
+// Copy setup and copies read or write decoded state directly: with the GX thread on (gx_worker.hpp) that part runs
+// there, in order (run_ordered); FIFO writes and the __gx shadow stay here, on the producer.
+// The display copy source height as the producer last set it: GXSetDispCopyYScale's return needs it now.
+static u16 s_producerDispCopySrcHeight = 0;
+
 void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
-  g_gxState.dispCopySrc = {left, top, wd, ht};
+  s_producerDispCopySrcHeight = ht;
+  aurora::gx::worker::run_ordered([left, top, wd, ht] { g_gxState.dispCopySrc = {left, top, wd, ht}; });
   GX_WRITE_RAS_REG(0x49000000u | ((static_cast<u32>(top) & 0x3ffu) << 10) | (static_cast<u32>(left) & 0x3ffu));
   GX_WRITE_RAS_REG(0x4a000000u | (((static_cast<u32>(ht) - 1u) * 0x400u) & 0x000ffc00u) |
                    ((static_cast<u32>(wd) - 1u) & 0x3ffu));
 }
 
 void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
-  g_gxState.texCopySrc = {left, top, wd, ht};
-  g_gxState.texCopySrcRenderSpace = false;
+  aurora::gx::worker::run_ordered([left, top, wd, ht] {
+    g_gxState.texCopySrc = {left, top, wd, ht};
+    g_gxState.texCopySrcRenderSpace = false;
+  });
 }
 
 void GXSetDispCopyDst(u16 wd, u16 ht) {
-  g_gxState.dispCopyDstWidth = wd;
-  g_gxState.dispCopyDstHeight = ht;
+  aurora::gx::worker::run_ordered([wd, ht] {
+    g_gxState.dispCopyDstWidth = wd;
+    g_gxState.dispCopyDstHeight = ht;
+  });
   GX_WRITE_RAS_REG(0x4d000000u | ((((static_cast<u32>(wd) & 0x7fffu) << 1) >> 5) & 0x3ffu));
 }
 
 void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
-  g_gxState.texCopyFmt = fmt;
-  g_gxState.texCopyDstWidth = wd;
-  g_gxState.texCopyDstHeight = ht;
-  g_gxState.texCopyHalfScale = mipmap != GX_FALSE;
+  aurora::gx::worker::run_ordered([wd, ht, fmt, mipmap] {
+    g_gxState.texCopyFmt = fmt;
+    g_gxState.texCopyDstWidth = wd;
+    g_gxState.texCopyDstHeight = ht;
+    g_gxState.texCopyHalfScale = mipmap != GX_FALSE;
+  });
 }
 
 void GXSetDispCopyFrame2Field(u32 mode) {
-  g_gxState.dispCopyFrame2Field = mode & 3;
+  aurora::gx::worker::run_ordered([mode] { g_gxState.dispCopyFrame2Field = mode & 3; });
 }
 
 void GXSetCopyClamp(GXFBClamp clamp) {
-  g_gxState.copyClamp = static_cast<GXFBClamp>(static_cast<u32>(clamp) & 3);
+  aurora::gx::worker::run_ordered(
+      [clamp] { g_gxState.copyClamp = static_cast<GXFBClamp>(static_cast<u32>(clamp) & 3); });
 }
 
 u32 GXSetDispCopyYScale(f32 vscale) {
   const u32 iScale = y_scale_to_integer(vscale);
-  g_gxState.dispCopyYScale = vscale;
+  aurora::gx::worker::run_ordered([vscale] { g_gxState.dispCopyYScale = vscale; });
   GX_WRITE_RAS_REG(0x4e000000u | iScale);
   __gx->bpSent = 0;
-  return get_num_xfb_lines_internal(static_cast<u16>(g_gxState.dispCopySrc.height), iScale);
+  // The producer's own copy of the source height: the same value decoded state will hold.
+  return get_num_xfb_lines_internal(aurora::gx::worker::enabled() ? s_producerDispCopySrcHeight
+                                                                  : static_cast<u16>(g_gxState.dispCopySrc.height),
+                                    iScale);
 }
 
 void GXSetCopyClear(GXColor color, u32 depth) {
@@ -397,6 +414,7 @@ void GXSetCopyClear(GXColor color, u32 depth) {
 }
 
 void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
+  aurora::gx::worker::sync();
   g_gxState.copyFilterAa = aa;
   g_gxState.copyFilterVf = vf;
   if (sample_pattern) {
@@ -430,10 +448,19 @@ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[
 }
 
 void GXSetDispCopyGamma(GXGamma gamma) {
-  g_gxState.dispCopyGamma = static_cast<GXGamma>(static_cast<u32>(gamma) & 3u);
-  g_gxState.bpRegCache[0x52] = (g_gxState.bpRegCache[0x52] & ~(3u << 7)) |
-                               ((static_cast<u32>(g_gxState.dispCopyGamma) & 3u) << 7);
+  aurora::gx::worker::run_ordered([gamma] {
+    g_gxState.dispCopyGamma = static_cast<GXGamma>(static_cast<u32>(gamma) & 3u);
+    g_gxState.bpRegCache[0x52] = (g_gxState.bpRegCache[0x52] & ~(3u << 7)) |
+                                 ((static_cast<u32>(g_gxState.dispCopyGamma) & 3u) << 7);
+  });
 }
+
+static void copy_disp_decoded(GXBool clear, bool keep);
+
+// The next GXCopyDisp clears the EFB as usual but leaves the display copy holding the image already in it, so the next
+// present shows that image again (a host's frame replayed without its picture, e.g. a rollback re-simulation).
+static std::atomic<bool> g_keepDisplayCopyOnce{false};
+extern "C" void aurora_gx_keep_display_copy_once() { g_keepDisplayCopyOnce.store(true, std::memory_order_relaxed); }
 
 void GXCopyDisp(void* dest, GXBool clear) {
   g_spmBBoxArmed = 0;  // a box cleared but never read this frame stops costing CPU projection
@@ -442,6 +469,12 @@ void GXCopyDisp(void* dest, GXBool clear) {
   if (aurora::gx::fifo::get_buffer_size() != 0) {
     aurora::gx::fifo::drain();
   }
+  // The copy reads decoded state and records a resolve: on the GX thread, after everything before it.
+  const bool keep = g_keepDisplayCopyOnce.exchange(false, std::memory_order_relaxed);
+  aurora::gx::worker::run_ordered([clear, keep] { copy_disp_decoded(clear, keep); });
+}
+
+static void copy_disp_decoded(GXBool clear, bool keep) {
   // Round the edges to the nearest render row, as texture copies do. Rounding outward like a scissor
   // pulls the row below the picture into its last line at fractional render scales.
   const auto rect = map_texture_copy_source(g_gxState.dispCopySrc, false).clearRect;
@@ -456,6 +489,16 @@ void GXCopyDisp(void* dest, GXBool clear) {
     g_gxState.displayCopyTexture = aurora::gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8, "Display Copy");
     g_gxState.displayCopyWidth = dstWidth;
     g_gxState.displayCopyHeight = dstHeight;
+    g_gxState.displayCopyDiscard = {};
+    keep = false;  // nothing to keep at this size
+  }
+  auto* target = &g_gxState.displayCopyTexture;
+  if (keep) {
+    if (!g_gxState.displayCopyDiscard) {
+      g_gxState.displayCopyDiscard =
+          aurora::gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8, "Display Copy (discarded)");
+    }
+    target = &g_gxState.displayCopyDiscard;
   }
 
   const auto clearState = get_copy_clear_state(clear);
@@ -463,7 +506,7 @@ void GXCopyDisp(void* dest, GXBool clear) {
   if (aurora::g_config.disableCopyFilter) {
     copyFilter = {0, copyFilter[0] + copyFilter[1] + copyFilter[2], 0};
   }
-  aurora::gfx::resolve_pass(g_gxState.displayCopyTexture, rect, clearState.clearColor, clearState.clearAlpha,
+  aurora::gfx::resolve_pass(*target, rect, clearState.clearColor, clearState.clearAlpha,
                             clearState.clearDepth, clearState.clearColorValue, aurora::gx::clear_depth_value(),
                             GX_TF_RGBA8, nullptr, false, &copyFilter, false,
                             static_cast<float>(rect.height) / std::max<float>(g_gxState.dispCopySrc.height, 1.0f),
@@ -476,17 +519,23 @@ std::atomic<bool> g_texturePatches{true};
 extern "C" void AuroraSetTexturePatches(bool enabled) { g_texturePatches.store(enabled, std::memory_order_relaxed); }
 
 extern "C" int g_spmDrawDump;
+static void copy_tex_decoded(void* dest, GXBool clear);
+
 void GXCopyTex(void* dest, GXBool clear) {
   g_statCopies.fetch_add(1, std::memory_order_relaxed);
-  if (g_spmDrawDump) {  // SPM diagnostic: copies in draw order during the dump frame
-    if (aurora::gx::fifo::get_buffer_size() != 0) aurora::gx::fifo::drain();
-    std::fprintf(stderr, "[aurora] [2] [aurora::gx::fifo] [spmdraw] COPYTEX src %d,%d %dx%d dst %ux%u clear %d\n",
-                 g_gxState.texCopySrc.x, g_gxState.texCopySrc.y, g_gxState.texCopySrc.width, g_gxState.texCopySrc.height,
-                 g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, (int)clear);
-  }
   // Texture copies must see all earlier draws and state changes.
   if (aurora::gx::fifo::get_buffer_size() != 0) {
     aurora::gx::fifo::drain();
+  }
+  // The copy reads decoded state and records a resolve: on the GX thread, after everything before it.
+  aurora::gx::worker::run_ordered([dest, clear] { copy_tex_decoded(dest, clear); });
+}
+
+static void copy_tex_decoded(void* dest, GXBool clear) {
+  if (g_spmDrawDump) {  // SPM diagnostic: copies in draw order during the dump frame
+    std::fprintf(stderr, "[aurora] [2] [aurora::gx::fifo] [spmdraw] COPYTEX src %d,%d %dx%d dst %ux%u clear %d\n",
+                 g_gxState.texCopySrc.x, g_gxState.texCopySrc.y, g_gxState.texCopySrc.width, g_gxState.texCopySrc.height,
+                 g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, (int)clear);
   }
   auto sourceRect = map_texture_copy_source(g_gxState.texCopySrc, g_gxState.texCopySrcRenderSpace);
   // SPM: with the view widened past 16:9 (Hor+), the game's screen coordinates squeeze toward the centre. A copy
@@ -643,6 +692,7 @@ void GXCopyTex(void* dest, GXBool clear) {
 }
 
 void GXClearBoundingBox() {
+  aurora::gx::worker::sync();
   g_gxState.boundingBox = {1023, 0, 1023, 0};
   g_spmBBoxArmed = 1;
   GX_WRITE_RAS_REG(0x550003FFu);
@@ -651,6 +701,8 @@ void GXClearBoundingBox() {
 }
 
 void GXReadBoundingBox(u16* left, u16* right, u16* top, u16* bottom) {
+  aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // a readback
   g_spmBBoxArmed = 0;
   if (left) {
     *left = g_gxState.boundingBox[0];

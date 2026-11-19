@@ -55,6 +55,7 @@ struct TextureRef {
   bool hasArbitraryMips = false;
   bool isReplacement = false;
   uint8_t spmMarker = 0;  // New Super Paper Bros.: from button_icons/<style>/marker<N> (where it's drawn is reported)
+  uint64_t debugDigest = 0;  // AURORA_DRAW_DUMP: hash of the bytes a static texture was created from (0 otherwise)
 
   TextureRef(gpu::Texture texture, Extent3D size, SDL_GPUTextureFormat format, uint32_t mipCount, u32 gxFormat)
   : texture(std::move(texture)), size(size), format(format), mipCount(mipCount), gxFormat(gxFormat) {}

@@ -82,9 +82,16 @@ else ()
     set(ABSL_MSVC_STATIC_RUNTIME ON CACHE INTERNAL "Link static runtime libraries")
   endif()
   set(ABSL_PROPAGATE_CXX_STD ON)
+  set(_absl_patch)
+  if (NINTENDO_SWITCH)
+    # Horizon: no ELF image introspection, signals, tm_gmtoff, or integer pthread_t (cmake/abseil-horizon.patch).
+    find_program(_absl_patch_tool patch REQUIRED)
+    set(_absl_patch PATCH_COMMAND "${_absl_patch_tool}" -p1 -N -i "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/abseil-horizon.patch")
+  endif ()
   FetchContent_Declare(abseil-cpp
     URL https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    ${_absl_patch}
     EXCLUDE_FROM_ALL
   )
   FetchContent_MakeAvailable(abseil-cpp)

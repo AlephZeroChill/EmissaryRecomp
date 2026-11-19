@@ -363,6 +363,7 @@ struct GXState {
   std::array<TcgConfig, MaxTexCoord> tcgs;
   std::array<TexCoordScale, MaxTexCoord> texCoordScales;
   u16 lastVtxSize = 0;
+  u16 lastVtxMatrixPrefix = 0;  // bytes of matrix-index attributes ahead of POS in lastVtxFmt's vertices
   GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
   std::array<GXAttrType, MaxVtxAttr> vtxDesc;
   std::array<GXAttrType, MaxVtxAttr> sourceVtxDesc;
@@ -425,9 +426,12 @@ struct GXState {
   gfx::TextureHandle displayCopyTexture;
   u32 displayCopyWidth = 0;
   u32 displayCopyHeight = 0;
+  // A display copy that keeps the image already in displayCopyTexture resolves here (aurora_gx_keep_display_copy_once).
+  gfx::TextureHandle displayCopyDiscard;
   bool depthCompare = true;
   // GX coplanar ("zfreeze", genMode bit 19): while set, primitives take their depth from the plane of the last
   // triangle drawn with it clear. zFreezePlane = z = x*A + y*B + C in the game's (unwidened) NDC, w = valid.
+  // Draws only capture the plane's inputs; call resolve_zfreeze_plane() before reading zFreezePlane.
   bool zFreeze = false;
   Vec4<float> zFreezePlane{0.f, 0.f, 0.f, 0.f};
   bool depthUpdate = true;
@@ -464,6 +468,8 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+// Brings g_gxState.zFreezePlane up to date with the draws captured since the last call (command_processor.cpp).
+void resolve_zfreeze_plane() noexcept;
 struct ShaderInfo;
 struct MappedRenderState {
   gfx::Viewport viewport{};

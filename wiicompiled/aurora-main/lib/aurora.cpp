@@ -35,6 +35,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -43,6 +44,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "gx/gx_worker.hpp"
 
 #ifdef AURORA_ENABLE_GX
 namespace aurora::gx {
@@ -57,6 +60,8 @@ AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
 char g_gameName[4];
 std::atomic<AuroraFrameWorkerWaitCallback> g_frameWorkerWaitCallback{nullptr};
+// Time the producer (any thread but the frame worker and the GX thread) spent blocked waiting for the frame worker.
+std::atomic<uint64_t> g_producerFrameWorkerWaitNanos{0};
 // Presentation schedule for the frame being sealed, set by the producer. Jobs carry absolute
 // deadlines derived from it, so the presenter cannot drift. Zero means present when ready.
 std::atomic<uint64_t> g_presentScheduleBaseNanos{0};
@@ -229,7 +234,7 @@ enum class ImGuiFramePolicy {
 bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy = ImGuiFramePolicy::Immediate,
                       bool* imguiNewFrameOwed = nullptr) noexcept;
 bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) noexcept;
-void end_frame_impl(bool pumpEvents, bool drainFifo);
+void end_frame_impl(bool pumpEvents, bool drainFifo, bool present = true);
 
 // The two publication points of a frame-worker cycle, cleared together under `mutex`. Sealed:
 // producer-shared renderer state is free again. Done: slots encoded, presented, ImGui restarted.
@@ -252,6 +257,7 @@ struct FrameWorkerState {
   std::atomic_bool ready{true};
   bool framePrepared = false;
   bool prepareAllowed = false;
+  bool present = true;  // the pending job's frame is presented (false: aurora_end_frame_unpresented)
 };
 
 FrameWorkerState g_frameWorker;
@@ -384,8 +390,16 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
     return frame_worker_phase_reached(phase);
   }
 
+  const auto waitStart = std::chrono::steady_clock::now();
   const bool reached =
       g_frameWorker.cv.wait_for(lock, timeout, [phase] { return frame_worker_phase_reached(phase); });
+  if (!gx::worker::on_gx_thread()) {
+    // The producer's frame time spent blocked on the frame worker (aurora_take_frame_worker_wait_nanos).
+    g_producerFrameWorkerWaitNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - waitStart)
+                                                 .count()),
+                                             std::memory_order_relaxed);
+  }
   if (reached) {
     return true;
   }
@@ -393,9 +407,7 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
   lock.unlock();
   // Both phases service the guest's alarm/retrace pump identically; the
   // producer must keep its own timing alive however long it waits.
-  if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {
-    callback();
-  }
+  run_frame_worker_wait_callback();
   return false;
 }
 
@@ -1152,6 +1164,7 @@ void encode_presentation_snapshot(gpu::Encoder& encoder, const gpu::PresentSourc
 #endif
 
 void shutdown() noexcept {
+  gx::worker::stop();
   stop_frame_worker();
 #ifdef AURORA_ENABLE_GX
   stop_presenter();
@@ -1276,17 +1289,29 @@ struct SealedFrameContext {
   uint32_t logicalFrame = 0;
   bool interpolationActive = false;
   bool replayInterpolatedFrames = false;
+  bool present = true;  // false: render and submit only (aurora_end_frame_unpresented)
+  // Milliseconds of each seal stage, for the slow-frame log: async EFB downloads, staging upload and rotation
+  // (gfx::end_frame), ImGui draw data, and detaching the recorded passes.
+  double sealEfbMs = 0, sealStagingMs = 0, sealImguiMs = 0, sealPassesMs = 0;
 };
 
 // Phase 1: everything that touches producer-shared renderer state. Needs g_rendererGpuMutex and
 // a FIFO already drained into the recorded pass list.
 void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ZoneScopedN("Seal frame");
+  using SealClock = std::chrono::steady_clock;
+  const auto msSince = [](SealClock::time_point t) {
+    return std::chrono::duration<double, std::milli>(SealClock::now() - t).count();
+  };
+  auto mark = SealClock::now();
   ctx.encoder.emplace();
   // Probe-sized CPU-consumed copies read back asynchronously. Their downscale blits push uniforms,
   // so prepare them while the producer's staging buffers are still mapped.
   gfx::efb_ram::seal_async_downloads();
+  ctx.sealEfbMs = msSince(mark);
+  mark = SealClock::now();
   gfx::end_frame(*ctx.encoder);
+  ctx.sealStagingMs = msSince(mark);
   gfx::g_stats.presentedFrameCount = 0;
   gfx::g_stats.interpolatedFrameCount = 0;
   // Latched before the producer's next gfx::begin_frame() calls
@@ -1305,14 +1330,18 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ctx.presentSource = gpu::current_present_source();
   // ImGui draw lists are built once per frame and replayed by each slot's ImGui pass, which is why
   // the next ImGui frame cannot start until the encode phase is done.
+  mark = SealClock::now();
   imgui::render_frame_data();
+  ctx.sealImguiMs = msSince(mark);
   // Drop the sealed frame's lazy RAM-readback requests while the producer is still excluded; it
   // starts registering the next frame's as soon as SEALED is published.
+  mark = SealClock::now();
   gfx::efb_ram::cancel();
   // Detach the recorded passes. From here the producer's list is empty and the
   // encode phase reads only worker-private state.
   gfx::seal_frame(sealedFrame);
   gfx::expire_bind_group_cache();
+  ctx.sealPassesMs = msSince(mark);
 }
 
 // Phase 2: encode every presentation slot. Reads only `ctx` and the sealed passes, so it runs
@@ -1346,6 +1375,17 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     std::lock_guard submitLock(g_queueSubmitMutex);
     target.submit();
   };
+  if (!ctx.present) {
+    // The frame's passes and readbacks, exactly as below, without a presentation slot. after_submit retires the
+    // depth-peek and EFB-readback slots (skipping it leaves them full and stalls the producer).
+    gfx::render(sealedFrame, encoder, -1, true);
+    gfx::efb_ram::encode_async_downloads(encoder);
+    submitEncodedSlot(encoder);
+    gfx::after_submit();
+    gfx::g_stats.presentedFrameCount = 0;
+    gfx::g_stats.interpolatedFrameCount = 0;
+    return presentationJobs;
+  }
 
   if (ctx.replayInterpolatedFrames) {
     for (uint32_t interpolatedFrame = 0; interpolatedFrame < ctx.interpolatedFrameCount;
@@ -1519,6 +1559,10 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
   ZoneScopedN("Frame worker cycle");
   gpu::fail_if_device_lost();
   SealedFrameContext ctx;
+  {
+    std::lock_guard lock(g_frameWorker.mutex);
+    ctx.present = g_frameWorker.present;
+  }
   std::vector<PresentationJob> presentationJobs;
   bool overlapEncode = false;
   // Stage times of a cycle, logged when it runs long (the producer waits on it in GXDrawDone).
@@ -1529,7 +1573,17 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
     std::lock_guard gpuLock(g_rendererGpuMutex);
     seal_frame_locked(sealedFrame, ctx);
     sealed = WorkerClock::now();
-    overlapEncode = ctx.interpolationActive;
+    // With the GX thread on (gx_worker.hpp), encode after preparing the next frame and outside the renderer lock, as
+    // with frame interpolation: otherwise the GX thread cannot decode the next frame until this one is encoded.
+    // The same order is the default without either (AURORA_OVERLAP_ENCODE=0: encode in the lock, before SEALED). The
+    // producer's first FIFO drain of a frame waits for SEALED (fifo.cpp), which an in-lock encode delays by the whole
+    // encode: ~400 us every frame in Brawl Training. Overlapped: game-thread critical path -11% mean, -13% p99 there
+    // (pacing spin off), game work +2%.
+    static const bool overlapRequested = [] {
+      const char* v = std::getenv("AURORA_OVERLAP_ENCODE");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    overlapEncode = ctx.interpolationActive || gx::worker::enabled() || overlapRequested;
     if (!overlapEncode) {
       presentationJobs = encode_sealed_frame(sealedFrame, ctx);
     }
@@ -1567,10 +1621,12 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
       s_logged = 0;
     }
     if (busy >= 16.7 && s_logged++ < 30) {
-      Log.info("Slow render frame: {:.1f} ms (seal {:.1f}, encode {:.1f}, publish {:.1f}, prepare next {:.1f}; "
-               "{} pipelines queued)",
-               busy, msOf(sealed - cycleStart), msOf(encoded - sealed), msOf(published - encoded),
-               msOf(prepareEnd - prepareStart), gfx::g_stats.queuedPipelines);
+      Log.info("Slow render frame: {:.1f} ms (seal {:.1f} [efb {:.1f} staging {:.1f} (unmap {:.1f} copy {:.1f} map {:.1f}) "
+               "imgui {:.1f} passes {:.1f}], encode {:.1f}, publish {:.1f}, prepare next {:.1f}; {} pipelines queued)",
+               busy, msOf(sealed - cycleStart), ctx.sealEfbMs, ctx.sealStagingMs, gfx::g_lastStagingUnmapMs,
+               gfx::g_lastStagingCopyMs, gfx::g_lastStagingMapMs, ctx.sealImguiMs, ctx.sealPassesMs,
+               msOf(encoded - sealed), msOf(published - encoded), msOf(prepareEnd - prepareStart),
+               gfx::g_stats.queuedPipelines);
     }
   }
 
@@ -1608,7 +1664,7 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
 
 // Synchronous frame submission: seal, encode and present inline on the calling thread. Used when
 // the frame worker is disabled (RenderDoc captures) and on the boot path.
-void end_frame_impl(bool pumpEvents, bool drainFifo) {
+void end_frame_impl(bool pumpEvents, bool drainFifo, bool present) {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gpu::fail_if_device_lost();
@@ -1617,8 +1673,11 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
   }
   gfx::SealedFrame sealedFrame;
   SealedFrameContext ctx;
+  ctx.present = present;
   std::vector<PresentationJob> presentationJobs;
   if (drainFifo) gx::fifo::drain();
+  gx::worker::sync();  // the GX thread has decoded everything this frame submitted
+  gx::worker::note_frame();
   {
     std::lock_guard gpuLock(g_rendererGpuMutex);
     seal_frame_locked(sealedFrame, ctx);
@@ -1629,6 +1688,7 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
 #else
   (void)pumpEvents;
   (void)drainFifo;
+  (void)present;
 #endif
 }
 
@@ -1638,6 +1698,8 @@ bool begin_frame() noexcept {
   // without entering begin_frame_impl(), so loss must be checked before it.
   gpu::fail_if_device_lost();
 #endif
+  // end_frame already synced; anything submitted since must still land in the frame it was meant for.
+  gx::worker::sync();
   if (!frame_worker_requested()) {
     return begin_frame_impl(true);
   }
@@ -1697,12 +1759,12 @@ bool begin_frame() noexcept {
   return prepared;
 }
 
-void end_frame() {
+void end_frame(bool present = true) {
 #ifdef AURORA_ENABLE_GX
   gpu::fail_if_device_lost();
 #endif
   if (!frame_worker_requested()) {
-    end_frame_impl(true, true);
+    end_frame_impl(true, true, present);
     return;
   }
 
@@ -1714,6 +1776,8 @@ void end_frame() {
   // Seal all current GX work on the CPU while the renderer is known ready.
   // Later FIFO writes belong exclusively to the next frame.
   gx::fifo::drain();
+  gx::worker::sync();  // the GX thread has decoded everything this frame submitted
+  gx::worker::note_frame();
   {
     std::lock_guard lock(g_frameWorker.mutex);
     g_frameWorker.framePrepared = false;
@@ -1721,10 +1785,21 @@ void end_frame() {
     g_frameWorker.ready.store(false, std::memory_order_release);
     g_frameWorker.jobPending = true;
     g_frameWorker.prepareAllowed = false;
+    g_frameWorker.present = present;
   }
   g_frameWorker.cv.notify_one();
 }
 } // namespace
+
+void run_frame_worker_wait_callback() noexcept {
+  // The pump runs guest code: never on the GX thread, whose producer pumps from its own sync() wait.
+  if (gx::worker::on_gx_thread()) {
+    return;
+  }
+  if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {
+    callback();
+  }
+}
 
 void wait_for_frame_worker() noexcept { wait_for_frame_worker_private(FrameWorkerPhase::Done); }
 std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept {
@@ -1735,6 +1810,7 @@ std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept {
   wait_for_frame_worker_private(FrameWorkerPhase::Sealed);
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
 }
+bool frame_worker_sealed() noexcept { return g_frameWorker.sealed.load(std::memory_order_acquire); }
 bool wait_for_frame_worker_for(std::chrono::microseconds timeout) noexcept {
   return wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);
 }
@@ -1753,10 +1829,29 @@ void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
+void aurora_end_frame_unpresented() { aurora::end_frame(false); }
 void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callback) {
   aurora::g_frameWorkerWaitCallback.store(callback, std::memory_order_release);
 }
 void aurora_wait_for_frame_worker() { aurora::wait_for_frame_worker(); }
+// Wait until the GX thread has decoded everything submitted so far (gx_worker.hpp); no-op when it is off. For runtime
+// code about to reuse memory it handed to GX by pointer.
+extern "C" void aurora_gx_sync() { aurora::gx::worker::sync(); }
+// An ordering point, not a wait: everything recorded so far is decoded before anything recorded after (drained; with
+// the GX thread on, handed to it in order). What GXDrawDone does for a copy that only needs FIFO order, without
+// waiting for the GX thread: copies are queued behind the draws they read.
+extern "C" void aurora_gx_order_point() {
+  aurora::gx::fifo::drain();
+  aurora::gx::worker::flush();
+}
+// The guest's GXFlush (gx_worker.hpp flush_point): the work submitted so far goes to the GX thread now.
+extern "C" void aurora_gx_flush_point() { aurora::gx::worker::flush_point(); }
+// Time the calling (producer) thread spent blocked waiting for the GX thread since the last call, in nanoseconds.
+extern "C" uint64_t aurora_gx_take_sync_wait_nanos() { return aurora::gx::worker::take_sync_wait_nanos(); }
+// Time the producer spent blocked waiting for the frame worker since the last call, in nanoseconds.
+extern "C" uint64_t aurora_take_frame_worker_wait_nanos() {
+  return aurora::g_producerFrameWorkerWaitNanos.exchange(0, std::memory_order_relaxed);
+}
 bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
   return aurora::wait_for_frame_worker_for(std::chrono::microseconds(timeoutMicros));
 }
@@ -1838,6 +1933,7 @@ bool aurora_flush_efb_copies_to_ram() {
   // suffix cannot safely be replayed against the same mutable EFB resources.
   aurora::gx::mark_frame_interpolation_replay_unsafe();
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // a readback: every submitted draw and copy decoded first
   if (!aurora::gfx::efb_ram::prepare_downloads()) return false;
   aurora::gpu::Encoder encoder;
   aurora::gfx::end_batch(encoder);
@@ -1857,7 +1953,14 @@ bool aurora_flush_efb_copies_to_ram() {
 }
 bool aurora_flush_efb_copy_to_ram(void* dest) {
 #ifdef AURORA_ENABLE_GX
-  if (dest == nullptr || !aurora::gfx::efb_ram::has_pending(dest)) {
+  // has_pending walks the pending-copy vectors, which the GX thread appends to (schedule, under this lock) and the
+  // frame worker clears: unlocked, a walk during a reallocating push_back can pair the old begin with the new end.
+  bool pending = false;
+  if (dest != nullptr) {
+    std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
+    pending = aurora::gfx::efb_ram::has_pending(dest);
+  }
+  if (!pending) {
     return false;
   }
 
@@ -1868,6 +1971,7 @@ bool aurora_flush_efb_copy_to_ram(void* dest) {
   // image instead of replaying this split frame.
   aurora::gx::mark_frame_interpolation_replay_unsafe();
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();  // a readback: every submitted draw and copy decoded first
   if (!aurora::gfx::efb_ram::prepare_downloads(dest)) return false;
   aurora::gpu::Encoder encoder;
   aurora::gfx::end_batch(encoder);
@@ -1891,6 +1995,10 @@ bool aurora_read_display_copy(uint8_t* rgba, uint32_t width, uint32_t height) {
   // The last finished display copy (the frame on screen), read back once and scaled to width x height RGBA:
   // what a game that reads its XFB with the CPU sees (Brawl's Classic score screen picture).
   aurora::wait_for_frame_worker();
+  // The GX thread reassigns displayCopyTexture (copy_disp_decoded): it must be idle before this copies the
+  // shared_ptr, or the copy can tear the pointer/control block (as the other readbacks: drain, then sync).
+  aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();
   const auto texture = aurora::gx::g_gxState.displayCopyTexture;
   if (!texture || rgba == nullptr || width == 0 || height == 0) return false;
   const auto format = texture->format;

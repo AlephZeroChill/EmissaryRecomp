@@ -7,8 +7,77 @@
 
 // Global shadow register instance
 static __GXData_struct sGXData;
-__GXData_struct* __gx = &sGXData;
+thread_local __GXData_struct* __gx = &sGXData;
 static GXFifoObj sFifoObj;
+
+// Deferred draws (runtime hle/g3d_native.cpp; gx_worker.hpp deferred jobs). The draw worker fills jobs on its own copy
+// of the shadow, loaded with the producer's at each recording; the producer then brings its own copy to where the
+// replay leaves it (GXShadowAfterDeferredDraw, after the runtime's vertex descriptor/format calls): the dirty bits the
+// replay's display-list calls flush cleared, and peCtrl's z-compare location when the draw set one (zCompLoc >= 0).
+extern "C" size_t GXShadowBytes() { return sizeof(__GXData_struct); }
+extern "C" void GXShadowSave(void* out) { std::memcpy(out, __gx, sizeof(__GXData_struct)); }
+extern "C" void GXShadowUseOwn(void* storage) { __gx = static_cast<__GXData_struct*>(storage); }
+extern "C" void GXShadowLoad(const void* in) { std::memcpy(__gx, in, sizeof(__GXData_struct)); }
+extern "C" void GXShadowAfterDeferredDraw(int zCompLoc) {
+  if (zCompLoc >= 0)
+    SET_REG_FIELD(0, __gx->peCtrl, 1, 6, zCompLoc);
+  __gx->dirtyState = 0;
+  __gx->dirtyVAT = 0;
+}
+extern "C" uint32_t GXShadowDirtyState() { return __gx->dirtyState; }
+// The dirty bits alone (dirtyState, dirtyVAT). The runtime's vertex-state take-back (hle/g3d_native.cpp) mirrors
+// deferred draws some GX calls after them: it keeps the bits those calls set across GXShadowAfterDeferredDraw, which
+// clears the bits as they were right after each draw.
+extern "C" void GXShadowSaveDirty(u32 out[2]) {
+  out[0] = __gx->dirtyState;
+  out[1] = __gx->dirtyVAT;
+}
+extern "C" void GXShadowLoadDirty(const u32 in[2]) {
+  __gx->dirtyState = in[0];
+  __gx->dirtyVAT = static_cast<u8>(in[1]);
+}
+// The shadow's vertex descriptor and format fields alone (GXSetVtxDesc / GXSetVtxAttrFmt write them): a draw worker
+// that carries the vertex state from one deferred draw to the next keeps its own across loading the producer's
+// shadow (whose copy is stale then), and publishes them at each job's end for the producer to take back.
+namespace {
+struct ShadowVtxFields {
+  u32 vcdLo, vcdHi;
+  GXAttrType nrmType;
+  u8 hasNrms, hasBiNrms;
+  u32 vatA[8], vatB[8], vatC[8];
+};
+} // namespace
+extern "C" size_t GXShadowVtxBytes() { return sizeof(ShadowVtxFields); }
+extern "C" void GXShadowSaveVtx(void* out) {
+  ShadowVtxFields f;
+  f.vcdLo = __gx->vcdLo;
+  f.vcdHi = __gx->vcdHi;
+  f.nrmType = __gx->nrmType;
+  f.hasNrms = __gx->hasNrms;
+  f.hasBiNrms = __gx->hasBiNrms;
+  std::memcpy(f.vatA, __gx->vatA, sizeof(f.vatA));
+  std::memcpy(f.vatB, __gx->vatB, sizeof(f.vatB));
+  std::memcpy(f.vatC, __gx->vatC, sizeof(f.vatC));
+  std::memcpy(out, &f, sizeof(f));
+}
+extern "C" void GXShadowLoadVtx(const void* in) {
+  ShadowVtxFields f;
+  std::memcpy(&f, in, sizeof(f));
+  __gx->vcdLo = f.vcdLo;
+  __gx->vcdHi = f.vcdHi;
+  __gx->nrmType = f.nrmType;
+  __gx->hasNrms = f.hasNrms;
+  __gx->hasBiNrms = f.hasBiNrms;
+  std::memcpy(__gx->vatA, f.vatA, sizeof(f.vatA));
+  std::memcpy(__gx->vatB, f.vatB, sizeof(f.vatB));
+  std::memcpy(__gx->vatC, f.vatC, sizeof(f.vatC));
+}
+// The draw worker at the end of a job: state the replay left dirty, sent at the job's end (the producer's copy has it
+// cleared). Counted by the caller; not expected (the replay ends with a display-list call, which flushes).
+extern "C" void GXShadowFlushDirty() {
+  if (__gx->dirtyState != 0)
+    __GXSetDirtyState();
+}
 
 extern "C" {
 static GXDrawDoneCallback DrawDoneCB = nullptr;
@@ -28,8 +97,10 @@ GXFifoObj* GXInit(void* base, u32 size) {
   __gx->tcsManEnab = 0;
   __gx->vNum = 0;
 
-  // Initialize FIFO subsystem
+  // Initialize FIFO subsystem (the GX thread, when on, idle first: init resets its decoder state).
+  aurora::gx::worker::sync();
   aurora::gx::fifo::init();
+  aurora::gx::worker::start();
   GXInitFifoBase(&sFifoObj, base, size);
   GXSetCPUFifo(&sFifoObj);
   GXSetGPFifo(&sFifoObj);
@@ -261,14 +332,19 @@ GXFifoObj* GXInit(void* base, u32 size) {
   return &sFifoObj;
 }
 
+// Draw done is where the game waits for the GPU: with the GX thread on, that means everything it was handed (the
+// guest may then reuse memory the GX thread reads lazily: vertex arrays, textures). Skipping it corrupts Brawl's
+// frame (black platforms, wrong textures); ordering-only callers use aurora_gx_order_point instead.
 void GXDrawDone() {
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();
   if (DrawDoneCB != nullptr)
     DrawDoneCB();
 }
 
 void GXSetDrawDone() {
   aurora::gx::fifo::drain();
+  aurora::gx::worker::sync();
   if (DrawDoneCB != nullptr)
     DrawDoneCB();
 }

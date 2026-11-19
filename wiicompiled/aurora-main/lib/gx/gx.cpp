@@ -1937,6 +1937,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   config.shaderConfig.tevStageCount = g_gxState.numTevStages;
   config.shaderConfig.numTexGens = g_gxState.numTexGens;
+  if (g_gxState.zFreeze) resolve_zfreeze_plane();
   config.shaderConfig.zFreeze = g_gxState.zFreeze && g_gxState.zFreezePlane.w() != 0.f;
   if (g_gxState.zTextureOp != GX_ZT_DISABLE && !g_gxState.zCompLocBeforeTex) {
     config.shaderConfig.zTexture = (g_gxState.zTextureBias & 0x00FFFFFFu) |
@@ -2020,6 +2021,24 @@ static GXBindGroups build_bind_groups_uncached(const ShaderInfo& info) noexcept 
     return {};
   }
 
+  // The slots' handles first: when the interned bindings already hold them (every set after its first draw), the id
+  // and those bindings are the result, and no texture or sampler reference is taken and dropped (16 of each a call).
+  // Handles, not references, across the loop: sampler_ref may insert, which moves its map's entries.
+  gfx::TextureBindingsRaw raw{};
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& tex = g_gxState.textures[i];
+    if (tex && tex.ref->texture && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
+      raw[i] = {.texture = tex.ref->texture->handle, .sampler = gfx::sampler_ref(tex.get_descriptor())->handle};
+    } else {
+      raw[i] = {.texture = sEmptyTexture->handle, .sampler = sEmptySampler->handle};
+    }
+  }
+  if (const auto [id, interned] = gfx::find_texture_bindings(raw, MaxTextures); interned != nullptr) {
+    return {
+        .textureBindGroup = id,
+        .resolvedTextureBindGroup = interned,
+    };
+  }
   gfx::TextureBindings bindings;
   for (u32 i = 0; i < MaxTextures; ++i) {
     const auto& tex = g_gxState.textures[i];

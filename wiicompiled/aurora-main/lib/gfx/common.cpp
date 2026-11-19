@@ -7,6 +7,7 @@
 #include "../internal.hpp"
 #include "../gpu/gpu.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/gx_worker.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -99,14 +100,17 @@ HashType hash_sampler(const SDL_GPUSamplerCreateInfo& info) {
   return xxh3_hash(key);
 }
 
-HashType hash_texture_bindings(const TextureBindings& bindings) {
+HashType hash_texture_bindings(const TextureBindingsRaw& raw, uint32_t count) {
   std::array<uintptr_t, MaxBoundTextures * 2 + 1> key{};
-  for (uint32_t i = 0; i < bindings.count; ++i) {
-    key[i * 2] = reinterpret_cast<uintptr_t>(bindings.raw[i].texture);
-    key[i * 2 + 1] = reinterpret_cast<uintptr_t>(bindings.raw[i].sampler);
+  for (uint32_t i = 0; i < count; ++i) {
+    key[i * 2] = reinterpret_cast<uintptr_t>(raw[i].texture);
+    key[i * 2 + 1] = reinterpret_cast<uintptr_t>(raw[i].sampler);
   }
-  key.back() = bindings.count;
+  key.back() = count;
   return xxh3_hash(key);
+}
+HashType hash_texture_bindings(const TextureBindings& bindings) {
+  return hash_texture_bindings(bindings.raw, bindings.count);
 }
 } // namespace
 } // namespace aurora::gfx
@@ -1076,7 +1080,14 @@ static void end_batch_impl(gpu::Encoder& cmd, bool advanceFrame) {
     bufferOffset += size;
     return writeSize;
   };
+  using StageClock = std::chrono::steady_clock;
+  const auto stageMs = [](StageClock::time_point t) {
+    return std::chrono::duration<double, std::milli>(StageClock::now() - t).count();
+  };
+  auto stageMark = StageClock::now();
   unmap_staging_buffer();
+  g_lastStagingUnmapMs = stageMs(stageMark);
+  stageMark = StageClock::now();
   g_stats.drawCallCount = g_drawCallCount;
   g_stats.mergedDrawCallCount = g_mergedDrawCallCount;
   g_stats.lastVertSize = writeBuffer(g_verts, g_vertexBuffer, VertexBufferSize);
@@ -1095,7 +1106,10 @@ static void end_batch_impl(gpu::Encoder& cmd, bool advanceFrame) {
     g_textureUpload.release();
   }
   currentStagingBuffer = (currentStagingBuffer + 1) % g_stagingBuffers.size();
+  g_lastStagingCopyMs = stageMs(stageMark);
+  stageMark = StageClock::now();
   map_staging_buffer();
+  g_lastStagingMapMs = stageMs(stageMark);
   g_currentRenderPass = UINT32_MAX;
   ++gx::g_arrayUploadEpoch;  // staging rotated: earlier array uploads are gone
   for (auto& array : gx::g_gxState.arrays) {
@@ -1113,7 +1127,9 @@ void end_batch(gpu::Encoder& cmd) { end_batch_impl(cmd, false); }
 
 void split_staging_batch() {
   // Never called under the decoder's renderer lock: the worker needs that lock
-  // to reach DONE. FIFO admission yields its unconsumed command first.
+  // to reach DONE. FIFO admission yields its unconsumed command first. The GX thread's batch-wide hold of it
+  // (gx_worker.cpp run_batch) is dropped here for the wait.
+  const gx::worker::BatchLockRelease batchLockRelease;
   aurora::wait_for_frame_worker();
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   if (!has_current_render_pass())
@@ -1567,6 +1583,18 @@ static inline Range map(ByteBuffer& target, size_t length, size_t alignment) {
 }
 Range push_verts(const uint8_t* data, size_t length) { return push(g_verts, data, length, 0); }
 Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, data, length, 0); }
+Range push_offset_indices(const uint16_t* src, size_t count, uint16_t offset) {
+  if (count == 0) return push(g_indices, nullptr, 0, 0);
+  // push(g_indices, data, count * 2, 0) without the intermediate buffer: no alignment, so no padding.
+  const size_t length = count * sizeof(uint16_t);
+  const auto begin = g_indices.size();
+  g_indices.append_uninitialized(length);
+  uint16_t* dst = reinterpret_cast<uint16_t*>(g_indices.data() + begin);
+  for (size_t i = 0; i < count; ++i) {
+    dst[i] = static_cast<uint16_t>(src[i] + offset);
+  }
+  return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length)};
+}
 Range push_uniform(const uint8_t* data, size_t length) { return push(g_uniforms, data, length, UniformAlignment); }
 Range push_storage(const uint8_t* data, size_t length) { return push(g_storage, data, length, StorageAlignment); }
 Range push_texture_data(const uint8_t* data, size_t length, u32 bytesPerRow, u32 rowsPerImage) {
@@ -1598,6 +1626,11 @@ std::pair<ByteBuffer, Range> copy_uniform(Range source) {
   std::memcpy(g_uniforms.data() + destination.offset, g_uniforms.data() + source.offset, source.size);
   return {ByteBuffer{g_uniforms.data() + destination.offset, destination.size}, destination};
 }
+const uint8_t* staged_bytes(int buffer, const Range& range) noexcept {
+  const ByteBuffer* buffers[] = {&g_verts, &g_uniforms, &g_indices, &g_storage};
+  const ByteBuffer& target = *buffers[buffer & 3];
+  return range.offset + range.size <= target.size() ? target.data() + range.offset : nullptr;
+}
 std::pair<ByteBuffer, Range> map_storage(size_t length) {
   const auto range = map(g_storage, length, StorageAlignment);
   return {ByteBuffer{g_storage.data() + range.offset, range.size}, range};
@@ -1615,6 +1648,17 @@ TextureBindingsRef texture_bindings_ref(TextureBindings&& bindings) {
     it->second.lastUsedFrame = g_frameIndex;
   }
   return id;
+}
+
+std::pair<TextureBindingsRef, const TextureBindings*> find_texture_bindings(const TextureBindingsRaw& raw,
+                                                                           uint32_t count) {
+  const auto id = hash_texture_bindings(raw, count);
+  const auto it = g_cachedBindGroups.find(id);
+  if (it == g_cachedBindGroups.end()) {
+    return {id, nullptr};
+  }
+  it->second.lastUsedFrame = g_frameIndex;  // as texture_bindings_ref for bindings it already holds
+  return {id, it->second.bindings.get()};
 }
 
 const TextureBindings& find_texture_bindings(TextureBindingsRef id) {
