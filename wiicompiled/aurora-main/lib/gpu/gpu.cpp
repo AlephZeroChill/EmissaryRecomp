@@ -809,8 +809,9 @@ bool initialize(AuroraBackend auroraBackend) {
     Log.error("Backend {} is not available on SDL_GPU", static_cast<int>(auroraBackend));
     return false;
   }
-  // GX shaders are generated at run time, so the device must take a language aurora can compile now.
-  constexpr SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL;
+  // GX shaders are generated at run time, so the device must take a language aurora can compile now:
+  // MSL (Metal compiles it) or SPIR-V (glslang, lib/gpu/shader.cpp).
+  constexpr SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
   if (g_device == nullptr) {
     g_device = SDL_CreateGPUDevice(formats, gfx_flag("debug"), driver);
     if (g_device == nullptr) {

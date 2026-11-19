@@ -3,6 +3,8 @@
 #include "../internal.hpp"
 
 #include <fmt/format.h>
+#include <glslang/Include/glslang_c_interface.h>
+#include <glslang/Public/resource_limits_c.h>
 
 #include <atomic>
 #include <cctype>
@@ -238,7 +240,7 @@ std::string assemble_glsl(const Interface& iface, std::string_view helpers, std:
     out += fmt::format("  if (p == {}u) {{ return {}[i]; }}\n", i, iface.storageBuffers[i]);
   }
   out += "  return 0u;\n}\n";
-  if (vertex || fragment) {
+  if ((vertex || fragment) && !iface.varyings.empty()) {  // GLSL has no empty interface blocks
     out += fmt::format("layout(location = 0) {} VOut {{\n", vertex ? "out" : "in");
     for (const auto& v : iface.varyings) {
       out += fmt::format("  {}{} {};\n", v.flat ? "flat " : "", v.type, v.name);
@@ -324,6 +326,62 @@ void log_source(const char* label, const std::string& source) {
 }
 } // namespace
 
+namespace {
+// Vulkan GLSL -> SPIR-V words with glslang (entry point `main`). Logs the source and returns empty on failure.
+std::vector<uint32_t> compile_spirv(glslang_stage_t stage, const std::string& source, const char* label) {
+  static const bool initialized = glslang_initialize_process() != 0;
+  if (!initialized) {
+    Log.error("Shader {}: glslang failed to initialize", label);
+    return {};
+  }
+  const glslang_input_t input{
+      .language = GLSLANG_SOURCE_GLSL,
+      .stage = stage,
+      .client = GLSLANG_CLIENT_VULKAN,
+      .client_version = GLSLANG_TARGET_VULKAN_1_1,
+      .target_language = GLSLANG_TARGET_SPV,
+      .target_language_version = GLSLANG_TARGET_SPV_1_3,
+      .code = source.c_str(),
+      .default_version = 450,
+      .default_profile = GLSLANG_CORE_PROFILE,
+      .force_default_version_and_profile = false,
+      .forward_compatible = false,
+      .messages = GLSLANG_MSG_DEFAULT_BIT,
+      .resource = glslang_default_resource(),
+  };
+  std::vector<uint32_t> words;
+  glslang_shader_t* shader = glslang_shader_create(&input);
+  glslang_program_t* program = nullptr;
+  if (!glslang_shader_preprocess(shader, &input) || !glslang_shader_parse(shader, &input)) {
+    Log.error("Shader {}: GLSL error:\n{}", label, glslang_shader_get_info_log(shader));
+    log_source(label, source);
+  } else {
+    program = glslang_program_create();
+    glslang_program_add_shader(program, shader);
+    if (!glslang_program_link(program, GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT)) {
+      Log.error("Shader {}: GLSL link error:\n{}", label, glslang_program_get_info_log(program));
+      log_source(label, source);
+    } else {
+      glslang_program_SPIRV_generate(program, stage);
+      words.resize(glslang_program_SPIRV_get_size(program));
+      glslang_program_SPIRV_get(program, words.data());
+    }
+  }
+  if (program != nullptr) {
+    glslang_program_delete(program);
+  }
+  glslang_shader_delete(shader);
+  return words;
+}
+
+glslang_stage_t glslang_stage(const Interface& iface) {
+  if (iface.compute) {
+    return GLSLANG_STAGE_COMPUTE;
+  }
+  return iface.stage == SDL_GPU_SHADERSTAGE_VERTEX ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT;
+}
+} // namespace
+
 Language language() noexcept {
   if (g_device != nullptr && (SDL_GetGPUShaderFormats(g_device) & SDL_GPU_SHADERFORMAT_MSL) != 0) {
     return Language::MSL;
@@ -340,17 +398,22 @@ std::string assemble(const Interface& iface, std::string_view helpers, std::stri
 }
 
 Shader create(const Interface& iface, std::string_view helpers, std::string_view body, const char* label) {
-  if (language() != Language::MSL) {
-    Log.error("Shader {}: this device needs SPIR-V, and no GLSL compiler is linked", label);
-    return nullptr;
+  const Language lang = language();
+  const auto source = assemble(lang, iface, helpers, body);
+  dump_source(label, lang, source);
+  std::vector<uint32_t> spirv;
+  if (lang == Language::GLSL) {
+    spirv = compile_spirv(glslang_stage(iface), source, label);
+    if (spirv.empty()) {
+      return nullptr;
+    }
   }
-  const auto source = assemble(Language::MSL, iface, helpers, body);
-  dump_source(label, Language::MSL, source);
   const SDL_GPUShaderCreateInfo info{
-      .code_size = source.size(),
-      .code = reinterpret_cast<const Uint8*>(source.c_str()),
-      .entrypoint = entry_name(iface),
-      .format = SDL_GPU_SHADERFORMAT_MSL,
+      .code_size = lang == Language::GLSL ? spirv.size() * sizeof(uint32_t) : source.size(),
+      .code = lang == Language::GLSL ? reinterpret_cast<const Uint8*>(spirv.data())
+                                     : reinterpret_cast<const Uint8*>(source.c_str()),
+      .entrypoint = lang == Language::GLSL ? "main" : entry_name(iface),
+      .format = lang == Language::GLSL ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_MSL,
       .stage = iface.stage,
       .num_samplers = static_cast<Uint32>(iface.textures.size()),
       .num_storage_textures = 0,
@@ -369,19 +432,24 @@ Shader create(const Interface& iface, std::string_view helpers, std::string_view
 
 ComputePipeline create_compute(const Interface& iface, std::string_view helpers, std::string_view body,
                                const char* label) {
-  if (language() != Language::MSL) {
-    Log.error("Compute shader {}: this device needs SPIR-V, and no GLSL compiler is linked", label);
-    return nullptr;
-  }
+  const Language lang = language();
   Interface compute = iface;
   compute.compute = true;
-  const auto source = assemble(Language::MSL, compute, helpers, body);
-  dump_source(label, Language::MSL, source);
+  const auto source = assemble(lang, compute, helpers, body);
+  dump_source(label, lang, source);
+  std::vector<uint32_t> spirv;
+  if (lang == Language::GLSL) {
+    spirv = compile_spirv(GLSLANG_STAGE_COMPUTE, source, label);
+    if (spirv.empty()) {
+      return nullptr;
+    }
+  }
   const SDL_GPUComputePipelineCreateInfo info{
-      .code_size = source.size(),
-      .code = reinterpret_cast<const Uint8*>(source.c_str()),
-      .entrypoint = "cs_main",
-      .format = SDL_GPU_SHADERFORMAT_MSL,
+      .code_size = lang == Language::GLSL ? spirv.size() * sizeof(uint32_t) : source.size(),
+      .code = lang == Language::GLSL ? reinterpret_cast<const Uint8*>(spirv.data())
+                                     : reinterpret_cast<const Uint8*>(source.c_str()),
+      .entrypoint = lang == Language::GLSL ? "main" : "cs_main",
+      .format = lang == Language::GLSL ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_MSL,
       .num_samplers = static_cast<Uint32>(compute.textures.size()),
       .num_readonly_storage_textures = 0,
       .num_readonly_storage_buffers = count_buffers(compute.storageBuffers),

@@ -240,6 +240,26 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing Freetype")
   endif ()
 
+  # GLSL -> SPIR-V for SDL_GPU's Vulkan backend (lib/gpu/shader.cpp): GX shaders are generated at run
+  # time. Only the GLSL front end and SPIR-V writer: no HLSL, no SPIRV-Tools optimizer, no tools or tests.
+  if (NOT TARGET glslang)
+    message(STATUS "aurora: Fetching glslang")
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(glslang
+      URL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz
+      URL_HASH SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(glslang)
+  endif ()
+
   if (NOT TARGET imgui)
     message(STATUS "aurora: Fetching imgui")
     FetchContent_Declare(imgui
