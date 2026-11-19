@@ -2,7 +2,7 @@
 
 #include "../internal.hpp"
 #include "../gx/gx.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../gpu/gpu.hpp"
 #include "dds_io.hpp"
 #include "texture_convert.hpp"
 
@@ -27,7 +27,6 @@
 #include "../fs_helper.hpp"
 
 using namespace aurora::gx;
-using aurora::webgpu::g_device;
 
 namespace aurora::gfx::texture_replacement {
 Module Log("aurora::gfx::texture_replacement");
@@ -389,21 +388,19 @@ static std::optional<ConvertedTexture> load_texture_file(const std::filesystem::
 
 constexpr bool isUnsupportedTextureFormat(const ConvertedTexture& texture) {
   switch (texture.format) {
-  case wgpu::TextureFormat::BC1RGBAUnorm:
-  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC2RGBAUnorm:
-  case wgpu::TextureFormat::BC2RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC3RGBAUnorm:
-  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC4RUnorm:
-  case wgpu::TextureFormat::BC4RSnorm:
-  case wgpu::TextureFormat::BC5RGUnorm:
-  case wgpu::TextureFormat::BC5RGSnorm:
-  case wgpu::TextureFormat::BC6HRGBUfloat:
-  case wgpu::TextureFormat::BC6HRGBFloat:
-  case wgpu::TextureFormat::BC7RGBAUnorm:
-  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
-    return !webgpu::g_bcTexturesSupported;
+  case SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM_SRGB:
+  case SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM_SRGB:
+  case SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM_SRGB:
+  case SDL_GPU_TEXTUREFORMAT_BC4_R_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC6H_RGB_UFLOAT:
+  case SDL_GPU_TEXTUREFORMAT_BC6H_RGB_FLOAT:
+  case SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM:
+  case SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM_SRGB:
+    return !gpu::g_bcTexturesSupported;
   default:
     return false;
   }
@@ -655,31 +652,19 @@ gfx::TextureHandle load_replacement_texture(const RuntimeTextureKey& key, const 
   }
 
   const auto label = fmt::format("TextureReplacement {}", format_replacement_filename(key));
-  const wgpu::Extent3D size{
+  const Extent3D size{
       .width = replacement->width,
       .height = replacement->height,
       .depthOrArrayLayers = 1,
   };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label.c_str(),
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = replacement->format,
-      .mipLevelCount = replacement->mips,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-  const auto viewLabel = fmt::format("{} view", label);
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = replacement->format,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = replacement->mips,
-  };
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size,
-                                                  replacement->format, replacement->mips, gfx::InvalidTextureFormat);
+  auto texture = gpu::create_texture_2d(size.width, size.height, replacement->format, SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                                        label.c_str(), replacement->mips);
+  if (!texture) {
+    s_failedKeys.insert(key);
+    return {};
+  }
+  auto handle = std::make_shared<gfx::TextureRef>(std::move(texture), size, replacement->format, replacement->mips,
+                                                  gfx::InvalidTextureFormat);
   handle->isReplacement = true;
   handle->spmMarker = entry.marker;
   gfx::write_texture(*handle, replacement->data);
@@ -714,9 +699,9 @@ bool dump_editable_texture_dds(const RuntimeTextureKey& key, const GXTexObj_& ob
     pixels = convert_texture(obj.format(), texWidth, texHeight, 1, texData);
   }
 
-  const uint64_t rgbaBytes = calc_texture_size(wgpu::TextureFormat::RGBA8Unorm, texWidth, texHeight, 1);
+  const uint64_t rgbaBytes = calc_texture_size(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, texWidth, texHeight, 1);
 
-  if (pixels.data.empty() || pixels.format != wgpu::TextureFormat::RGBA8Unorm || pixels.data.size() != rgbaBytes) {
+  if (pixels.data.empty() || pixels.format != SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM || pixels.data.size() != rgbaBytes) {
     return false;
   }
 

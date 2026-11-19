@@ -16,13 +16,16 @@ constexpr uint32_t max_texture_mip_count(uint32_t width, uint32_t height) noexce
   return count;
 }
 
+// A pending copy from the frame's texture upload staging (push_texture_data) into a texture.
 struct TextureUpload {
-  wgpu::TexelCopyBufferLayout layout;
-  wgpu::TexelCopyTextureInfo tex;
-  wgpu::Extent3D size;
-
-  TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) noexcept
-  : layout(layout), tex(std::move(tex)), size(size) {}
+  uint64_t offset = 0;         // into the texture upload staging
+  uint32_t pixelsPerRow = 0;   // source row pitch, in texels
+  uint32_t rowsPerImage = 0;   // in texel rows
+  gpu::Texture texture;
+  uint32_t mip = 0;
+  uint32_t layer = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
 };
 extern std::vector<TextureUpload> g_textureUploads;
 
@@ -32,31 +35,29 @@ struct TextureFormatInfo {
   uint8_t blockSize;
   bool compressed;
 };
-TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept;
-uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
+TextureFormatInfo format_info(SDL_GPUTextureFormat format) noexcept;
+uint64_t calc_texture_size(SDL_GPUTextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
 
 constexpr u32 InvalidTextureFormat = -1;
+struct Extent3D {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t depthOrArrayLayers = 1;
+};
+
 struct TextureRef {
-  wgpu::Texture texture;
-  wgpu::TextureView sampleTextureView;
-  wgpu::TextureView attachmentTextureView;
-  wgpu::Extent3D size;
-  wgpu::TextureFormat format;
+  // Sampled and attached as a whole (SDL_GPU has no views).
+  gpu::Texture texture;
+  Extent3D size;
+  SDL_GPUTextureFormat format;
   uint32_t mipCount;
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
   uint8_t spmMarker = 0;  // New Super Paper Bros.: from button_icons/<style>/marker<N> (where it's drawn is reported)
 
-  TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
-             wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
-  : texture(std::move(texture))
-  , sampleTextureView(std::move(sampleTextureView))
-  , attachmentTextureView(std::move(attachmentTextureView))
-  , size(size)
-  , format(format)
-  , mipCount(mipCount)
-  , gxFormat(gxFormat) {}
+  TextureRef(gpu::Texture texture, Extent3D size, SDL_GPUTextureFormat format, uint32_t mipCount, u32 gxFormat)
+  : texture(std::move(texture)), size(size), format(format), mipCount(mipCount), gxFormat(gxFormat) {}
 };
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
@@ -142,7 +143,7 @@ struct TextureBind {
   TextureBind() noexcept = default;
   TextureBind(const GXTexObj_& obj, TextureHandle handle) noexcept : ref(std::move(handle)), texObj(obj) {}
   void reset() noexcept { ref.reset(); }
-  [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
+  [[nodiscard]] SDL_GPUSamplerCreateInfo get_descriptor() const noexcept;
   operator bool() const noexcept { return ref.operator bool(); }
 };
 } // namespace aurora::gfx

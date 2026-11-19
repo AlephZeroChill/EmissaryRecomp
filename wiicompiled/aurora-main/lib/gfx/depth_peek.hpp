@@ -21,8 +21,8 @@ struct FrameMapping {
 };
 FrameMapping capture_frame_mapping() noexcept;
 
-void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
-                           wgpu::Extent3D sourceSize, uint32_t msaaSamples, const FrameMapping& mapping) noexcept;
+void encode_frame_snapshot(gpu::Encoder& enc, const gpu::Texture& depth, uint32_t msaaSamples,
+                           const FrameMapping& mapping) noexcept;
 void after_submit() noexcept;
 
 namespace testing {

@@ -58,9 +58,6 @@ if (_AURORA_EXCLUDE_HOST_HOMEBREW)
   message(STATUS "aurora: cross-architecture macOS build; ignoring host Homebrew prefixes")
 endif ()
 
-if (AURORA_ENABLE_GX)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
-endif ()
 
 # SDL's pkg-config probe can bypass CMake's prefix exclusion. macOS does not
 # need libusb for the supported SDL input paths, so keep that host-only library
@@ -70,8 +67,7 @@ if (_AURORA_EXCLUDE_HOST_HOMEBREW)
   set(SDL_HIDAPI_LIBUSB_SHARED OFF CACHE BOOL "" FORCE)
 endif ()
 
-# Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
-# Otherwise prefer a system package and only fetch it as a last resort.
+# Abseil is needed for core libraries. Prefer a system package and only fetch it as a last resort.
 if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
@@ -99,10 +95,6 @@ endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraSDL3Provider.cmake)
 
-if (AURORA_ENABLE_GX)
-  # Dawn or the SDL_GPU implementation of the same WebGPU API (needs Dawn's headers and SDL3 above).
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/aurora_sdlgpu.cmake)
-endif ()
 
 if (NOT TARGET xxhash)
   message(STATUS "aurora: Fetching xxhash")
@@ -270,10 +262,9 @@ if (AURORA_ENABLE_GX)
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
     )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} ${AURORA_WEBGPU_TARGET})
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)
@@ -306,48 +297,6 @@ if (AURORA_ENABLE_GX)
     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
   else ()
     message(STATUS "aurora: Using existing sqlite3")
-  endif ()
-
-  if (AURORA_CACHE_USE_ZSTD)
-    if (NOT TARGET libzstd_static)
-      message(STATUS "aurora: Fetching zstd")
-      set(ZSTD_BUILD_STATIC ON)
-      set(ZSTD_BUILD_SHARED OFF)
-      set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "BUILD PROGRAMS" FORCE)
-      set(ZSTD_BUILD_TESTS OFF CACHE BOOL "BUILD TESTS" FORCE)
-
-      if (WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set(C_FLAG_WALL TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WALL TRUE CACHE INTERNAL "")
-        set(C_FLAG_WEXTRA TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WEXTRA TRUE CACHE INTERNAL "")
-        set(C_FLAG_WUNDEF TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WUNDEF TRUE CACHE INTERNAL "")
-        set(C_FLAG_WSHADOW TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WSHADOW TRUE CACHE INTERNAL "")
-        set(C_FLAG_WCAST_ALIGN TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WCAST_ALIGN TRUE CACHE INTERNAL "")
-        set(C_FLAG_WCAST_QUAL TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WCAST_QUAL TRUE CACHE INTERNAL "")
-        set(C_FLAG_WSTRICT_PROTOTYPES TRUE CACHE INTERNAL "")
-        set(LD_FLAG_WL_Z_NOEXECSTACK FALSE CACHE INTERNAL "")
-        set(C_FLAG_QUNUSED_ARGUMENTS TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_QUNUSED_ARGUMENTS TRUE CACHE INTERNAL "")
-        set(C_FLAG_WA_NOEXECSTACK TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WA_NOEXECSTACK TRUE CACHE INTERNAL "")
-      endif()
-
-      FetchContent_Declare(zstd
-        URL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
-        URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-        SOURCE_SUBDIR build/cmake
-        EXCLUDE_FROM_ALL
-      )
-      FetchContent_MakeAvailable(zstd)
-    else ()
-      message(STATUS "aurora: Using existing zstd")
-    endif ()
   endif ()
 endif ()
 

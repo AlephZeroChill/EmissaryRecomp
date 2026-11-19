@@ -1,19 +1,19 @@
 #include "clear.hpp"
 
-#include "../webgpu/gpu.hpp"
+#include "../gpu/gpu.hpp"
+#include "../gpu/shader.hpp"
 #include "aurora/profiling.hpp"
 
 #include <algorithm>
-#include <array>
 
 namespace {
-wgpu::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
-  auto writeMask = wgpu::ColorWriteMask::None;
+SDL_GPUColorComponentFlags clear_write_mask(bool clearColor, bool clearAlpha) {
+  SDL_GPUColorComponentFlags writeMask = 0;
   if (clearColor) {
-    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+    writeMask |= SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B;
   }
   if (clearAlpha) {
-    writeMask |= wgpu::ColorWriteMask::Alpha;
+    writeMask |= SDL_GPU_COLORCOMPONENT_A;
   }
   return writeMask;
 }
@@ -21,142 +21,105 @@ wgpu::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
 
 namespace aurora::gfx::clear {
 
-using webgpu::g_device;
-using webgpu::g_graphicsConfig;
+using gpu::g_graphicsConfig;
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+gpu::GraphicsPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
-  wgpu::ShaderSourceWGSL sourceDescriptor{};
-  sourceDescriptor.code = R"""(
-struct VertexOutput {
-    @builtin(position) pos: vec4<f32>,
-};
-
-struct ClearUniform {
-    depth: f32,
-};
-
-struct FragmentOutput {
-    @location(0) color: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-};
-
-@group(1) @binding(0) var<uniform> clear: ClearUniform;
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-
-@vertex
-fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.pos = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    return out;
-}
-
-@fragment
-fn fs_main() -> FragmentOutput {
-    var out: FragmentOutput;
-    out.color = vec4<f32>(1.0);
-    out.depth = clear.depth;
-    return out;
-}
-)""";
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &sourceDescriptor,
-      .label = "EFB Clear Module",
+  const gpu::shader::Interface vs{.stage = SDL_GPU_SHADERSTAGE_VERTEX};
+  constexpr std::string_view vsBody = R"(
+  vec2 p = vidx == 0u ? vec2(-1.0, 1.0) : (vidx == 1u ? vec2(-1.0, -3.0) : vec2(3.0, 1.0));
+  out_pos = vec4(p, 0.0, 1.0);)";
+  const gpu::shader::Interface fs{
+      .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+      // x: depth
+      .uniforms = {{"clear", "vec4 value;"}},
+      .writesDepth = true,
   };
-  auto module = g_device.CreateShaderModule(&moduleDescriptor);
-  const std::array layouts{
-      g_staticBindGroupLayout,
-      g_uniformBindGroupLayout,
-  };
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .label = "EFB Clear Pipeline Layout",
-      .bindGroupLayoutCount = layouts.size(),
-      .bindGroupLayouts = layouts.data(),
-  };
-  auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-  constexpr wgpu::BlendState blendState{
-      .color =
-          wgpu::BlendComponent{
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
-          },
-      .alpha =
-          wgpu::BlendComponent{
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
+  constexpr std::string_view fsBody = R"(
+  out_color = vec4(1.0);
+  out_depth = clear.value.x;)";
+  const auto vertex = gpu::shader::create(vs, {}, vsBody, "EFB Clear vertex");
+  const auto fragment = gpu::shader::create(fs, {}, fsBody, "EFB Clear fragment");
+  if (!vertex || !fragment) {
+    return nullptr;
+  }
+  const SDL_GPUColorTargetDescription colorTarget{
+      .format = g_graphicsConfig.surfaceFormat,
+      .blend_state =
+          SDL_GPUColorTargetBlendState{
+              .src_color_blendfactor = SDL_GPU_BLENDFACTOR_CONSTANT_COLOR,
+              .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO,
+              .color_blend_op = SDL_GPU_BLENDOP_ADD,
+              .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_CONSTANT_COLOR,
+              .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO,
+              .alpha_blend_op = SDL_GPU_BLENDOP_ADD,
+              .color_write_mask = clear_write_mask(config.clearColor, config.clearAlpha),
+              .enable_blend = true,
+              .enable_color_write_mask = true,
           },
   };
-  const wgpu::ColorTargetState colorTarget{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = clear_write_mask(config.clearColor, config.clearAlpha),
-  };
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = 1,
-      .targets = &colorTarget,
-  };
-  const wgpu::DepthStencilState depthStencil{
-      .format = g_graphicsConfig.depthFormat,
-      .depthWriteEnabled = config.clearDepth,
-      .depthCompare = wgpu::CompareFunction::Always,
+  const SDL_GPUGraphicsPipelineCreateInfo info{
+      .vertex_shader = vertex->handle,
+      .fragment_shader = fragment->handle,
+      .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+      .rasterizer_state =
+          {
+              .fill_mode = SDL_GPU_FILLMODE_FILL,
+              .cull_mode = SDL_GPU_CULLMODE_NONE,
+              .enable_depth_clip = true,
+          },
+      .multisample_state = {.sample_count = gpu::sample_count(config.msaaSamples)},
+      .depth_stencil_state =
+          {
+              .compare_op = SDL_GPU_COMPAREOP_ALWAYS,
+              .enable_depth_test = true,
+              .enable_depth_write = config.clearDepth,
+          },
+      .target_info =
+          {
+              .color_target_descriptions = &colorTarget,
+              .num_color_targets = 1,
+              .depth_stencil_format = g_graphicsConfig.depthFormat,
+              .has_depth_stencil_target = true,
+          },
   };
   const auto label = fmt::format("EFB Clear Pipeline (color {}, alpha {}, depth {})", config.clearColor,
                                  config.clearAlpha, config.clearDepth);
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = label.c_str(),
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = &depthStencil,
-      .multisample =
-          wgpu::MultisampleState{
-              .count = config.msaaSamples,
-          },
-      .fragment = &fragmentState,
-  };
-  return g_device.CreateRenderPipeline(&pipelineDescriptor);
+  return gpu::create_graphics_pipeline(info, label.c_str());
 }
 
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize,
-            PipelineRef& currentPipeline) {
-  if (!bind_pipeline(data.pipeline, pass, currentPipeline)) {
+void render(const DrawData& data, const PassContext& ctx, PipelineRef& currentPipeline) {
+  if (!bind_pipeline(data.pipeline, ctx, currentPipeline)) {
     return;
   }
 
-  const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, g_uniformBindGroup, offsets.size(), offsets.data());
-  pass.SetBlendConstant(&data.color);
-  pass.SetViewport(0.f, 0.f, static_cast<float>(targetSize.width), static_cast<float>(targetSize.height), 0.f, 1.f);
+  const uint32_t targetWidth = ctx.targetWidth;
+  const uint32_t targetHeight = ctx.targetHeight;
+  SDL_PushGPUFragmentUniformData(ctx.cmd, 0, ctx.uniform(data.uniformRange), data.uniformRange.size);
+  SDL_SetGPUBlendConstants(ctx.pass, data.color);
+  const SDL_GPUViewport viewport{
+      .x = 0.f,
+      .y = 0.f,
+      .w = static_cast<float>(targetWidth),
+      .h = static_cast<float>(targetHeight),
+      .min_depth = 0.f,
+      .max_depth = 1.f,
+  };
+  SDL_SetGPUViewport(ctx.pass, &viewport);
+  SDL_Rect scissor{0, 0, static_cast<int>(targetWidth), static_cast<int>(targetHeight)};
   if (data.useScissor) {
-    const auto x = static_cast<uint32_t>(std::clamp<int32_t>(data.scissor.x, 0, static_cast<int32_t>(targetSize.width)));
-    const auto y = static_cast<uint32_t>(std::clamp<int32_t>(data.scissor.y, 0, static_cast<int32_t>(targetSize.height)));
-    const auto right = static_cast<uint32_t>(std::clamp<int32_t>(
-        data.scissor.x + data.scissor.width, 0, static_cast<int32_t>(targetSize.width)));
-    const auto bottom = static_cast<uint32_t>(std::clamp<int32_t>(
-        data.scissor.y + data.scissor.height, 0, static_cast<int32_t>(targetSize.height)));
+    const auto x = std::clamp<int32_t>(data.scissor.x, 0, static_cast<int32_t>(targetWidth));
+    const auto y = std::clamp<int32_t>(data.scissor.y, 0, static_cast<int32_t>(targetHeight));
+    const auto right =
+        std::clamp<int32_t>(data.scissor.x + data.scissor.width, 0, static_cast<int32_t>(targetWidth));
+    const auto bottom =
+        std::clamp<int32_t>(data.scissor.y + data.scissor.height, 0, static_cast<int32_t>(targetHeight));
     if (right <= x || bottom <= y) {
       return;
     }
-    pass.SetScissorRect(x, y, right - x, bottom - y);
-  } else {
-    pass.SetScissorRect(0, 0, targetSize.width, targetSize.height);
+    scissor = SDL_Rect{x, y, right - x, bottom - y};
   }
-  pass.Draw(3);
+  SDL_SetGPUScissor(ctx.pass, &scissor);
+  SDL_DrawGPUPrimitives(ctx.pass, 3, 1, 0, 0);
 }
 } // namespace aurora::gfx::clear

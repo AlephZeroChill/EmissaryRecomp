@@ -3,22 +3,21 @@
 #include <cstddef>
 #include <cmath>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_render.h>
 
 #include "fs_helper.hpp"
 #include "internal.hpp"
-#include "webgpu/gpu.hpp"
+#include "gpu/gpu.hpp"
 #include "window.hpp"
 
-#define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
 #include "backends/imgui_impl_sdl3.h"
+#include "backends/imgui_impl_sdlgpu3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
-#include "backends/imgui_impl_wgpu.h"
 #include "aurora/profiling.hpp"
 
 namespace aurora::imgui {
@@ -29,8 +28,20 @@ static bool g_useSdlRenderer = false;
 // ImGui passes per frame, and every one of them used to rebuild the draw lists from scratch.
 static bool g_frameDataBuilt = false;
 
+// An image handed to ImGui: ImTextureID is a pointer to `binding`, so entries must not move.
+struct GpuTexture {
+  gpu::Texture texture;
+  SDL_GPUTextureSamplerBinding binding{};
+};
+
 static std::vector<SDL_Texture*> g_sdlTextures;
-static std::vector<wgpu::Texture> g_wgpuTextures;
+static std::vector<std::unique_ptr<GpuTexture>> g_gpuTextures;
+static gpu::Sampler g_gpuSampler;
+
+static void recreate_device_objects() noexcept {
+  ImGui_ImplSDLGPU3_DestroyDeviceObjects();
+  ImGui_ImplSDLGPU3_CreateDeviceObjects();
+}
 
 void remove_legacy_ini_file(const char* basePath) noexcept {
   if (basePath == nullptr || *basePath == '\0') {
@@ -63,13 +74,11 @@ void initialize() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
   } else {
-    ImGui_ImplWGPU_InitInfo info;
-    info.Device = webgpu::g_device.Get();
-    info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
-    // Interpolation records up to four ImGui passes in one command buffer, so keep three logical
-    // frames of renderer resources to stop them overwriting each other's vertex/index buffers.
-    info.NumFramesInFlight = 12;
-    ImGui_ImplWGPU_Init(&info);
+    ImGui_ImplSDLGPU3_InitInfo info;
+    info.Device = gpu::g_device;
+    info.ColorTargetFormat = gpu::g_graphicsConfig.surfaceFormat;
+    info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+    ImGui_ImplSDLGPU3_Init(&info);
   }
 }
 
@@ -83,7 +92,7 @@ void shutdown() noexcept {
       if (g_useSdlRenderer) {
         ImGui_ImplSDLRenderer3_Shutdown();
       } else {
-        ImGui_ImplWGPU_Shutdown();
+        ImGui_ImplSDLGPU3_Shutdown();
       }
     }
     if (io.BackendPlatformUserData != nullptr) {
@@ -95,7 +104,8 @@ void shutdown() noexcept {
     SDL_DestroyTexture(texture);
   }
   g_sdlTextures.clear();
-  g_wgpuTextures.clear();
+  g_gpuTextures.clear();
+  g_gpuSampler.reset();
   g_useSdlRenderer = false;
   g_scale = 0.f;
   g_frameDataBuilt = false;
@@ -166,14 +176,14 @@ void new_frame(const AuroraWindowSize& size) noexcept {
   } else {
     if (g_scale != size.scale) {
       if (g_scale > 0.f) {
-        ImGui_ImplWGPU_CreateDeviceObjects();
+        recreate_device_objects();
       }
       g_scale = size.scale;
     }
     if (!ImGui::GetIO().Fonts->IsBuilt()) {
-      ImGui_ImplWGPU_CreateDeviceObjects();
+      recreate_device_objects();
     }
-    ImGui_ImplWGPU_NewFrame();
+    ImGui_ImplSDLGPU3_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
 
@@ -195,7 +205,16 @@ void render_frame_data() noexcept {
   g_frameDataBuilt = true;
 }
 
-void render(const wgpu::RenderPassEncoder& pass) noexcept {
+void prepare(SDL_GPUCommandBuffer* cmd) noexcept {
+  ZoneScoped;
+  render_frame_data();
+  if (g_useSdlRenderer) {
+    return;
+  }
+  Imgui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), cmd);
+}
+
+void render(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass) noexcept {
   ZoneScoped;
   render_frame_data();
 
@@ -206,9 +225,9 @@ void render(const wgpu::RenderPassEncoder& pass) noexcept {
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
   } else {
-    pass.PushDebugGroup("Aurora: Dear Imgui");
-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
-    pass.PopDebugGroup();
+    SDL_PushGPUDebugGroup(cmd, "Aurora: Dear Imgui");
+    ImGui_ImplSDLGPU3_RenderDrawData(data, cmd, pass);
+    SDL_PopGPUDebugGroup(cmd);
   }
 }
 
@@ -220,41 +239,31 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
     g_sdlTextures.push_back(texture);
     return reinterpret_cast<ImTextureID>(texture);
   }
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = "imgui texture",
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = "imgui texture view",
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = WGPU_MIP_LEVEL_COUNT_UNDEFINED,
-      .arrayLayerCount = WGPU_ARRAY_LAYER_COUNT_UNDEFINED,
-  };
-  auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  {
-    const wgpu::TexelCopyTextureInfo dstView{
-        .texture = texture,
+  if (!g_gpuSampler) {
+    const SDL_GPUSamplerCreateInfo samplerInfo{
+        .min_filter = SDL_GPU_FILTER_LINEAR,
+        .mag_filter = SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+        .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .max_anisotropy = 1.0f,
+        .max_lod = 1000.0f,
     };
-    const wgpu::TexelCopyBufferLayout dataLayout{
-        .bytesPerRow = 4 * width,
-        .rowsPerImage = height,
-    };
-    webgpu::g_queue.WriteTexture(&dstView, data, width * height * 4, &dataLayout, &size);
+    g_gpuSampler = gpu::create_sampler(samplerInfo);
   }
-  g_wgpuTextures.push_back(texture);
-  return reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
+  auto texture = gpu::create_texture_2d(width, height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                                        SDL_GPU_TEXTUREUSAGE_SAMPLER, "imgui texture");
+  if (!texture || !g_gpuSampler) {
+    return ImTextureID{};
+  }
+  gpu::write_texture(*texture, 0, 0, width, height, 0, 0, data, 4 * width, height);
+  auto entry = std::make_unique<GpuTexture>();
+  entry->binding = {.texture = texture->handle, .sampler = g_gpuSampler->handle};
+  entry->texture = std::move(texture);
+  const auto id = reinterpret_cast<ImTextureID>(&entry->binding);
+  g_gpuTextures.push_back(std::move(entry));
+  return id;
 }
 } // namespace aurora::imgui
 

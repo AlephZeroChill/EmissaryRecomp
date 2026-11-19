@@ -43,5 +43,4 @@ add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
 target_link_libraries(aurora_gx PUBLIC aurora::core xxhash)
-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map ${AURORA_WEBGPU_TARGET} sqlite3 $<$<BOOL:${TRACY_ENABLE}>:TracyClient> PNG::PNG)
-target_compile_definitions(aurora_gx PRIVATE $<$<NOT:$<BOOL:${AURORA_GPU_SDLGPU}>>:WEBGPU_DAWN>)
+target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 $<$<BOOL:${TRACY_ENABLE}>:TracyClient> PNG::PNG)

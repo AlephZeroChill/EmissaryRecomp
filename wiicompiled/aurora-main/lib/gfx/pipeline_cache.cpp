@@ -4,7 +4,7 @@
 #include "../gx/pipeline.hpp"
 #include "../fs_helper.hpp"
 #include "../sqlite_utils.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../gpu/gpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -31,7 +31,7 @@ constexpr const char* InitialPipelineCacheName = "initial_pipeline_cache.db";
 constexpr const char* SdlVfsName = "aurora_pipeline_cache_sdl_vfs";
 
 struct CachedPipeline {
-  wgpu::RenderPipeline pipeline;
+  gpu::GraphicsPipeline pipeline;
   uint32_t firstFrameUsed = UINT32_MAX;
 };
 
@@ -954,17 +954,9 @@ static void note_pipeline_queue_drained() {
   if (!g_prewarmActive.exchange(false, std::memory_order_acq_rel)) {
     return;
   }
-  // Persist the monolithic Vulkan pipeline cache once after boot prewarm only; doing it on
-  // every drained burst stalls the device lock mid-race. Later first-use compiles are
-  // covered by the shutdown serialize.
-  webgpu::serialize_pipeline_caches();
   const auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_prewarmStart);
-  const auto stats = webgpu::blob_cache_stats();
-  Log.info("Pipeline prewarm finished: {} pipelines in {:.1f} s (Dawn blob cache: {}/{} hits, {} stores, {:.1f} MiB "
-           "loaded)",
-           g_prewarmCount, elapsed.count() / 1000.0, stats.hits, stats.lookups, stats.stores,
-           static_cast<double>(stats.hitBytes) / (1024.0 * 1024.0));
+  Log.info("Pipeline prewarm finished: {} pipelines in {:.1f} s", g_prewarmCount, elapsed.count() / 1000.0);
 }
 
 static void compile_pending_pipeline(PendingPipeline pending) {
@@ -1169,10 +1161,7 @@ void initialize_pipeline_cache() {
   g_pipelineThreadEnd = false;
   g_activeBackgroundPipelineWorkers = 0;
 
-  if (webgpu::g_backendType == wgpu::BackendType::OpenGL || webgpu::g_backendType == wgpu::BackendType::OpenGLES ||
-      webgpu::g_backendType == wgpu::BackendType::WebGPU) {
-    g_hasPipelineThread = false;
-  } else {
+  {
     g_hasPipelineThread = true;
     const size_t workerCount = pipeline_worker_count();
     g_pipelineThreads.reserve(workerCount);
@@ -1246,7 +1235,7 @@ uint32_t queued_pipeline_count() noexcept {
 #endif
 }
 
-bool try_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool try_pipeline(PipelineRef ref, gpu::GraphicsPipeline& pipeline) {
   std::scoped_lock lock{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
@@ -1256,7 +1245,7 @@ bool try_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
   return true;
 }
 
-static bool wait_pipeline_impl(PipelineRef ref, wgpu::RenderPipeline& pipeline, bool fatalIfMissing,
+static bool wait_pipeline_impl(PipelineRef ref, gpu::GraphicsPipeline& pipeline, bool fatalIfMissing,
                                bool persistentPass) {
   std::unique_lock lock{g_pipelineMutex};
   if (!g_pipelines.contains(ref) && g_pendingPipelines.contains(ref)) {
@@ -1287,11 +1276,11 @@ static bool wait_pipeline_impl(PipelineRef ref, wgpu::RenderPipeline& pipeline, 
   return true;
 }
 
-bool wait_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool wait_pipeline(PipelineRef ref, gpu::GraphicsPipeline& pipeline) {
   return wait_pipeline_impl(ref, pipeline, true, false);
 }
 
-bool wait_pipeline_for_persistent_pass(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool wait_pipeline_for_persistent_pass(PipelineRef ref, gpu::GraphicsPipeline& pipeline) {
   return wait_pipeline_impl(ref, pipeline, false, true);
 }
 

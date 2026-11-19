@@ -11,7 +11,7 @@ namespace aurora::gx::fifo { extern float g_spmScreenWiden; }
 #include "../../internal.hpp"
 #include "../../window.hpp"
 #include "../../gfx/clear.hpp"
-#include "../../webgpu/gpu.hpp"
+#include "../../gpu/gpu.hpp"
 #include "../vi/vi_internal.hpp"
 
 #include <algorithm>
@@ -595,7 +595,7 @@ void GXCopyTex(void* dest, GXBool clear) {
             .clearAlpha = true,
             .clearDepth = false,
         }),
-        .color = wgpu::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
+        .color = SDL_FColor{0.f, 0.f, 0.f, static_cast<float>(g_gxState.dstAlpha) / 255.f},
     });
   }
   if (aurora::gx::render_target_has_alpha(g_gxState.pixelFmt)) {

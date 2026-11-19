@@ -8,9 +8,7 @@
 #include "gx/fifo.hpp"
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
-#include "webgpu/gpu.hpp"
-#include "webgpu/metalfx.hpp"
-#include <webgpu/webgpu_cpp.h>
+#include "gpu/gpu.hpp"
 #endif
 
 #include "input.hpp"
@@ -477,10 +475,7 @@ bool write_bmp(const char* path, const uint8_t* pixels, uint32_t width, uint32_t
 
 #ifdef AURORA_ENABLE_GX
 // GPU
-using webgpu::g_device;
-using webgpu::g_instance;
-using webgpu::g_queue;
-using webgpu::g_surface;
+using gpu::g_device;
 std::recursive_mutex g_rendererGpuMutex;
 std::mutex g_queueSubmitMutex;
 // Surface ownership, held apart from the renderer mutex: a presentation slot touches the surface,
@@ -499,7 +494,7 @@ void request_surface_recreate() noexcept {
 }
 
 struct PendingFrameCapture {
-  wgpu::Buffer buffer;
+  gpu::TransferBuffer buffer;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t bytesPerRow = 0;
@@ -508,48 +503,35 @@ struct PendingFrameCapture {
   std::string path;
 };
 
-std::optional<PendingFrameCapture> encode_frame_capture(const wgpu::CommandEncoder& encoder,
-                                                        const webgpu::PresentSource& source) {
+std::optional<PendingFrameCapture> encode_frame_capture(gpu::Encoder& encoder, const gpu::PresentSource& source) {
   const uint32_t requestedFrame = g_captureFrame.load(std::memory_order_acquire);
   const uint32_t currentFrame = gfx::current_frame();
   if (requestedFrame == UINT32_MAX || currentFrame < requestedFrame) return std::nullopt;
   g_captureFrame.store(UINT32_MAX, std::memory_order_release);  // the first frame at or after the requested one
-  if (!source.texture || source.size.width == 0 || source.size.height == 0) {
+  if (!source.texture || source.texture->width == 0 || source.texture->height == 0) {
     Log.error("Frame {} capture has no present-source texture", currentFrame);
     return std::nullopt;
   }
-  const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm ||
-                    source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
-  const bool rgba = source.format == wgpu::TextureFormat::RGBA8Unorm ||
-                    source.format == wgpu::TextureFormat::RGBA8UnormSrgb;
+  const auto format = source.texture->format;
+  const bool bgra = format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+  const bool rgba = format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM || format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB;
   if (!bgra && !rgba) {
-    Log.error("Frame {} capture does not support texture format {}", currentFrame,
-              magic_enum::enum_name(source.format));
+    Log.error("Frame {} capture does not support texture format {}", currentFrame, static_cast<int>(format));
     return std::nullopt;
   }
-  const uint32_t bytesPerRow = align_to(source.size.width * 4, 256);
-  const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * source.size.height;
-  const wgpu::BufferDescriptor descriptor{
-      .label = "Visual validation frame capture",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
-      .size = bufferSize,
-  };
-  auto buffer = g_device.CreateBuffer(&descriptor);
-  const wgpu::TexelCopyTextureInfo sourceInfo{
-      .texture = source.texture,
-      .mipLevel = 0,
-      .origin = {0, 0, 0},
-      .aspect = wgpu::TextureAspect::All,
-  };
-  const wgpu::TexelCopyBufferInfo destinationInfo{
-      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = source.size.height},
-      .buffer = buffer,
-  };
-  encoder.CopyTextureToBuffer(&sourceInfo, &destinationInfo, &source.size);
+  const uint32_t width = source.texture->width;
+  const uint32_t height = source.texture->height;
+  const uint32_t bytesPerRow = width * 4;
+  const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * height;
+  auto buffer = gpu::create_transfer_buffer(false, static_cast<uint32_t>(bufferSize));
+  if (!buffer) {
+    return std::nullopt;
+  }
+  gpu::download_from_texture(encoder, *source.texture, 0, 0, width, height, *buffer, 0, width);
   return PendingFrameCapture{
       .buffer = std::move(buffer),
-      .width = source.size.width,
-      .height = source.size.height,
+      .width = width,
+      .height = height,
       .bytesPerRow = bytesPerRow,
       .bufferSize = bufferSize,
       .bgra = bgra,
@@ -558,27 +540,19 @@ std::optional<PendingFrameCapture> encode_frame_capture(const wgpu::CommandEncod
 }
 
 void complete_frame_capture(PendingFrameCapture& capture) {
-  wgpu::MapAsyncStatus mapStatus = wgpu::MapAsyncStatus::CallbackCancelled;
-  wgpu::StringView mapMessage{};
-  const auto future = capture.buffer.MapAsync(
-      wgpu::MapMode::Read, 0, capture.bufferSize, wgpu::CallbackMode::WaitAnyOnly,
-      [&mapStatus, &mapMessage](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-        mapStatus = status;
-        mapMessage = message;
-      });
-  const auto waitStatus = g_instance.WaitAny(future, 5000000000);
-  if (waitStatus != wgpu::WaitStatus::Success || mapStatus != wgpu::MapAsyncStatus::Success) {
-    Log.error("Frame capture readback failed wait={} map={} message={}", magic_enum::enum_name(waitStatus),
-              magic_enum::enum_name(mapStatus), mapMessage);
+  // A debugging aid: the capture's command buffer was submitted with the frame, so wait for the GPU.
+  SDL_WaitForGPUIdle(g_device);
+  const auto* pixels = static_cast<const uint8_t*>(SDL_MapGPUTransferBuffer(g_device, capture.buffer->handle, false));
+  if (pixels == nullptr) {
+    Log.error("Frame capture readback failed: {}", SDL_GetError());
     return;
   }
-  const auto* pixels = static_cast<const uint8_t*>(capture.buffer.GetConstMappedRange(0, capture.bufferSize));
   if (write_bmp(capture.path.c_str(), pixels, capture.width, capture.height, capture.bytesPerRow, capture.bgra)) {
     Log.info("Captured rendered frame to '{}' ({}x{})", capture.path, capture.width, capture.height);
   } else {
     Log.error("Failed to write rendered frame capture to '{}'", capture.path);
   }
-  capture.buffer.Unmap();
+  SDL_UnmapGPUTransferBuffer(g_device, capture.buffer->handle);
 }
 #endif
 
@@ -609,33 +583,15 @@ constexpr const char* backend_name(AuroraBackend backend) noexcept {
 }
 
 #ifdef AURORA_ENABLE_GX
+// The SDL_GPU drivers per platform, most preferred first.
 constexpr std::array PreferredBackendOrder{
-#ifdef ENABLE_BACKEND_WEBGPU
-    BACKEND_WEBGPU,
-#endif
-#ifdef DAWN_ENABLE_BACKEND_D3D12
-    BACKEND_D3D12,
-#endif
-#if defined(_WIN32) && defined(DAWN_ENABLE_BACKEND_D3D11)
-    BACKEND_D3D11,
-#endif
-#ifdef DAWN_ENABLE_BACKEND_METAL
+#if defined(__APPLE__)
     BACKEND_METAL,
-#endif
-#ifdef DAWN_ENABLE_BACKEND_VULKAN
+#elif defined(_WIN32)
+    BACKEND_D3D12,
     BACKEND_VULKAN,
-#endif
-#if !defined(_WIN32) && defined(DAWN_ENABLE_BACKEND_D3D11)
-    BACKEND_D3D11,
-#endif
-// #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
-//     BACKEND_OPENGL,
-// #endif
-// #ifdef DAWN_ENABLE_BACKEND_OPENGLES
-//     BACKEND_OPENGLES,
-// #endif
-#ifdef DAWN_ENABLE_BACKEND_NULL
-    BACKEND_NULL,
+#else
+    BACKEND_VULKAN,
 #endif
 };
 #else
@@ -700,7 +656,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (selectedBackend != BACKEND_AUTO) {
     Log.info("Requested graphics backend: {}", backend_name(selectedBackend));
     if (window::create_window(selectedBackend)) {
-      if (webgpu::initialize(selectedBackend)) {
+      if (gpu::initialize(selectedBackend)) {
         windowCreated = true;
       } else {
         rememberGraphicsError();
@@ -727,7 +683,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
         rememberGraphicsError();
         continue;
       }
-      if (webgpu::initialize(selectedBackend)) {
+      if (gpu::initialize(selectedBackend)) {
         windowCreated = true;
         break;
       } else {
@@ -752,10 +708,6 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
               backend_name(requestedBackend), backend_name(selectedBackend));
   }
 
-  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
-    ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
-  }
 #else
   AuroraBackend selectedBackend = BACKEND_NULL;
   ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
@@ -767,8 +719,8 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
 
-  g_metalfxSupported.store(webgpu::metalfx::supported(g_device, webgpu::g_backendType));
-  g_metalfxStatus.store(AURORA_METALFX_DISABLED);
+  g_metalfxSupported.store(false);
+  g_metalfxStatus.store(AURORA_METALFX_UNSUPPORTED);
 
   imgui::create_context();
 #endif
@@ -790,68 +742,16 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
       .window = window::get_sdl_window(),
       .windowSize = size,
 #ifdef AURORA_ENABLE_GX
-      .gpuName = webgpu::adapter_name(),
-      .gpuCompatActive = webgpu::g_safeVertexFetch,
-      .gpuIntegrated = webgpu::adapter_integrated(),
+      .gpuName = gpu::adapter_name(),
+      .gpuCompatActive = gpu::g_safeVertexFetch,
+      .gpuIntegrated = gpu::adapter_integrated(),
 #endif
   };
 }
 
 #ifdef AURORA_ENABLE_GX
-struct AcquiredSurfaceTexture {
-  wgpu::Texture texture;
-  wgpu::TextureView view;
-};
-
-std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
-  if (!window::is_presentable()) {
-    request_surface_reconfigure();
-    return std::nullopt;
-  }
-  if (!g_surface) {
-    request_surface_reconfigure();
-    return std::nullopt;
-  }
-
-  wgpu::SurfaceTexture surfaceTexture;
-  g_surface.GetCurrentTexture(&surfaceTexture);
-  switch (surfaceTexture.status) {
-  case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal:
-    return AcquiredSurfaceTexture{
-        .texture = surfaceTexture.texture,
-        .view = surfaceTexture.texture.CreateView(),
-    };
-  case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
-    Log.info("Surface texture is suboptimal, deferring swapchain reconfiguration");
-    request_surface_reconfigure();
-    return AcquiredSurfaceTexture{
-        .texture = surfaceTexture.texture,
-        .view = surfaceTexture.texture.CreateView(),
-    };
-  case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
-    Log.warn("Surface texture acquisition timed out");
-    return std::nullopt;
-  case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
-    Log.info("Surface texture is {}, reconfiguring swapchain", magic_enum::enum_name(surfaceTexture.status));
-    request_surface_reconfigure();
-    return std::nullopt;
-  case wgpu::SurfaceGetCurrentTextureStatus::Lost:
-    Log.warn("Surface texture is {}, requesting surface recreation", magic_enum::enum_name(surfaceTexture.status));
-    request_surface_recreate();
-    return std::nullopt;
-  case wgpu::SurfaceGetCurrentTextureStatus::Error:
-    Log.warn("Surface texture is {}, deferring surface recovery", magic_enum::enum_name(surfaceTexture.status));
-    request_surface_reconfigure();
-    return std::nullopt;
-  default:
-    Log.error("Failed to get surface texture: {}", magic_enum::enum_name(surfaceTexture.status));
-    return std::nullopt;
-  }
-}
-
 struct PresentationImage {
-  webgpu::TextureWithSampler texture;
-  wgpu::BindGroup bindGroup;
+  gpu::TextureWithSampler texture;
 };
 
 struct PresentationJob {
@@ -878,7 +778,7 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
   // images from an older surface size are dropped here instead of leaking for the run.
   for (auto it = pool.begin(); it != pool.end();) {
     const auto& image = *it;
-    if (image->texture.size.width == width && image->texture.size.height == height) {
+    if (image->texture.texture && image->texture.texture->width == width && image->texture.texture->height == height) {
       if (image.use_count() == 1) {
         return image;
       }
@@ -893,8 +793,7 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
   }
 
   auto image = std::make_shared<PresentationImage>();
-  image->texture = webgpu::create_render_texture(width, height, false);
-  image->bindGroup = webgpu::create_copy_bind_group(image->texture);
+  image->texture = gpu::create_render_texture(width, height, false);
   pool.emplace_back(image);
   return image;
 }
@@ -943,99 +842,70 @@ bool present_presentation_job(const PresentationJob& job) {
     bool surfaceSizeChanged = window::native_resize_pending();
     if (!surfaceSizeChanged &&
         !g_surfaceReconfigurePending.load(std::memory_order_acquire) &&
-        window::is_presentable() && g_surface) {
+        window::is_presentable() && gpu::has_surface()) {
       // native_window_size_matches compares the OS client size with the configured swapchain, which is
       // what native_fb_* reports. One window query instead of SDL's per-call ones.
-      surfaceSizeChanged = !window::native_window_size_matches(
-          webgpu::g_graphicsConfig.surfaceConfiguration.width,
-          webgpu::g_graphicsConfig.surfaceConfiguration.height);
+      surfaceSizeChanged = !window::native_window_size_matches(gpu::g_graphicsConfig.surfaceWidth,
+                                                              gpu::g_graphicsConfig.surfaceHeight);
     }
-    if (!surfaceSizeChanged && window::is_presentable()) {
+    if (!surfaceSizeChanged && window::is_presentable() && gpu::has_surface()) {
+      // SDL_GPU presents a swapchain image when the command buffer that acquired it is submitted, so
+      // the schedule wait sits between encoding and the submit.
+      gpu::Encoder encoder;
+      SDL_GPUTexture* swapchainTexture = nullptr;
+      uint32_t swapchainWidth = 0;
+      uint32_t swapchainHeight = 0;
       const auto acquireStarted = PresentClock::now();
-      auto acquired = acquire_surface_texture();
+      const bool acquireOk = encoder && SDL_WaitAndAcquireGPUSwapchainTexture(
+                                            encoder.cmd(), gpu::swapchain_window(), &swapchainTexture,
+                                            &swapchainWidth, &swapchainHeight);
       acquireDuration =
           std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - acquireStarted);
       g_lastAcquireNanos.store(acquireDuration.count(), std::memory_order_relaxed);
-      if (acquired) {
-        const wgpu::CommandEncoderDescriptor encoderDescriptor{
-            .label = "Presentation encoder",
+      if (!acquireOk) {
+        Log.warn("Swapchain image acquisition failed: {}", SDL_GetError());
+        request_surface_reconfigure();
+      }
+      if (swapchainTexture != nullptr) {
+        const SDL_GPUColorTargetInfo colorTarget{
+            .texture = swapchainTexture,
+            .clear_color = SDL_FColor{0.f, 0.f, 0.f, 1.f},
+            .load_op = SDL_GPU_LOADOP_CLEAR,
+            .store_op = SDL_GPU_STOREOP_STORE,
         };
-        const auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
-        const std::array attachments{
-            wgpu::RenderPassColorAttachment{
-                .view = acquired->view,
-                .loadOp = wgpu::LoadOp::Clear,
-                .storeOp = wgpu::StoreOp::Store,
-            },
-        };
-        const wgpu::RenderPassDescriptor renderPassDescriptor{
-            .label = "Presentation copy pass",
-            .colorAttachmentCount = attachments.size(),
-            .colorAttachments = attachments.data(),
-        };
-        const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-        pass.SetPipeline(webgpu::g_CopyPipeline);
-        pass.SetBindGroup(0, job.image->bindGroup, 0, nullptr);
-        pass.SetViewport(0.f, 0.f,
-                         static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.width),
-                         static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.height),
-                         0.f, 1.f);
-        pass.Draw(3);
-        pass.End();
-        const auto encodeFinished = PresentClock::now();
+        SDL_GPURenderPass* pass = encoder.begin_render_pass(&colorTarget, 1, nullptr);
+        const SDL_GPUViewport viewport{0.f, 0.f, static_cast<float>(swapchainWidth),
+                                       static_cast<float>(swapchainHeight), 0.f, 1.f};
+        SDL_SetGPUViewport(pass, &viewport);
+        gpu::draw_copy(encoder.cmd(), pass, job.image->texture.texture, job.image->texture.sampler);
+        SDL_EndGPURenderPass(pass);
         encodeDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            encodeFinished - workStarted - acquireDuration);
-        const wgpu::CommandBufferDescriptor cmdBufDescriptor{
-            .label = "Presentation command buffer",
-        };
-        const auto finishStarted = PresentClock::now();
-        const auto buffer = encoder.Finish(&cmdBufDescriptor);
-        finishDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            PresentClock::now() - finishStarted);
-        const auto submitStarted = PresentClock::now();
-        {
-          std::lock_guard submitLock(g_queueSubmitMutex);
-          g_queue.Submit(1, &buffer);
-        }
-        submitDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            PresentClock::now() - submitStarted);
-        // Pace the Present() call itself, not the whole unit, so acquire/encode/submit variance stays out
-        // of the cadence. Holding the image across the wait is safe while the surface lock is held.
+            PresentClock::now() - workStarted - acquireDuration);
+        // Pace the present itself, not the whole unit, so acquire/encode variance stays out of the cadence.
         if (job.presentAt != PresentClock::time_point{}) {
           const auto scheduleWaitStarted = PresentClock::now();
           wait_until_precise(job.presentAt);
           scheduleWaitDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
               PresentClock::now() - scheduleWaitStarted);
         }
-        // A native resize can arrive after acquisition, so drop the obsolete image and let the render
-        // worker reconfigure at its ordered frame boundary.
-        if (!g_surfaceReconfigurePending.load(std::memory_order_acquire) &&
-            !window::native_resize_pending() && window::is_presentable() &&
-            window::native_window_size_matches(
-                webgpu::g_graphicsConfig.surfaceConfiguration.width,
-                webgpu::g_graphicsConfig.surfaceConfiguration.height)) {
-          const auto presentStarted = PresentClock::now();
-          wgpu::Status presentStatus;
-          {
-            std::lock_guard submitLock(g_queueSubmitMutex);
-            presentStatus = g_surface.Present();
-          }
-          presentDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
-              PresentClock::now() - presentStarted);
-          if (presentStatus == wgpu::Status::Success) {
-            presented = true;
-            record_successful_present(
-                job.interpolated, job.logicalFrame, acquireDuration, encodeDuration,
-                finishDuration, submitDuration, presentDuration,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
-                                                                     submissionStarted),
-                job.duplicated, job.slidPeriods, lateBy);
-          } else {
-            Log.warn("Surface present failed: {}", static_cast<int>(presentStatus));
-            request_surface_reconfigure();
-          }
+        const auto presentStarted = PresentClock::now();
+        {
+          std::lock_guard submitLock(g_queueSubmitMutex);
+          encoder.submit();
         }
-        acquired.reset();
+        presentDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PresentClock::now() - presentStarted);
+        presented = true;
+        record_successful_present(
+            job.interpolated, job.logicalFrame, acquireDuration, encodeDuration,
+            finishDuration, submitDuration, presentDuration,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
+                                                                 submissionStarted),
+            job.duplicated, job.slidPeriods, lateBy);
+      } else {
+        // No image (minimized or occluded); the acquiring command buffer still has to be submitted.
+        std::lock_guard submitLock(g_queueSubmitMutex);
+        encoder.submit();
       }
     }
   }
@@ -1136,7 +1006,7 @@ void presenter_main() noexcept {
       // V-Sync only, never for an inserted (interpolated) slot: drop this frame when the swapchain
       // is backed up, or when it is already late and a newer one waits. A slow scene with no
       // backlog presents every frame, late or not.
-      if (webgpu::vsync_enabled() && !job.interpolated && job.presentAt != PresentClock::time_point{}) {
+      if (gpu::vsync_enabled() && !job.interpolated && job.presentAt != PresentClock::time_point{}) {
         constexpr auto kBacklog = std::chrono::milliseconds(8);
         const bool backedUp = g_lastAcquireNanos.exchange(0, std::memory_order_relaxed) >
                               std::chrono::duration_cast<std::chrono::nanoseconds>(kBacklog).count();
@@ -1240,172 +1110,44 @@ void stop_presenter() noexcept {
   g_presenterStarted.store(false, std::memory_order_release);
 }
 
-struct MetalFXSlot {
-  webgpu::metalfx::Size size{};
-  std::unique_ptr<webgpu::metalfx::SpatialScaler> scaler;
-  wgpu::BindGroup bindGroup;
-};
-std::array<MetalFXSlot, gx::MaxInterpolatedFrames + 1> g_metalfxSlots;
-size_t g_metalfxNextSlot = 0;
-webgpu::metalfx::SpatialScaler* g_metalfxPendingOutput = nullptr;
-bool g_metalfxFailed = false;
-
-void metalfx_failed(const std::string& reason) {
-  Log.warn("MetalFX spatial upscaling disabled: {}; using normal presentation", reason);
-  g_metalfxFailed = true;
-  g_metalfxStatus.store(AURORA_METALFX_ERROR);
-  g_metalfxPendingOutput = nullptr;
-  g_metalfxSlots = {};
-}
-
-wgpu::BindGroup upscale_presentation(wgpu::CommandEncoder& encoder,
-                                     const webgpu::PresentSource& source,
-                                     const webgpu::Viewport& viewport, bool enabled) {
-  if (!enabled) {
-    g_metalfxSlots = {};
-    g_metalfxFailed = false;
-    g_metalfxStatus.store(AURORA_METALFX_DISABLED);
-    return {};
-  }
-  if (!g_metalfxSupported.load()) {
-    g_metalfxStatus.store(AURORA_METALFX_UNSUPPORTED);
-    return {};
-  }
-  if (g_metalfxFailed) return {};
-  const webgpu::metalfx::Size size{
-      source.size.width, source.size.height,
-      static_cast<uint32_t>(viewport.width), static_cast<uint32_t>(viewport.height),
-      webgpu::g_graphicsConfig.surfaceConfiguration.format,
-  };
-  // The existing copy path samples perceptual values from unorm game images.
-  // Do not introduce implicit sRGB decoding or downscaling into MetalFX.
-  if (!size.inputWidth || !size.inputHeight || size.inputWidth >= size.outputWidth ||
-      size.inputHeight >= size.outputHeight ||
-      (source.format != wgpu::TextureFormat::RGBA8Unorm && source.format != wgpu::TextureFormat::BGRA8Unorm)) {
-    g_metalfxStatus.store(AURORA_METALFX_NOT_UPSCALING);
-    return {};
-  }
-  auto& slot = g_metalfxSlots[g_metalfxNextSlot++ % g_metalfxSlots.size()];
-  if (!slot.scaler || !(slot.size == size)) {
-    slot = {};
-    std::string error;
-    slot.scaler = webgpu::metalfx::create(g_instance, g_device, size, error);
-    if (!slot.scaler) {
-      if (error.empty()) g_metalfxStatus.store(AURORA_METALFX_NOT_UPSCALING);
-      else metalfx_failed(error);
-      return {};
-    }
-    slot.size = size;
-    wgpu::SamplerDescriptor samplerDescriptor{};
-    samplerDescriptor.magFilter = wgpu::FilterMode::Linear;
-    samplerDescriptor.minFilter = wgpu::FilterMode::Linear;
-    slot.bindGroup = webgpu::create_copy_bind_group(slot.scaler->output_view(),
-                                                   g_device.CreateSampler(&samplerDescriptor));
-    Log.info("MetalFX spatial slot: {}x{} -> {}x{}", size.inputWidth, size.inputHeight,
-             size.outputWidth, size.outputHeight);
-  }
-  if (!slot.scaler->begin_input()) {
-    metalfx_failed(slot.scaler->error());
-    return {};
-  }
-  const wgpu::RenderPassColorAttachment attachment{
-      .view = slot.scaler->input_view(),
-      .loadOp = wgpu::LoadOp::Clear,
-      .storeOp = wgpu::StoreOp::Store,
-  };
-  const wgpu::RenderPassDescriptor descriptor{
-      .label = "MetalFX input copy",
-      .colorAttachmentCount = 1,
-      .colorAttachments = &attachment,
-  };
-  auto pass = encoder.BeginRenderPass(&descriptor);
-  pass.SetPipeline(webgpu::g_CopyPipeline);
-  pass.SetBindGroup(0, source.bindGroup);
-  pass.SetViewport(0, 0, static_cast<float>(size.inputWidth), static_cast<float>(size.inputHeight), 0, 1);
-  pass.Draw(3);
-  pass.End();
-  // Submit the sealed scene and input copy before crossing to the native queue.
-  // The replacement encoder composites the upscaled image and ImGui normally.
-  auto buffer = encoder.Finish();
-  {
-    std::lock_guard submitLock(g_queueSubmitMutex);
-    g_queue.Submit(1, &buffer);
-  }
-  encoder = g_device.CreateCommandEncoder();
-  if (!slot.scaler->upscale()) {
-    metalfx_failed(slot.scaler->error());
-    return {};
-  }
-  g_metalfxPendingOutput = slot.scaler.get();
-  g_metalfxStatus.store(AURORA_METALFX_ACTIVE);
-  return slot.bindGroup;
-}
-
 // `presentSource` is latched in the seal prologue: by the time this encodes, the producer's next
 // gfx::begin_frame() may already have cleared the display-copy override.
-wgpu::BindGroup encode_presentation_snapshot(wgpu::CommandEncoder& encoder,
-                                              const webgpu::PresentSource& presentSource,
-                                              const PresentationImage& image,
-                                              bool includeImGui, bool metalfxEnabled,
-                                              const wgpu::BindGroup* cachedMetalFXOutput = nullptr) {
+void encode_presentation_snapshot(gpu::Encoder& encoder, const gpu::PresentSource& presentSource,
+                                  const PresentationImage& image, bool includeImGui) {
   ZoneScoped;
-  auto viewport = webgpu::calculate_present_viewport(
-      image.texture.size.width, image.texture.size.height, presentSource.size.width,
-      presentSource.size.height);
+  const auto& target = *image.texture.texture;
+  if (!presentSource.texture) {
+    return;
+  }
+  auto viewport = gpu::calculate_present_viewport(target.width, target.height, presentSource.texture->width,
+                                                  presentSource.texture->height);
   float presentAspect = 0.f;
   if (window::get_present_aspect_ratio(presentAspect)) {
-    viewport = webgpu::calculate_present_viewport_for_aspect(
-        image.texture.size.width, image.texture.size.height, presentAspect);
-  }
-  wgpu::BindGroup presentBindGroup = presentSource.bindGroup;
-  wgpu::BindGroup newMetalFXOutput;
-  if (cachedMetalFXOutput && *cachedMetalFXOutput) {
-    presentBindGroup = *cachedMetalFXOutput;
-  } else if (auto upscaled = upscale_presentation(encoder, presentSource, viewport, metalfxEnabled)) {
-    presentBindGroup = std::move(upscaled);
-    newMetalFXOutput = presentBindGroup;
-  }
-  {
-    const std::array attachments{
-        wgpu::RenderPassColorAttachment{
-            .view = image.texture.view,
-            .loadOp = wgpu::LoadOp::Clear,
-            .storeOp = wgpu::StoreOp::Store,
-        },
-    };
-    const wgpu::RenderPassDescriptor renderPassDescriptor{
-        .label = "Interpolation snapshot pass",
-        .colorAttachmentCount = attachments.size(),
-        .colorAttachments = attachments.data(),
-    };
-    const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-    pass.SetPipeline(webgpu::g_CopyPipeline);
-    pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-    pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height,
-                     viewport.znear, viewport.zfar);
-    pass.Draw(3);
-    pass.End();
+    viewport = gpu::calculate_present_viewport_for_aspect(target.width, target.height, presentAspect);
   }
   if (includeImGui) {
-    const std::array attachments{
-        wgpu::RenderPassColorAttachment{
-            .view = image.texture.view,
-            .loadOp = wgpu::LoadOp::Load,
-            .storeOp = wgpu::StoreOp::Store,
-        },
-    };
-    const wgpu::RenderPassDescriptor renderPassDescriptor{
-        .label = "Snapshot ImGui pass",
-        .colorAttachmentCount = attachments.size(),
-        .colorAttachments = attachments.data(),
-    };
-    const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-    pass.SetViewport(0.f, 0.f, static_cast<float>(image.texture.size.width),
-                     static_cast<float>(image.texture.size.height), 0.f, 1.f);
-    imgui::render(pass);
-    pass.End();
+    // The ImGui backend uploads its vertex data in a copy pass of its own, before the render pass.
+    encoder.end_copy_pass();
+    imgui::prepare(encoder.cmd());
   }
-  return newMetalFXOutput;
+  const SDL_GPUColorTargetInfo colorTarget{
+      .texture = target.handle,
+      .clear_color = SDL_FColor{0.f, 0.f, 0.f, 0.f},
+      .load_op = SDL_GPU_LOADOP_CLEAR,
+      .store_op = SDL_GPU_STOREOP_STORE,
+  };
+  SDL_GPURenderPass* pass = encoder.begin_render_pass(&colorTarget, 1, nullptr);
+  const SDL_GPUViewport gameViewport{viewport.left, viewport.top, viewport.width, viewport.height,
+                                     viewport.znear, viewport.zfar};
+  SDL_SetGPUViewport(pass, &gameViewport);
+  gpu::draw_copy(encoder.cmd(), pass, presentSource.texture, presentSource.sampler);
+  if (includeImGui) {
+    const SDL_GPUViewport fullViewport{0.f, 0.f, static_cast<float>(target.width), static_cast<float>(target.height),
+                                       0.f, 1.f};
+    SDL_SetGPUViewport(pass, &fullViewport);
+    imgui::render(encoder.cmd(), pass);
+  }
+  SDL_EndGPURenderPass(pass);
 }
 #endif
 
@@ -1414,16 +1156,12 @@ void shutdown() noexcept {
 #ifdef AURORA_ENABLE_GX
   stop_presenter();
   g_presentationImagePools = {};
-  g_metalfxSlots = {};
-  g_metalfxPendingOutput = nullptr;
-  g_metalfxNextSlot = 0;
-  g_metalfxFailed = false;
   g_metalfxRequested.store(false);
   g_metalfxSupported.store(false);
   g_metalfxStatus.store(AURORA_METALFX_DISABLED);
   imgui::shutdown();
   gfx::shutdown();
-  webgpu::shutdown();
+  gpu::shutdown();
 #endif
   input::shutdown();
   window::shutdown();
@@ -1441,18 +1179,18 @@ const AuroraEvent* update() noexcept {
 bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
-  webgpu::fail_if_device_lost();
+  gpu::fail_if_device_lost();
   if (pumpEvents) {
     window::pump_events();
   }
   const bool surfaceReconfigurePending =
       g_surfaceReconfigurePending.load(std::memory_order_acquire);
   const bool surfaceMutationRequired =
-      surfaceReconfigurePending || webgpu::vsync_change_pending() || !window::is_presentable() || !g_surface ||
+      surfaceReconfigurePending || gpu::vsync_change_pending() || !window::is_presentable() || !gpu::has_surface() ||
       window::native_resize_pending() ||
       !window::native_window_size_matches(
-          webgpu::g_graphicsConfig.surfaceConfiguration.width,
-          webgpu::g_graphicsConfig.surfaceConfiguration.height);
+          gpu::g_graphicsConfig.surfaceWidth,
+          gpu::g_graphicsConfig.surfaceHeight);
   if (surfaceMutationRequired) {
     wait_for_presenter_idle();
     window::SurfaceLock surfaceLock;
@@ -1463,7 +1201,7 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
     // Surface configuration belongs to the render thread; the SDL thread must not reconfigure Dawn
     // while this worker is acquiring or presenting.
     if (!window::is_presentable()) {
-      webgpu::release_surface();
+      gpu::release_surface();
       return false;
     }
     if (window::is_paused()) {
@@ -1473,24 +1211,24 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
         g_surfaceReconfigurePending.exchange(false, std::memory_order_acq_rel);
     const bool consumeSurfaceRecreate =
         g_surfaceRecreatePending.exchange(false, std::memory_order_acq_rel);
-    if (!g_surface || consumeSurfaceReconfigure) {
+    if (!gpu::has_surface() || consumeSurfaceReconfigure) {
       // Reconfigure in place unless the surface was actually lost. See
       // g_surfaceRecreatePending for why destroying a live surface here is fatal
       // while a capture overlay is attached.
-      webgpu::refresh_surface(consumeSurfaceRecreate);
-      if (!g_surface) {
+      gpu::refresh_surface(consumeSurfaceRecreate);
+      if (!gpu::has_surface()) {
         return false;
       }
     }
     if (window::native_resize_pending() ||
-        !window::native_window_size_matches(webgpu::g_graphicsConfig.surfaceConfiguration.width,
-                                            webgpu::g_graphicsConfig.surfaceConfiguration.height)) {
+        !window::native_window_size_matches(gpu::g_graphicsConfig.surfaceWidth,
+                                            gpu::g_graphicsConfig.surfaceHeight)) {
       window::sync_frame_buffer_size();
     }
     // A V-Sync change reconfigures the swapchain at this same ordered frame boundary.
-    if (webgpu::take_vsync_change()) {
+    if (gpu::take_vsync_change()) {
       const auto size = window::get_window_size();
-      webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+      gpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
     }
   } else if (window::is_paused()) {
     return false;
@@ -1528,8 +1266,8 @@ bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewF
 // Everything the mutex-free encode phase needs, latched while the renderer GPU mutex is held.
 // None of it may be re-read from a global later; the producer has already begun the next frame.
 struct SealedFrameContext {
-  wgpu::CommandEncoder encoder; // slot 0's encoder; already holds the staging copies
-  webgpu::PresentSource presentSource{};
+  std::optional<gpu::Encoder> encoder; // slot 0's encoder; already holds the staging copies
+  gpu::PresentSource presentSource{};
   uint64_t scheduleBaseNanos = 0;
   uint64_t scheduleIntervalNanos = 0;
   uint32_t interpolatedFrameCount = 0;
@@ -1538,21 +1276,17 @@ struct SealedFrameContext {
   uint32_t logicalFrame = 0;
   bool interpolationActive = false;
   bool replayInterpolatedFrames = false;
-  bool metalfxEnabled = false;
 };
 
 // Phase 1: everything that touches producer-shared renderer state. Needs g_rendererGpuMutex and
 // a FIFO already drained into the recorded pass list.
 void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ZoneScopedN("Seal frame");
-  const auto encoderDescriptor = wgpu::CommandEncoderDescriptor{
-      .label = "Redraw encoder",
-  };
-  ctx.encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+  ctx.encoder.emplace();
   // Probe-sized CPU-consumed copies read back asynchronously. Their downscale blits push uniforms,
   // so prepare them while the producer's staging buffers are still mapped.
   gfx::efb_ram::seal_async_downloads();
-  gfx::end_frame(ctx.encoder);
+  gfx::end_frame(*ctx.encoder);
   gfx::g_stats.presentedFrameCount = 0;
   gfx::g_stats.interpolatedFrameCount = 0;
   // Latched before the producer's next gfx::begin_frame() calls
@@ -1566,10 +1300,9 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ctx.snapshotWidth = (std::max)(windowSize.native_fb_width, 1u);
   ctx.snapshotHeight = (std::max)(windowSize.native_fb_height, 1u);
   ctx.logicalFrame = gfx::current_frame();
-  ctx.metalfxEnabled = g_metalfxRequested.load();
-  // Latched before webgpu::clear_present_source_override() in the producer's
+  // Latched before gpu::clear_present_source_override() in the producer's
   // next gfx::begin_frame().
-  ctx.presentSource = webgpu::current_present_source();
+  ctx.presentSource = gpu::current_present_source();
   // ImGui draw lists are built once per frame and replayed by each slot's ImGui pass, which is why
   // the next ImGui frame cannot start until the encode phase is done.
   imgui::render_frame_data();
@@ -1586,10 +1319,8 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
 // without the renderer GPU mutex while the producer records the next frame.
 std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ZoneScopedN("Encode sealed frame");
-  auto encoder = std::move(ctx.encoder);
-  const auto encoderDescriptor = wgpu::CommandEncoderDescriptor{
-      .label = "Redraw encoder",
-  };
+  auto encoder = std::move(*ctx.encoder);
+  ctx.encoder.reset();
   // Absolute slot deadlines: slot k of jobCount presents at base + k * interval / jobCount. With
   // interpolation off, pace to the boundary that just passed plus 6.5 ms; late frames free-run.
   constexpr uint64_t kNativePresentOffsetNanos = 6'500'000;
@@ -1611,17 +1342,9 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
 
   // Each slot is submitted as soon as it is encoded, so the GPU starts slot 0 while slot 1 is still
   // recording. Queue order preserves the ordering the single batched buffer gave.
-  const wgpu::CommandBufferDescriptor cmdBufDescriptor{
-      .label = "Presentation slot command buffer",
-  };
-  const auto submitEncodedSlot = [&](wgpu::CommandEncoder& target, bool releaseMetalFXOutput = true) {
-    const auto buffer = target.Finish(&cmdBufDescriptor);
+  const auto submitEncodedSlot = [&](gpu::Encoder& target) {
     std::lock_guard submitLock(g_queueSubmitMutex);
-    g_queue.Submit(1, &buffer);
-    if (releaseMetalFXOutput && g_metalfxPendingOutput) {
-      if (!g_metalfxPendingOutput->end_output()) metalfx_failed(g_metalfxPendingOutput->error());
-      g_metalfxPendingOutput = nullptr;
-    }
+    target.submit();
   };
 
   if (ctx.replayInterpolatedFrames) {
@@ -1630,7 +1353,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
       gfx::render(sealedFrame, encoder, static_cast<int32_t>(interpolatedFrame), false);
       auto image =
           acquire_presentation_image(interpolatedFrame, ctx.snapshotWidth, ctx.snapshotHeight);
-      encode_presentation_snapshot(encoder, ctx.presentSource, *image, true, ctx.metalfxEnabled);
+      encode_presentation_snapshot(encoder, ctx.presentSource, *image, true);
       presentationJobs.push_back({
           .image = std::move(image),
           .logicalFrame = ctx.logicalFrame,
@@ -1638,7 +1361,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           .interpolated = true,
       });
       submitEncodedSlot(encoder);
-      encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+      encoder = gpu::Encoder{};
     }
   }
 
@@ -1648,18 +1371,12 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // The copy targets now hold this frame's resolves, so queue their readbacks on the same encoder;
   // completion is harvested in gfx::after_submit, never waited on here.
   gfx::efb_ram::encode_async_downloads(encoder);
-  wgpu::BindGroup duplicatedMetalFXOutput;
   if (!ctx.replayInterpolatedFrames) {
     for (uint32_t interpolatedFrame = 0; interpolatedFrame < ctx.interpolatedFrameCount;
          ++interpolatedFrame) {
       auto image =
           acquire_presentation_image(interpolatedFrame, ctx.snapshotWidth, ctx.snapshotHeight);
-      const auto newMetalFXOutput = encode_presentation_snapshot(
-          encoder, ctx.presentSource, *image, true, ctx.metalfxEnabled,
-          duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr);
-      if (!duplicatedMetalFXOutput && newMetalFXOutput) {
-        duplicatedMetalFXOutput = newMetalFXOutput;
-      }
+      encode_presentation_snapshot(encoder, ctx.presentSource, *image, true);
       presentationJobs.push_back({
           .image = std::move(image),
           .logicalFrame = ctx.logicalFrame,
@@ -1667,14 +1384,13 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           .interpolated = true,
           .duplicated = true,
       });
-      submitEncodedSlot(encoder, false);
-      encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+      submitEncodedSlot(encoder);
+      encoder = gpu::Encoder{};
     }
   }
   auto finalImage =
       acquire_presentation_image(ctx.interpolatedFrameCount, ctx.snapshotWidth, ctx.snapshotHeight);
-  encode_presentation_snapshot(encoder, ctx.presentSource, *finalImage, true, ctx.metalfxEnabled,
-                               duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr);
+  encode_presentation_snapshot(encoder, ctx.presentSource, *finalImage, true);
   auto pendingFrameCapture = encode_frame_capture(encoder, ctx.presentSource);
   presentationJobs.push_back({
       .image = std::move(finalImage),
@@ -1801,7 +1517,7 @@ void record_frame_telemetry() {
 // interpolation actually inserts slots; otherwise both phases publish together.
 bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
   ZoneScopedN("Frame worker cycle");
-  webgpu::fail_if_device_lost();
+  gpu::fail_if_device_lost();
   SealedFrameContext ctx;
   std::vector<PresentationJob> presentationJobs;
   bool overlapEncode = false;
@@ -1895,7 +1611,7 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
 void end_frame_impl(bool pumpEvents, bool drainFifo) {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
-  webgpu::fail_if_device_lost();
+  gpu::fail_if_device_lost();
   if (pumpEvents) {
     window::pump_events();
   }
@@ -1920,7 +1636,7 @@ bool begin_frame() noexcept {
 #ifdef AURORA_ENABLE_GX
   // The asynchronous fast path below can return a logically prepared frame
   // without entering begin_frame_impl(), so loss must be checked before it.
-  webgpu::fail_if_device_lost();
+  gpu::fail_if_device_lost();
 #endif
   if (!frame_worker_requested()) {
     return begin_frame_impl(true);
@@ -1935,11 +1651,11 @@ bool begin_frame() noexcept {
   // A surface mutation can legitimately fail preparation, and optimistic success would let GX/ImGui
   // record into a frame that was never begun, so join this path and return its real result.
   waitForSurfacePreparation =
-      !window::is_presentable() || !g_surface ||
+      !window::is_presentable() || !gpu::has_surface() ||
       window::native_resize_pending() || window::is_paused() ||
       !window::native_window_size_matches(
-          webgpu::g_graphicsConfig.surfaceConfiguration.width,
-          webgpu::g_graphicsConfig.surfaceConfiguration.height);
+          gpu::g_graphicsConfig.surfaceWidth,
+          gpu::g_graphicsConfig.surfaceHeight);
 #endif
   bool workerPreparationPending = false;
   {
@@ -1983,7 +1699,7 @@ bool begin_frame() noexcept {
 
 void end_frame() {
 #ifdef AURORA_ENABLE_GX
-  webgpu::fail_if_device_lost();
+  gpu::fail_if_device_lost();
 #endif
   if (!frame_worker_requested()) {
     end_frame_impl(true, true);
@@ -2023,9 +1739,9 @@ bool wait_for_frame_worker_for(std::chrono::microseconds timeout) noexcept {
   return wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);
 }
 std::recursive_mutex& renderer_gpu_mutex() noexcept { return g_rendererGpuMutex; }
-void submit_staging_commands(const wgpu::CommandBuffer& commands) {
+void submit_staging_commands(gpu::Encoder&& commands) {
   std::lock_guard submitLock(g_queueSubmitMutex);
-  webgpu::g_queue.Submit(1, &commands);
+  commands.submit();
 }
 } // namespace aurora
 
@@ -2066,8 +1782,8 @@ void aurora_get_present_timing(AuroraPresentTiming* timing) {
     *timing = aurora::snapshot_present_timing();
   }
 }
-void aurora_set_vsync(bool enabled) { aurora::webgpu::request_vsync(enabled); }
-bool aurora_get_vsync() { return aurora::webgpu::vsync_enabled(); }
+void aurora_set_vsync(bool enabled) { aurora::gpu::request_vsync(enabled); }
+bool aurora_get_vsync() { return aurora::gpu::vsync_enabled(); }
 namespace aurora::gx { extern std::atomic<bool> g_pacingExempt; }
 void aurora_set_frame_pacing_exempt(bool exempt) { aurora::gx::g_pacingExempt.store(exempt, std::memory_order_release); }
 
@@ -2123,20 +1839,13 @@ bool aurora_flush_efb_copies_to_ram() {
   aurora::gx::mark_frame_interpolation_replay_unsafe();
   aurora::gx::fifo::drain();
   if (!aurora::gfx::efb_ram::prepare_downloads()) return false;
-  const wgpu::CommandEncoderDescriptor encoderDescriptor{
-      .label = "GX CPU-visible EFB copy encoder",
-  };
-  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encoderDescriptor);
+  aurora::gpu::Encoder encoder;
   aurora::gfx::end_batch(encoder);
   aurora::gfx::render(encoder);
   aurora::gfx::efb_ram::encode_downloads(encoder);
-  const wgpu::CommandBufferDescriptor commandDescriptor{
-      .label = "GX CPU-visible EFB copy command buffer",
-  };
-  const auto commandBuffer = encoder.Finish(&commandDescriptor);
   {
     std::lock_guard submitLock(aurora::g_queueSubmitMutex);
-    aurora::webgpu::g_queue.Submit(1, &commandBuffer);
+    encoder.submit();
   }
   const bool copied = aurora::gfx::efb_ram::complete_downloads();
   aurora::gfx::after_submit();
@@ -2160,20 +1869,13 @@ bool aurora_flush_efb_copy_to_ram(void* dest) {
   aurora::gx::mark_frame_interpolation_replay_unsafe();
   aurora::gx::fifo::drain();
   if (!aurora::gfx::efb_ram::prepare_downloads(dest)) return false;
-  const wgpu::CommandEncoderDescriptor encoderDescriptor{
-      .label = "GX demanded EFB copy encoder",
-  };
-  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encoderDescriptor);
+  aurora::gpu::Encoder encoder;
   aurora::gfx::end_batch(encoder);
   aurora::gfx::render(encoder);
   aurora::gfx::efb_ram::encode_downloads(encoder, dest);
-  const wgpu::CommandBufferDescriptor commandDescriptor{
-      .label = "GX demanded EFB copy command buffer",
-  };
-  const auto commandBuffer = encoder.Finish(&commandDescriptor);
   {
     std::lock_guard submitLock(aurora::g_queueSubmitMutex);
-    aurora::webgpu::g_queue.Submit(1, &commandBuffer);
+    encoder.submit();
   }
   const bool copied = aurora::gfx::efb_ram::complete_downloads();
   aurora::gfx::after_submit();
@@ -2192,40 +1894,27 @@ bool aurora_read_display_copy(uint8_t* rgba, uint32_t width, uint32_t height) {
   const auto texture = aurora::gx::g_gxState.displayCopyTexture;
   if (!texture || rgba == nullptr || width == 0 || height == 0) return false;
   const auto format = texture->format;
-  const bool bgra = format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::BGRA8UnormSrgb;
-  const bool rgba8 = format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::RGBA8UnormSrgb;
-  if (!bgra && !rgba8) return false;
+  const bool bgra = format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+  const bool rgba8 = format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM || format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB;
+  if (!bgra && !rgba8 || !texture->texture) return false;
   const uint32_t srcW = texture->size.width, srcH = texture->size.height;
-  const uint32_t bytesPerRow = (srcW * 4 + 255) & ~255u;
+  const uint32_t bytesPerRow = srcW * 4;
   const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * srcH;
-  const wgpu::BufferDescriptor bufferDescriptor{
-      .label = "Display copy readback",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
-      .size = bufferSize,
-  };
-  auto buffer = aurora::webgpu::g_device.CreateBuffer(&bufferDescriptor);
-  const wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "Display copy readback encoder"};
-  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encoderDescriptor);
-  const wgpu::TexelCopyTextureInfo source{.texture = texture->texture};
-  const wgpu::TexelCopyBufferInfo destination{
-      .layout = wgpu::TexelCopyBufferLayout{.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = srcH},
-      .buffer = buffer,
-  };
-  const wgpu::Extent3D size{srcW, srcH, 1};
-  encoder.CopyTextureToBuffer(&source, &destination, &size);
-  const auto commandBuffer = encoder.Finish();
+  auto buffer = aurora::gpu::create_transfer_buffer(false, static_cast<uint32_t>(bufferSize));
+  if (!buffer) return false;
+  SDL_GPUFence* fence = nullptr;
   {
+    aurora::gpu::Encoder encoder;
+    aurora::gpu::download_from_texture(encoder, *texture->texture, 0, 0, srcW, srcH, *buffer, 0, srcW);
     std::lock_guard submitLock(aurora::g_queueSubmitMutex);
-    aurora::webgpu::g_queue.Submit(1, &commandBuffer);
+    fence = encoder.submit_with_fence();
   }
-  const auto status = std::make_shared<wgpu::MapAsyncStatus>(wgpu::MapAsyncStatus::CallbackCancelled);
-  const auto future = buffer.MapAsync(wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::WaitAnyOnly,
-                                      [status](wgpu::MapAsyncStatus s, wgpu::StringView) { *status = s; });
-  if (aurora::webgpu::g_instance.WaitAny(future, 5000000000) != wgpu::WaitStatus::Success ||
-      *status != wgpu::MapAsyncStatus::Success) {
-    return false;
-  }
-  const auto* pixels = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, bufferSize));
+  if (fence == nullptr) return false;
+  SDL_WaitForGPUFences(aurora::gpu::g_device, true, &fence, 1);
+  SDL_ReleaseGPUFence(aurora::gpu::g_device, fence);
+  const auto* pixels =
+      static_cast<const uint8_t*>(SDL_MapGPUTransferBuffer(aurora::gpu::g_device, buffer->handle, false));
+  if (pixels == nullptr) return false;
   for (uint32_t y = 0; y < height; ++y) {
     const uint8_t* row = pixels + static_cast<size_t>((y * 2 + 1) * srcH / (height * 2)) * bytesPerRow;
     for (uint32_t x = 0; x < width; ++x) {
@@ -2237,7 +1926,7 @@ bool aurora_read_display_copy(uint8_t* rgba, uint32_t width, uint32_t height) {
       out[3] = 255;
     }
   }
-  buffer.Unmap();
+  SDL_UnmapGPUTransferBuffer(aurora::gpu::g_device, buffer->handle);
   return true;
 #else
   (void)rgba;

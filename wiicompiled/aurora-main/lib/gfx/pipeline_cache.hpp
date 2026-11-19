@@ -14,7 +14,7 @@ struct PipelineConfig;
 
 namespace aurora::gfx {
 
-using NewPipelineCallback = std::function<wgpu::RenderPipeline()>;
+using NewPipelineCallback = std::function<gpu::GraphicsPipeline()>;
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
@@ -27,10 +27,10 @@ uint32_t queued_pipeline_count() noexcept;
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
-bool wait_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
-bool try_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+bool wait_pipeline(PipelineRef ref, gpu::GraphicsPipeline& pipeline);
+bool try_pipeline(PipelineRef ref, gpu::GraphicsPipeline& pipeline);
 // Waits indefinitely for a draw about to be committed to a persistent texture with no re-issue
 // path. Separate from wait_pipeline so skip-unready mode never becomes blocking for other passes.
-bool wait_pipeline_for_persistent_pass(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+bool wait_pipeline_for_persistent_pass(PipelineRef ref, gpu::GraphicsPipeline& pipeline);
 
 } // namespace aurora::gfx
