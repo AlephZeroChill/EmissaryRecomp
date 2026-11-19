@@ -1,6 +1,7 @@
 // OSAlarm queue HLE.
 
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 
@@ -144,12 +145,44 @@ bool IsLikelyCodeAddress(uint32_t addr)
 }
 } // namespace
 
+namespace {
+// BRAWL_THREAD_TRACE: once a second, every guest thread on the OS active list: state
+// (1 ready, 2 running, 4 waiting, 8 moribund), priority, base priority, suspend count and
+// the thread queue it waits on.
+void TraceGuestThreads() {
+    static const bool on = std::getenv("BRAWL_THREAD_TRACE") != nullptr;
+    if (!on) return;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(1)) return;
+    last = now;
+    uint32_t current = 0, thread = 0;
+    Memory::TryRead32(0x800000E4u, current);
+    Memory::TryRead32(kThreadListHeadAddr, thread);
+    for (int i = 0; thread != 0 && i < 64; ++i) {
+        uint32_t stateAttr = 0, suspend = 0, priority = 0, base = 0, queue = 0, next = 0;
+        Memory::TryRead32(thread + kThreadStateOffset, stateAttr);
+        const uint32_t state = stateAttr >> 16;
+        Memory::TryRead32(thread + kThreadSuspendOffset, suspend);
+        Memory::TryRead32(thread + kThreadPriorityOffset, priority);
+        Memory::TryRead32(thread + kThreadBasePriorityOffset, base);
+        Memory::TryRead32(thread + kThreadQueueOffset, queue);
+        Memory::TryRead32(thread + kThreadListNextOffset, next);
+        RT_LOGF(RT_TAG_OS, "[threadtrace] %08X%s state=%u prio=%d base=%d suspend=%d queue=%08X\n", thread,
+                thread == current ? "*" : " ", state, static_cast<int32_t>(priority), static_cast<int32_t>(base),
+                static_cast<int32_t>(suspend), queue);
+        thread = next;
+    }
+}
+} // namespace
+
 namespace OsHleInternal {
 bool ProcessAlarmQueue(CpuContext* cpu, int maxToProcess)
 {
     if (!cpu || maxToProcess <= 0) {
         return false;
     }
+    TraceGuestThreads();
 
     if (g_alarmProcessDepth != 0) {
         return false;

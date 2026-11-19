@@ -645,11 +645,26 @@ private:
         }
     }
 
+    // BRAWL_AX_TRACE: once a second, the voice list the game handed the DSP and what became of it.
+    struct VoiceTrace {
+        uint32_t lists = 0, voices = 0, running = 0, runningAfter = 0, streams = 0, ended = 0, maxList = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    };
+    static bool VoiceTraceOn() {
+        static const bool on = std::getenv("BRAWL_AX_TRACE") != nullptr;
+        return on;
+    }
+
     void ProcessPBList(uint32_t pbAddr, bool newFilter, bool oldAxLayout) {
+        static VoiceTrace trace;
+        const bool tracing = VoiceTraceOn();
+        uint32_t listLength = 0;
         uint32_t guard = 0;
         while (pbAddr && guard++ < 256) {
             AXPBWii pb{};
             ReadPB(pbAddr, pb);
+            const bool wasRunning = pb.running == 1;
+            ++listLength;
             AXBuffers buffers = MixBuffers();
             const AXMixControl control = ConvertMixerControl(Hilo(pb.mixer_control_hi, pb.mixer_control_lo));
             if (oldAxLayout && (pb.updates.num_updates[0] | pb.updates.num_updates[1] | pb.updates.num_updates[2]) != 0) {
@@ -663,7 +678,29 @@ private:
                 ProcessVoice(pb, buffers, kAxSamplesPerFrame, control, BaseCoefficients(), newFilter);
             }
             WritePB(pbAddr, pb);
+            if (tracing) {
+                const bool nowRunning = pb.running == 1;
+                trace.running += wasRunning;
+                trace.runningAfter += nowRunning;
+                trace.streams += (wasRunning || nowRunning) && pb.is_stream == 1;
+                trace.ended += wasRunning && !nowRunning;
+            }
             pbAddr = Hilo(pb.next_pb_hi, pb.next_pb_lo);
+        }
+        if (!tracing) return;
+        ++trace.lists;
+        trace.voices += listLength;
+        trace.maxList = std::max(trace.maxList, listLength);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - trace.last >= std::chrono::seconds(1)) {
+            const uint32_t n = std::max(trace.lists, 1u);
+            RT_LOGF(RT_TAG_AUDIO, "[axtrace] lists=%u avg_voices=%.1f max_voices=%u running_in=%.1f running_out=%.1f "
+                    "streams=%.1f ended=%u pb_layout=%d ucode=%08X old_layout=%d\n",
+                    trace.lists, double(trace.voices) / n, trace.maxList, double(trace.running) / n,
+                    double(trace.runningAfter) / n, double(trace.streams) / n, trace.ended,
+                    static_cast<int>(m_pbLayout), m_ucodeCrc, oldAxLayout ? 1 : 0);
+            trace = VoiceTrace{};
+            trace.last = now;
         }
     }
 
