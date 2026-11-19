@@ -104,6 +104,9 @@ void Check() {
 } // namespace
 
 std::string Available() {
+#if defined(__SWITCH__)
+    return {};  // releases are desktop launcher builds; nothing to offer a console
+#endif
     std::call_once(g_started, [] { std::thread(Check).detach(); });
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_newer;

@@ -1,17 +1,24 @@
 extern "C" void aurora_spm_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3);
+extern "C" void GXCallDisplayListCompiled(const void* data, uint32_t nbytes, uint64_t digest);  // GXDispList.cpp
+extern "C" void aurora_gx_sync();  // aurora.cpp: wait for Aurora's GX thread (no-op when it is off)
 #include "gx_internal.h"
 #include "runtime_log.h"
 #include "gx_stream_common.h"
 #include "gx_cp_decode.h"
 #include "isa/big_endian.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 
 // The display-list scan cache validates a cached scan against the live guest
 // bytes with a 64-bit XXH3 digest (see GxDisplayListScanCache::CanReuse).
 #include <xxhash.h>
+#include "hz_perf.h"
+#include "g3d_native.h"
+#include "gx_vertex_state_overrides.h"  // last: this file's entry points touch the HLE vertex state
 
 namespace aurora::gx::fifo {
 bool in_display_list();
@@ -499,22 +506,23 @@ static uint64_t HashScanLayoutState() {
     if (!g_hleGxState.vtxLayoutHashDirty) {
         return g_hleGxState.vtxLayoutHash;
     }
-    uint64_t hash = 1469598103934665603ull;
-    auto mix = [&hash](uint32_t value) {
-        hash ^= static_cast<uint64_t>(value);
-        hash *= 1099511628211ull;
-    };
+    // The same 650 values the FNV-1 mix used to take one at a time, packed and hashed in one XXH3 pass.
+    // The hash is only an in-process cache key (equal layouts give equal keys either way); FNV's serial
+    // multiply chain cost ~0.7 us per layout change, and the layout changes dozens of times a frame.
+    std::array<uint32_t, 26 + 8 * 26 * 3> packed;
+    size_t n = 0;
     for (int attr = 0; attr < 26; ++attr) {
-        mix(static_cast<uint32_t>(g_hleGxState.vtxDesc[attr]));
+        packed[n++] = static_cast<uint32_t>(g_hleGxState.vtxDesc[attr]);
     }
     for (int fmt = 0; fmt < 8; ++fmt) {
         for (int attr = 0; attr < 26; ++attr) {
             const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];
-            mix(static_cast<uint32_t>(f.cnt));
-            mix(static_cast<uint32_t>(f.type));
-            mix(static_cast<uint32_t>(f.frac));
+            packed[n++] = static_cast<uint32_t>(f.cnt);
+            packed[n++] = static_cast<uint32_t>(f.type);
+            packed[n++] = static_cast<uint32_t>(f.frac);
         }
     }
+    const uint64_t hash = static_cast<uint64_t>(XXH3_64bits(packed.data(), sizeof(packed)));
     g_hleGxState.vtxLayoutHash = hash;
     g_hleGxState.vtxLayoutHashDirty = false;
     return g_hleGxState.vtxLayoutHash;
@@ -792,6 +800,7 @@ static bool WalkDisplayList(const uint8_t* data, uint32_t nbytes, Visitor& visit
 struct DlMayContainDrawVisitor {
     static constexpr int kMaxDepth = 8;
     static constexpr bool kHandlesDraw = false;
+    bool* sawCall = nullptr;  // set when the walk meets a call-DL command (at any depth)
 
     bool OnNop(uint8_t) { return true; }
     bool OnBpReg(const uint8_t*, uint32_t) { return true; }
@@ -804,16 +813,19 @@ struct DlMayContainDrawVisitor {
     // command byte this walker does not model, both mean "assume it draws".
     bool OnUnknownCommand(uint8_t) { return false; }
     bool OnCallDisplayList(uint32_t addr, uint32_t size, int depth) {
+        if (sawCall) *sawCall = true;
         if (addr == 0 || size == 0) return true;
         const uint8_t* nested = static_cast<const uint8_t*>(GuestToHostPtr(addr, size));
         if (!nested) return false;
         DlMayContainDrawVisitor child;
+        child.sawCall = sawCall;
         return WalkDisplayList(nested, size, child, depth + 1);
     }
 };
 
-static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
+static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes, bool* sawCall = nullptr) {
     DlMayContainDrawVisitor visitor;
+    visitor.sawCall = sawCall;
     return !WalkDisplayList(data, nbytes, visitor, 0);
 }
 
@@ -1042,11 +1054,12 @@ static std::vector<uint8_t>& FlattenDisplayListScratch() {
     return s_scratch;
 }
 
-static bool s_appliedVtxDescValid = false;
-static std::array<GXAttrType, 26> s_appliedVtxDesc{};
-static std::array<GXAttrType, 26> s_appliedSourceVtxDesc{};
-static bool s_appliedVtxAttrFmtValid = false;
-static VtxAttrFmt s_appliedVtxAttrFmt[8][26]{};
+// The applied-state mirror is per producer thread (a draw worker filling deferred jobs has its own; g3d_native.cpp).
+static thread_local bool s_appliedVtxDescValid = false;
+static thread_local std::array<GXAttrType, 26> s_appliedVtxDesc{};
+static thread_local std::array<GXAttrType, 26> s_appliedSourceVtxDesc{};
+static thread_local bool s_appliedVtxAttrFmtValid = false;
+static thread_local VtxAttrFmt s_appliedVtxAttrFmt[8][26]{};
 
 struct AppliedArrayState {
     const void* data = nullptr;
@@ -1055,13 +1068,13 @@ struct AppliedArrayState {
     bool valid = false;
 };
 
-static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
+static thread_local std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
 
 // True only while the applied-state mirror is a verbatim copy of HLE vertex state at
 // generation s_appliedVtxStateGeneration; any HLE-side mutation bumps that generation, so the
 // memoized republish below can never observe a stale match.
-static bool s_appliedVtxStateMatchesHle = false;
-static uint32_t s_appliedVtxStateGeneration = 0;
+static thread_local bool s_appliedVtxStateMatchesHle = false;
+static thread_local uint32_t s_appliedVtxStateGeneration = 0;
 
 static void InvalidateAppliedAuroraState() {
     s_appliedVtxDescValid = false;
@@ -1160,6 +1173,13 @@ static uint32_t GetIndexedAttrElementSizeBytes(GXAttr attr, const VtxAttrFmt& fm
 
 static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
     const bool hadValidState = s_appliedVtxAttrFmtValid;
+    // The row is byte-identical to what was last applied: the loop below would skip every attribute. One compare
+    // instead of 24 per display list (6% of the main thread in the menus); any difference, padding included,
+    // takes the exact per-attribute path.
+    if (hadValidState && std::memcmp(s_appliedVtxAttrFmt[fmt], g_hleGxState.vtxAttrFmt[fmt],
+                                     sizeof(s_appliedVtxAttrFmt[fmt])) == 0) {
+        return;
+    }
     // Rows other than `fmt` keep their contents and every write below copies
     // g_hleGxState, so an already-matching mirror still matches. Only the rebuild
     // from an invalidated mirror leaves the untouched rows divergent.
@@ -1176,6 +1196,9 @@ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
         GXSetVtxAttrFmt(fmt, static_cast<GXAttr>(attr), f.cnt, f.type, f.frac);
         s_appliedVtxAttrFmt[fmt][attr] = f;
     }
+    // Mirror the whole row (the never-applied NBT and matrix-index entries too, as the full republish does), so an
+    // unchanged row matches the compare above next time.
+    std::memcpy(s_appliedVtxAttrFmt[fmt], g_hleGxState.vtxAttrFmt[fmt], sizeof(s_appliedVtxAttrFmt[fmt]));
     s_appliedVtxAttrFmtValid = true;
 }
 
@@ -1211,8 +1234,8 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
                                             const std::array<bool, GX_VA_MAX_ATTR>& sawIdx,
                                             GXVtxFmt vtxfmt,
                                             bool vtxfmtMixed) {
-    static std::array<std::array<std::vector<uint8_t>, 2>, GX_VA_MAX_ATTR> s_packedArrays;
-    static std::array<uint32_t, GX_VA_MAX_ATTR> s_packedArrayCursor{};
+    static thread_local std::array<std::array<std::vector<uint8_t>, 2>, GX_VA_MAX_ATTR> s_packedArrays;
+    static thread_local std::array<uint32_t, GX_VA_MAX_ATTR> s_packedArrayCursor{};
     bool ok = true;
     if (vtxfmt >= GX_MAX_VTXFMT) {
         vtxfmt = g_hleGxState.currentVtxFmt;
@@ -1248,6 +1271,9 @@ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX
             ApplyAuroraArrayIfChanged(gxAttr, hostPtr, span, static_cast<uint8_t>(arr.stride));
             continue;
         }
+        // Only two packed buffers per attribute alternate, and Aurora reads the array through this pointer when it
+        // decodes: with its GX thread on, that may be after this returns, so it must be done with the older one.
+        aurora_gx_sync();
         auto& packed = s_packedArrays[attr][++s_packedArrayCursor[attr] & 1u];
         if (!PackIndexedAttrData(hostPtr, arr.stride, count, elemSize, packed)) {
             ok = false;
@@ -1324,8 +1350,26 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
     return false;
 }
 
+// Horizon perf spans inside GX__CallDisplayList_HLE: the ticks since the last mark go to a slot.
+#if MKW_HZ_PERF && MKW_HZ_PERF_HOT
+#define HZ_DL_MARK(var) const uint64_t var = HzTicks()
+#define HZ_DL_SPAN(slot, since) HZ_PERF_ADD(slot, HzTicks() - (since))
+#else
+#define HZ_DL_MARK(var) ((void)0)
+#define HZ_DL_SPAN(slot, since) ((void)0)
+#endif
+
 extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
     if (nbytes == 0 || listAddr == 0) return;
+    // Recorded as the FIFO command GXFastCallDisplayList writes, so both ways of calling a list compare equal.
+    const uint8_t g3dRecCall[9] = {0x40, uint8_t(listAddr >> 24), uint8_t(listAddr >> 16), uint8_t(listAddr >> 8),
+                                   uint8_t(listAddr), uint8_t(nbytes >> 24), uint8_t(nbytes >> 16),
+                                   uint8_t(nbytes >> 8), uint8_t(nbytes)};
+    g3dn::HleRec g3dRec(g3dn::kRecFifo, g3dRecCall, sizeof(g3dRecCall));
+    if (g3dRec.skip) return;
+    HZ_PERF_ADD(kHzDlCalls, 1);
+    HZ_PERF_ADD(kHzDlBytes, nbytes);
+    HZ_PHASE(kHzDlTicks);
     try {
         const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
         if (!list) return;
@@ -1340,6 +1384,7 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
             }
         }
 
+        HZ_DL_MARK(hzProbe);
         const bool allowScanCache = nbytes <= kDlScanCacheMaxEntryBytes;
         const uint64_t scanLayoutHash = allowScanCache ? HashScanLayoutState() : 0;
         // The digest is computed lazily inside the probe: an entry whose covering
@@ -1351,8 +1396,11 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
         const DlScanCacheRecord* cached = probe.record;
 
         // The scan a cached record came from already walked the list for this,
-        // so only a miss pays for DisplayListMayContainDraw.
-        const bool auroraList = ListHasAuroraCommand(list, nbytes);
+        // so only a miss pays for DisplayListMayContainDraw. Records are stored
+        // only for lists ListHasAuroraCommand rejected, and a hit means the bytes
+        // are the ones that record was taken from, so a hit is never an Aurora list.
+        const bool auroraList = cached != nullptr ? false : ListHasAuroraCommand(list, nbytes);
+        HZ_DL_SPAN(kHzDlProbeTicks, hzProbe);
         if (auroraList) g_boundTexMaps.fill(BoundTexInfo{});
         { static int s_callLog = 0;
           if (s_callLog++ < 60) RT_LOGF(RT_TAG_GX, "[spmdl] call 0x%08X %u bytes aurora=%d\n", listAddr, nbytes, auroraList ? 1 : 0); }  // the list rebinds textures behind the cache
@@ -1368,9 +1416,20 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
                         m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
             }
         }
+        bool walkSawCall = false;
         const bool mayContainDraw = auroraList ? false
-            : (cached != nullptr) ? cached->mayContainDraw : DisplayListMayContainDraw(list, nbytes);
+            : (cached != nullptr) ? cached->mayContainDraw : DisplayListMayContainDraw(list, nbytes, &walkSawCall);
         if (!mayContainDraw) {
+            // Register-only lists are ~60% of calls in a match. Record the answer so the next call with these
+            // bytes is a hit and skips both walks (ListHasAuroraCommand, DisplayListMayContainDraw). Not for
+            // Aurora lists (they keep the per-call texture reset above) or lists calling other lists (the
+            // digest covers only the outer list), the same rule the draw-list records follow.
+            if (cached == nullptr && !auroraList && allowScanCache && !walkSawCall) {
+                const uint64_t contentDigest =
+                    probe.digestValid ? probe.contentDigest : DlContentDigest(list, nbytes);
+                StoreDlScanCache(listAddr, nbytes, scanLayoutHash, contentDigest, probe.writeGeneration,
+                                 /*mayContainDraw=*/false, DlScanCacheEntry{}, {}, nullptr, 0u);
+            }
             EnsureAuroraFrameActive();
             GXMarkFrameWork();
             GXCallDisplayList(list, nbytes);
@@ -1381,9 +1440,11 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
             SyncAppliedVtxStateFromHleReal();
             return;
         }
-        std::array<uint32_t, GX_VA_MAX_ATTR> maxIdx{}; std::array<bool, GX_VA_MAX_ATTR> sawIdx{};
-        std::array<uint32_t, GX_VA_MAX_ATTR> maxXfIdx{}; std::array<uint32_t, GX_VA_MAX_ATTR> maxXfBytes{};
-        std::array<bool, GX_VA_MAX_ATTR> sawXfIdx{};
+        // The per-attribute index ranges are read in place from the cached record, or from a fresh
+        // entry built only on a miss: copying them (and zeroing the locals they were copied into)
+        // was ~0.7 KB of stores per call on the common, cached path.
+        std::optional<DlScanCacheEntry> scanned;
+        const DlScanCacheEntry* scan = nullptr;
         GXVtxFmt dlVtxFmt = GX_MAX_VTXFMT; bool dlVtxFmtMixed = false;
         bool dlHasNestedDl = false;
         bool dlHasArrayStateWrites = false;
@@ -1400,12 +1461,8 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
         uint32_t auroraStreamBytes = 0;
         if (cached != nullptr) {
             const auto& entry = cached->result;
+            scan = &entry;
             scanOk = entry.scanOk;
-            maxIdx = entry.maxIdx;
-            sawIdx = entry.sawIdx;
-            maxXfIdx = entry.maxXfIdx;
-            maxXfBytes = entry.maxXfBytes;
-            sawXfIdx = entry.sawXfIdx;
             dlVtxFmt = entry.dlVtxFmt;
             dlVtxFmtMixed = entry.dlVtxFmtMixed;
             dlHasNestedDl = entry.dlHasNestedDl;
@@ -1436,7 +1493,10 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
             // The scan discovers the list's CP writes as it walks, so this path
             // cannot narrow the snapshot the way the cached one does.
             stateBeforeScan = CaptureGxVertexState();
-            scanOk = ScanDisplayListMaxIndices(list, nbytes, maxIdx, sawIdx, maxXfIdx, maxXfBytes, sawXfIdx,
+            DlScanCacheEntry& fresh = scanned.emplace();
+            scan = &fresh;
+            scanOk = ScanDisplayListMaxIndices(list, nbytes, fresh.maxIdx, fresh.sawIdx, fresh.maxXfIdx,
+                                               fresh.maxXfBytes, fresh.sawXfIdx,
                                                &dlVtxFmt, &dlVtxFmtMixed, &dlHasNestedDl,
                                                &dlHasArrayStateWrites, &dlHasCpWrites, &cpWrites);
             needsFlatten = dlHasNestedDl || dlHasArrayStateWrites || dlHasCpWrites;
@@ -1461,15 +1521,10 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
             // rewritten callee would go undetected. Everything else is cacheable since the
             // scan/flatten are pure functions of the list bytes and the layout-hash cache key.
             if (allowScanCache && scanOk && !dlHasNestedDl && (!needsFlatten || flattenOk)) {
-                DlScanCacheEntry entry{};
+                DlScanCacheEntry& entry = fresh;  // its index ranges are already filled in by the scan
                 entry.listAddr = CanonicalizeGxMainRamAddress(listAddr);
                 entry.nbytes = nbytes;
                 entry.layoutHash = scanLayoutHash;
-                entry.maxIdx = maxIdx;
-                entry.sawIdx = sawIdx;
-                entry.maxXfIdx = maxXfIdx;
-                entry.maxXfBytes = maxXfBytes;
-                entry.sawXfIdx = sawXfIdx;
                 entry.dlVtxFmt = dlVtxFmt;
                 entry.dlVtxFmtMixed = dlVtxFmtMixed;
                 entry.dlHasNestedDl = dlHasNestedDl;
@@ -1492,21 +1547,27 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
 
         if (needsFlatten) {
             bool flattenApplyOk = flattenOk && scanOk && auroraStream != nullptr && auroraStreamBytes != 0;
+            HZ_DL_MARK(hzApply);
             if (flattenApplyOk) {
                 ApplyAuroraVtxDesc();
                 ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
                 const bool flattenArraysOk =
-                    ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed);
+                    ApplyAuroraArraysForDisplayList(scan->maxIdx, scan->sawIdx, dlVtxFmt, dlVtxFmtMixed);
                 const bool flattenXfOk =
-                    ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
+                    ApplyAuroraIndexedXFArraysForDisplayList(scan->maxXfIdx, scan->maxXfBytes, scan->sawXfIdx);
                 flattenApplyOk = flattenArraysOk && flattenXfOk;
             }
+            HZ_DL_SPAN(kHzDlApplyTicks, hzApply);
             if (flattenApplyOk) {
+                HZ_DL_MARK(hzAurora);
                 EnsureAuroraFrameActive();
                 GXMarkFrameWork();
                 GXCallDisplayList(auroraStream, auroraStreamBytes);
+                HZ_DL_SPAN(kHzDlAuroraTicks, hzAurora);
                 // No flip back to GX_DIRECT here
+                HZ_DL_MARK(hzSync);
                 SyncAppliedVtxStateFromHleReal();
+                HZ_DL_SPAN(kHzDlSyncTicks, hzSync);
                 return;
             }
 
@@ -1514,19 +1575,30 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
             bool applyOk = scanOk;
             bool arraysOk = false;
             bool xfOk = false;
+            HZ_DL_MARK(hzApply);
             if (scanOk) {
                 ApplyAuroraVtxDesc();
                 ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
-                arraysOk = ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed);
-                xfOk = ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
+                arraysOk = ApplyAuroraArraysForDisplayList(scan->maxIdx, scan->sawIdx, dlVtxFmt, dlVtxFmtMixed);
+                xfOk = ApplyAuroraIndexedXFArraysForDisplayList(scan->maxXfIdx, scan->maxXfBytes, scan->sawXfIdx);
                 applyOk = arraysOk && xfOk;
             }
+            HZ_DL_SPAN(kHzDlApplyTicks, hzApply);
             if (applyOk) {
+                HZ_DL_MARK(hzAurora);
                 EnsureAuroraFrameActive();
                 GXMarkFrameWork();
-                GXCallDisplayList(list, nbytes);
+                // The native g3d path's lists (a shape's draws): Aurora may submit them from a compiled form, keyed
+                // by the list's content digest (GXCallDisplayListCompiled falls back to decoding the bytes).
+                if (g3dn::g_nativeDraw && probe.digestValid)
+                    GXCallDisplayListCompiled(list, nbytes, probe.contentDigest);
+                else
+                    GXCallDisplayList(list, nbytes);
+                HZ_DL_SPAN(kHzDlAuroraTicks, hzAurora);
 
+                HZ_DL_MARK(hzSync);
                 SyncAppliedVtxStateFromHleReal();
+                HZ_DL_SPAN(kHzDlSyncTicks, hzSync);
                 return;
             }
 
@@ -1545,7 +1617,293 @@ extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
 
 PPC_NATIVE_OVERRIDE_VOID(801F4EAC, GX__CallDisplayList_HLE, (uint32_t listAddr, uint32_t nbytes), (listAddr, nbytes));
 
+// The native nw4r g3d path's shape lists (hle/g3d_native.cpp): a shape's pre-primitive list (its vertex descriptor,
+// formats and array bases, as CP writes) and its primitive list (its draws and, for a skinned shape, the matrix loads
+// between them). What GX__CallDisplayList_HLE does on a scan-cache hit, from a record of the list's own: found by
+// address, valid while the list's write generation is the one it was made under and the vertex layout its scan read
+// is unchanged (the scan cache keys on a hash of the whole layout; a scan reads only the descriptor and the formats
+// of the list's draws: nothing for a list without draws, the descriptor and one format's row for a list of draws in
+// one format without CP writes, the whole layout's hash otherwise). So without the probe (layout hash, identity key
+// and lookup, the SPM host-list check: a hit means the bytes are the ones the record came from) and, when the apply
+// cannot fail (nothing indexed to apply: a pre-primitive list), without the vertex-state snapshot a list with CP
+// writes keeps for its fallback. A miss is the HLE call; the scan cache's record for those bytes, when it stored one,
+// is then copied.
+extern "C" void GXCallStateDisplayList(const void* data, uint32_t nbytes);  // Aurora GXDispList.cpp
+
+namespace {
+// True for a list of BP and CP writes and NOP padding only (what GXCallStateDisplayList takes).
+bool ListIsStateOnly(const uint8_t* data, uint32_t n) {
+    uint32_t pos = 0;
+    while (pos < n) {
+        const uint8_t cmd = data[pos];
+        if (cmd == GX_NOP_CMD) {
+            ++pos;
+        } else if (cmd == GX_LOAD_BP_REG_CMD) {
+            pos += 5;
+        } else if ((cmd & GX_OPCODE_MASK_CMD) == GX_LOAD_CP_REG_CMD) {
+            pos += 6;
+        } else {
+            return false;
+        }
+    }
+    return pos == n;
+}
+
+enum class ShapeLayout : uint8_t { kNone, kFormat, kHash };
+struct G3dShapeList {
+    uint32_t nbytes = 0;
+    uint64_t generation = kDlWriteGenerationUntracked;
+    ShapeLayout layout = ShapeLayout::kHash;
+    uint64_t layoutHash = 0;                                     // kHash
+    GXVtxFmt fmt = GX_VTXFMT0;                                              // kFormat: the format of its draws,
+    decltype(g_hleGxState.vtxDesc) vtxDesc{};                               //   the descriptor
+    std::remove_cvref_t<decltype(g_hleGxState.vtxAttrFmt[0])> fmtRow{};     //   and that format's row, as recorded
+    uint64_t contentDigest = 0;
+    bool mayContainDraw = false;
+    bool applyCannotFail = false;
+    bool streamStateOnly = false;  // the flattened stream holds BP and CP writes only (GXCallStateDisplayList)
+    DlScanCacheEntry scan{};
+    std::vector<DlCpWrite> cpWrites;
+    std::vector<uint8_t> flattened;
+};
+
+bool ShapeLayoutMatches(const G3dShapeList& r) {
+    switch (r.layout) {
+    case ShapeLayout::kNone:
+        return true;
+    case ShapeLayout::kFormat:
+        return std::memcmp(&r.vtxDesc, &g_hleGxState.vtxDesc, sizeof(r.vtxDesc)) == 0 &&
+               std::memcmp(&r.fmtRow, &g_hleGxState.vtxAttrFmt[r.fmt], sizeof(r.fmtRow)) == 0;
+    case ShapeLayout::kHash:
+        break;
+    }
+    return HashScanLayoutState() == r.layoutHash;
+}
+// Per producer thread (the game thread, a draw worker: g3d_native.cpp), as the scan cache.
+thread_local std::unordered_map<uint32_t, G3dShapeList> s_g3dShapeLists;
+// GX__ClearShapeDisplayLists_G3D may run on any thread (scene reports); each drawing thread drops its records (and
+// GX__CallRegisterDisplayList_G3D its list classifications).
+std::atomic<uint32_t> s_g3dShapeListClears{0};
+thread_local uint32_t s_g3dShapeListClearsSeen = 0;
+
+void RecordG3dShapeList(const uint8_t* list, uint32_t listAddr, uint32_t nbytes, uint64_t generation,
+                        uint64_t layoutHash) {
+    const DlScanCacheProbe probe = ProbeDlScanCache(list, listAddr, nbytes, layoutHash);
+    if (probe.record == nullptr || probe.record->writeGeneration != generation) return;
+    const DlScanCacheRecord& from = *probe.record;
+    G3dShapeList& r = s_g3dShapeLists[listAddr];
+    r.nbytes = nbytes;
+    r.generation = generation;
+    r.contentDigest = from.contentDigest;
+    r.mayContainDraw = from.mayContainDraw;
+    r.scan = from.result;
+    r.cpWrites = from.cpWrites;
+    r.flattened = from.flattened;
+    const auto& s = r.scan;
+    // The layout the scan read (see above). A list without CP writes leaves the layout as the HLE call found it.
+    r.layoutHash = layoutHash;
+    if (!from.mayContainDraw || s.dlVtxFmt >= GX_MAX_VTXFMT) {
+        r.layout = ShapeLayout::kNone;
+    } else if (!s.dlVtxFmtMixed && !s.dlHasCpWrites && !s.dlHasNestedDl) {
+        r.layout = ShapeLayout::kFormat;
+        r.fmt = s.dlVtxFmt;
+        std::memcpy(&r.vtxDesc, &g_hleGxState.vtxDesc, sizeof(r.vtxDesc));
+        std::memcpy(&r.fmtRow, &g_hleGxState.vtxAttrFmt[r.fmt], sizeof(r.fmtRow));
+    } else {
+        r.layout = ShapeLayout::kHash;
+    }
+    bool indexed = false;
+    for (int attr = 0; attr < GX_VA_MAX_ATTR; ++attr) indexed = indexed || s.sawIdx[attr] || s.sawXfIdx[attr];
+    const bool streamOk = !s.needsFlatten || (s.flattenOk && (s.flattenVerbatim ? nbytes != 0 : !r.flattened.empty()));
+    r.applyCannotFail = !indexed && s.scanOk && streamOk;
+    r.streamStateOnly = s.needsFlatten && s.flattenOk &&
+                        (s.flattenVerbatim ? ListIsStateOnly(list, nbytes)
+                                           : ListIsStateOnly(r.flattened.data(), static_cast<uint32_t>(r.flattened.size())));
+}
+} // namespace
+
+extern "C" void GX__ClearShapeDisplayLists_G3D() {
+    s_g3dShapeListClears.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void GX__CallShapeDisplayList_G3D(uint32_t listAddr, uint32_t nbytes) {
+    if (nbytes == 0 || listAddr == 0) return;
+    const uint8_t g3dRecCall[9] = {0x40, uint8_t(listAddr >> 24), uint8_t(listAddr >> 16), uint8_t(listAddr >> 8),
+                                   uint8_t(listAddr), uint8_t(nbytes >> 24), uint8_t(nbytes >> 16),
+                                   uint8_t(nbytes >> 8), uint8_t(nbytes)};
+    g3dn::HleRec g3dRec(g3dn::g_recJob ? g3dn::kRecShapeDL : g3dn::kRecFifo, g3dRecCall, sizeof(g3dRecCall));
+    if (g3dRec.skip) return;
+    if (const uint32_t clears = s_g3dShapeListClears.load(std::memory_order_relaxed);
+        clears != s_g3dShapeListClearsSeen) {
+        s_g3dShapeLists.clear();
+        s_g3dShapeListClearsSeen = clears;
+    }
+    try {
+        const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
+        if (!list) return;
+        const uint64_t generation = GxGuestWrite::GenerationForRange(listAddr, nbytes);
+        if (generation == kDlWriteGenerationUntracked || nbytes > kDlScanCacheMaxEntryBytes || SpmDumpFrame()) {
+            GX__CallDisplayList_HLE(listAddr, nbytes);
+            return;
+        }
+        const auto it = s_g3dShapeLists.find(listAddr);
+        if (it == s_g3dShapeLists.end() || it->second.nbytes != nbytes || it->second.generation != generation ||
+            !ShapeLayoutMatches(it->second)) {
+            const uint64_t layoutHash = HashScanLayoutState();  // the key the HLE call stores its record under
+            GX__CallDisplayList_HLE(listAddr, nbytes);
+            RecordG3dShapeList(list, listAddr, nbytes, generation, layoutHash);
+            return;
+        }
+        const G3dShapeList& r = it->second;
+        HZ_PERF_ADD(kHzDlCalls, 1);
+        HZ_PERF_ADD(kHzDlBytes, nbytes);
+        HZ_PHASE(kHzDlTicks);
+        if (!r.mayContainDraw) {
+            EnsureAuroraFrameActive();
+            GXMarkFrameWork();
+            GXCallDisplayList(list, nbytes);
+            SyncAppliedVtxStateFromHleReal();
+            return;
+        }
+        const DlScanCacheEntry& scan = r.scan;
+        std::optional<HleGxVertexStateSnapshot> stateBeforeScan;
+        if (scan.dlHasCpWrites && !r.applyCannotFail) stateBeforeScan = CaptureGxVertexStateForCpWrites(r.cpWrites);
+        for (const auto& write : r.cpWrites) ApplyCpRegWrite(write.reg, write.value);
+        if (scan.needsFlatten) {
+            const uint8_t* stream = nullptr;
+            uint32_t streamBytes = 0;
+            if (scan.flattenOk) {
+                stream = scan.flattenVerbatim ? list : r.flattened.data();
+                streamBytes = scan.flattenVerbatim ? nbytes : static_cast<uint32_t>(r.flattened.size());
+            }
+            bool ok = scan.flattenOk && scan.scanOk && stream != nullptr && streamBytes != 0;
+            if (ok) {
+                ApplyAuroraVtxDesc();
+                ApplyAuroraVtxAttrFmtForDisplayList(scan.dlVtxFmt, scan.dlVtxFmtMixed);
+                const bool arraysOk =
+                    ApplyAuroraArraysForDisplayList(scan.maxIdx, scan.sawIdx, scan.dlVtxFmt, scan.dlVtxFmtMixed);
+                const bool xfOk = ApplyAuroraIndexedXFArraysForDisplayList(scan.maxXfIdx, scan.maxXfBytes, scan.sawXfIdx);
+                ok = arraysOk && xfOk;
+            }
+            if (ok) {
+                EnsureAuroraFrameActive();
+                GXMarkFrameWork();
+                if (r.streamStateOnly)
+                    GXCallStateDisplayList(stream, streamBytes);
+                else
+                    GXCallDisplayList(stream, streamBytes);
+                SyncAppliedVtxStateFromHleReal();
+                return;
+            }
+        } else {
+            bool ok = scan.scanOk;
+            if (ok) {
+                ApplyAuroraVtxDesc();
+                ApplyAuroraVtxAttrFmtForDisplayList(scan.dlVtxFmt, scan.dlVtxFmtMixed);
+                const bool arraysOk =
+                    ApplyAuroraArraysForDisplayList(scan.maxIdx, scan.sawIdx, scan.dlVtxFmt, scan.dlVtxFmtMixed);
+                const bool xfOk = ApplyAuroraIndexedXFArraysForDisplayList(scan.maxXfIdx, scan.maxXfBytes, scan.sawXfIdx);
+                ok = arraysOk && xfOk;
+            }
+            if (ok) {
+                EnsureAuroraFrameActive();
+                GXMarkFrameWork();
+                if (g3dn::g_nativeDraw)
+                    GXCallDisplayListCompiled(list, nbytes, r.contentDigest);
+                else
+                    GXCallDisplayList(list, nbytes);
+                SyncAppliedVtxStateFromHleReal();
+                return;
+            }
+        }
+        // The HLE's fallback (applyCannotFail records never get here).
+        if (stateBeforeScan) RestoreGxVertexState(*stateBeforeScan);
+        EnsureAuroraFrameActive();
+        GXMarkFrameWork();
+        InvalidateAppliedAuroraState();
+        ParseDisplayList(list, nbytes);
+        InvalidateAppliedAuroraState();
+    } catch (...) {}
+}
+
+namespace {
+// What a list holds, for GX__CallRegisterDisplayList_G3D: kOther (anything GX__CallDisplayList_HLE scans for),
+// kRegisters (BP and XF commands, NOP padding), kBP (BP commands and NOP padding only).
+enum class RegisterList { kOther, kRegisters, kBP };
+RegisterList ClassifyRegisterList(const uint8_t* data, uint32_t n) {
+    uint32_t pos = 0;
+    bool xf = false;
+    while (pos < n) {
+        const uint8_t cmd = data[pos];
+        if (cmd == GX_NOP_CMD) {
+            ++pos;
+        } else if (cmd == GX_LOAD_BP_REG_CMD) {
+            pos += 5;
+        } else if ((cmd & GX_OPCODE_MASK_CMD) == GX_LOAD_XF_REG_CMD && pos + 5 <= n) {
+            pos += 5 + (static_cast<uint32_t>(ReadBE16(data + pos + 1)) + 1u) * 4u;
+            xf = true;
+        } else {
+            return RegisterList::kOther;
+        }
+    }
+    if (pos != n) return RegisterList::kOther;
+    return xf ? RegisterList::kRegisters : RegisterList::kBP;
+}
+} // namespace
+
+// The native nw4r g3d path's material display lists (hle/g3d_native.cpp: TEV, pixel, TEV colour, indirect matrix,
+// texgen lists: register writes only). What GX__CallDisplayList_HLE does with a register-only list, without its
+// per-call layout hash and scan-cache probe: a list is classified once per write generation of its bytes (every call
+// while its memory is untracked); a list of BP writes only goes to Aurora's GXCallStateDisplayList (the writes applied
+// as process() applies them, without its renderer lock), one with XF writes too to GXCallDisplayList, any other list
+// takes GX__CallDisplayList_HLE.
+extern "C" void GX__CallRegisterDisplayList_G3D(uint32_t listAddr, uint32_t nbytes) {
+    if (nbytes == 0 || listAddr == 0) return;
+    const uint8_t g3dRecCall[9] = {0x40, uint8_t(listAddr >> 24), uint8_t(listAddr >> 16), uint8_t(listAddr >> 8),
+                                   uint8_t(listAddr), uint8_t(nbytes >> 24), uint8_t(nbytes >> 16),
+                                   uint8_t(nbytes >> 8), uint8_t(nbytes)};
+    g3dn::HleRec g3dRec(g3dn::g_recJob ? g3dn::kRecRegDL : g3dn::kRecFifo, g3dRecCall, sizeof(g3dRecCall));
+    if (g3dRec.skip) return;
+    struct Known {
+        uint32_t nbytes;
+        uint64_t generation;
+        RegisterList kind;
+    };
+    static thread_local std::unordered_map<uint32_t, Known> s_known;
+    static thread_local uint32_t s_knownClearsSeen = 0;  // scene changes (GX__ClearShapeDisplayLists_G3D)
+    if (const uint32_t clears = s_g3dShapeListClears.load(std::memory_order_relaxed); clears != s_knownClearsSeen) {
+        s_known.clear();
+        s_knownClearsSeen = clears;
+    }
+    try {
+        const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
+        if (!list) return;
+        const uint64_t generation = GxGuestWrite::GenerationForRange(listAddr, nbytes);
+        const auto it = s_known.find(listAddr);
+        RegisterList kind;
+        if (generation == kDlWriteGenerationUntracked || it == s_known.end() || it->second.nbytes != nbytes ||
+            it->second.generation != generation) {
+            kind = ClassifyRegisterList(list, nbytes);
+            if (kind == RegisterList::kOther) {
+                GX__CallDisplayList_HLE(listAddr, nbytes);
+                return;
+            }
+            if (generation != kDlWriteGenerationUntracked) s_known[listAddr] = Known{nbytes, generation, kind};
+        } else {
+            kind = it->second.kind;
+        }
+        EnsureAuroraFrameActive();
+        GXMarkFrameWork();
+        if (kind == RegisterList::kBP)
+            GXCallStateDisplayList(list, nbytes);
+        else
+            GXCallDisplayList(list, nbytes);
+        SyncAppliedVtxStateFromHleReal();
+    } catch (...) {}
+}
+
 extern "C" void nw4r__lyt__detail__DrawQuad_800847c0(CpuContext* ctx) {
+    GX_HLE_MaterializeIfPending();  // a named override, not a thunk: publishes the HLE vertex descriptors
     uint32_t colors[4];
     const uint32_t colorAddr = ctx->gpr[7];
     const uint32_t* colorPtr = nullptr;
@@ -1561,7 +1919,453 @@ extern "C" void nw4r__lyt__detail__DrawQuad_800847c0(CpuContext* ctx) {
 }
 
 
+// ---------------------------------------------------------------------------------------------------------------
+// Deferred native draws (hle/g3d_native.cpp, G3D_NATIVE_ASYNC=2): a native model draw recorded on the game thread is
+// replayed by a draw worker into a deferred job (aurora gx_worker.hpp) on its own HLE state (this file's applied-state
+// mirror, shape records and scan cache, g_hleGxState, g_boundTexMaps are per thread). The game thread keeps its own
+// HLE state as the replay leaves it: the vertex state through the helpers below; the mirrors of what Aurora holds
+// (applied state, bound textures) invalidated, so its next use publishes again.
+// ---------------------------------------------------------------------------------------------------------------
+
+// The vertex-state effect of calling a display list on this thread's HLE state (its CP writes applied in order),
+// without submitting anything. The writes come from the list scan once per list address, size and write generation,
+// then from this thread's cache. *drawFmtMask gets the vertex formats the list draws with (bit per format; all eight
+// when mixed; none without draws): the formats a replay publishes for it. False when the list cannot be scanned or
+// calls other lists (the scan may have applied some writes: the caller restores its snapshot).
+// The walk behind it: CP writes applied in list order, draws skipped by their vertex size (as the flatten and the
+// interpreter size them: CalcDLVertexSize), nothing scanned per vertex. A nested list fails the walk.
+struct DlVertexStateVisitor {
+    static constexpr int kMaxDepth = 0;
+    static constexpr bool kHandlesDraw = true;
+
+    std::vector<DlCpWrite>* writes;  // the CP writes, in order
+    GXVtxFmt fmt = GX_MAX_VTXFMT;  // the first format drawn; stays so without draws
+    bool mixed = false;
+    int sizedFmt = -1;  // the format sizedBytes holds, until a CP write changes the layout
+    uint32_t sizedBytes = 0;
+
+    bool OnNop(uint8_t) { return true; }
+    bool OnBpReg(const uint8_t*, uint32_t) { return true; }
+    bool OnXfReg(const uint8_t*, uint32_t) { return true; }
+    bool OnIndexedXf(const uint8_t*, uint8_t, uint32_t) { return true; }
+    bool OnInvalidateVertexCache(uint8_t) { return true; }
+    bool OnUnknownCommand(uint8_t) { return false; }
+    bool OnCpReg(const uint8_t*, uint8_t reg, uint32_t value) {
+        writes->push_back(DlCpWrite{reg, value});
+        ApplyCpRegWrite(reg, value);
+        if (reg == 0x50 || reg == 0x60 || (reg >= 0x70 && reg <= 0x97)) sizedFmt = -1;
+        return true;
+    }
+    bool OnCallDisplayList(uint32_t addr, uint32_t size, int) { return addr == 0 || size == 0; }
+    uint32_t DrawVertexSize(GXVtxFmt vtxfmt) {
+        if (fmt == GX_MAX_VTXFMT) fmt = vtxfmt;
+        else if (fmt != vtxfmt) mixed = true;
+        if (sizedFmt != static_cast<int>(vtxfmt)) {
+            sizedBytes = CalcDLVertexSize(vtxfmt);
+            sizedFmt = static_cast<int>(vtxfmt);
+        }
+        return sizedBytes;
+    }
+    bool OnDraw(const uint8_t*, uint8_t, GXVtxFmt, uint16_t, const uint8_t*, uint32_t&) { return true; }
+};
+
+// The walk's result is kept per list (this thread's) while no write notification lands on the list's bytes: the fine
+// 4 KiB generations (gx_guest_write.h), as the coarse ones missed every frame. Walking a model's shape lists costs the
+// game thread their bytes, cold in its cache (perf: the command-byte load).
+// The cache: open addressing on the list address (linear probes from a hashed home slot), each entry holding the
+// list's CP writes inline, so a hit reads one or two cache lines (a std::unordered_map lookup missed about three
+// times: bucket array, node, the writes' heap block). Entries validate themselves (address, size, generation), so a
+// full probe run just overwrites the home slot. Lists with more CP writes than an entry holds are walked every time
+// (32: a shape's pre-draw list sets the descriptors, a format and up to ~24 array bases and strides).
+//
+// A hit applies the writes from an image when the list has one (ListMirrorImage): a shape's pre-draw list (~12
+// writes: the two descriptor registers, a format's three VAT registers, array bases and strides) cost ~1,000
+// instructions to decode again on every hit (~50 such hits a frame in vanilla Training, all in the take-back's mirror,
+// which grows as the game thread outruns the draw worker).
+namespace {
+// What a list's writes leave, captured right after the walk applied them (ListMirrorFill): each field they set holds
+// its final value. Only for a list whose descriptor and VAT registers are each written once and whose VAT writes set
+// one format: then each such write sets fields no other write of the list sets, and decides alone whether it changes
+// them, from the fields as they were before the list (GxCpDecode: one layout-hash invalidation per write that changes
+// a field). ApplyListImage repeats that per register: compares its fields with the image, copies them, invalidates
+// once if they differed; array bases (already decoded) and strides are copied (no invalidation), the last write each.
+struct ListMirrorImage {
+    bool vcdLo = false, vcdHi = false;
+    uint8_t vat = 0;  // bit 0 VAT A, bit 1 B, bit 2 C, all of format fmt
+    uint8_t fmt = 0;
+    uint32_t baseMask = 0, strideMask = 0;  // a bit per attribute
+    GXAttrType desc[26] = {};
+    VtxAttrFmt attrs[26] = {};
+    HleGxState::VtxArray arrays[26] = {};
+};
+static_assert(GX_VA_PNMTXIDX == 0 && GX_VA_TEX7MTXIDX == 8 && GX_VA_POS == 9 && GX_VA_CLR1 == 12 &&
+              GX_VA_TEX0 == 13 && GX_VA_TEX7 == 20 && GX_VA_NBT == 25, "GxCpDecode's descriptor ranges");
+
+// GX_LIST_IMAGE=0: every hit decodes its writes again (a same-binary A/B). GX_LIST_IMAGE_CHECK=1: every hit with an
+// image also applies the writes the old way from the same state and compares the vertex state.
+const bool s_listImages = [] {
+    const char* v = std::getenv("GX_LIST_IMAGE");
+    return v == nullptr || v[0] != '0';
+}();
+const bool s_listImageCheck = [] {
+    const char* v = std::getenv("GX_LIST_IMAGE_CHECK");
+    return v != nullptr && v[0] == '1';
+}();
+uint64_t s_listImageHits = 0, s_listWriteHits = 0, s_listImageChecked = 0, s_listImageBad = 0;  // game thread
+
+struct ListMirrorEntry {
+    static constexpr uint32_t kMaxWrites = 32;
+    uint32_t addr = 0;  // 0: empty
+    uint32_t nbytes = 0;
+    uint64_t generation = 0;
+    uint8_t fmtMask = 0;
+    uint8_t nwrites = 0;
+    bool imaged = false;              // image holds this list's
+    ListMirrorImage* image = nullptr;  // allocated at the slot's first image, kept (the table is never freed)
+    uint8_t regs[kMaxWrites] = {};
+    uint32_t values[kMaxWrites] = {};
+};
+
+// The image of `writes`, just applied to this thread's state by a walk; false where the list cannot have one.
+bool CaptureListImage(ListMirrorEntry* slot, const std::vector<DlCpWrite>& writes) {
+    if (!s_listImages || writes.empty()) return false;
+    bool vcdLo = false, vcdHi = false;
+    uint8_t vat = 0;
+    int fmt = -1;
+    uint32_t baseMask = 0, strideMask = 0;
+    for (const DlCpWrite& w : writes) {
+        const uint8_t reg = w.reg;
+        if (reg == 0x50) {
+            if (vcdLo) return false;
+            vcdLo = true;
+        } else if (reg == 0x60) {
+            if (vcdHi) return false;
+            vcdHi = true;
+        } else if ((reg >= 0x70 && reg <= 0x77) || (reg >= 0x80 && reg <= 0x87) || (reg >= 0x90 && reg <= 0x97)) {
+            const uint8_t bit = static_cast<uint8_t>(1u << ((reg >> 4) - 7));
+            if ((vat & bit) != 0 || (fmt >= 0 && fmt != (reg & 7))) return false;
+            vat |= bit;
+            fmt = reg & 7;
+        } else if (reg >= 0xA0 && reg <= 0xAF) {
+            baseMask |= 1u << ((reg - 0xA0) + GX_VA_POS);
+        } else if (reg >= 0xB0 && reg <= 0xBF) {
+            strideMask |= 1u << ((reg - 0xB0) + GX_VA_POS);
+        }  // other registers: dropped by GxCpDecode::ApplyCpRegWrite
+    }
+    if (slot->image == nullptr) slot->image = new ListMirrorImage;
+    ListMirrorImage& im = *slot->image;
+    im.vcdLo = vcdLo;
+    im.vcdHi = vcdHi;
+    im.vat = vat;
+    im.fmt = static_cast<uint8_t>(fmt < 0 ? 0 : fmt);
+    im.baseMask = baseMask;
+    im.strideMask = strideMask;
+    std::memcpy(im.desc, g_hleGxState.vtxDesc, sizeof(im.desc));
+    std::memcpy(im.attrs, g_hleGxState.vtxAttrFmt[im.fmt], sizeof(im.attrs));
+    std::memcpy(im.arrays, g_hleGxState.vtxArray, sizeof(im.arrays));
+    return true;
+}
+
+// The image's writes applied to this thread's state, as GxCpDecode::ApplyCpRegWrite applies each (fields written
+// field by field, so the formats' padding bytes stay as that leaves them).
+void ApplyListImage(const ListMirrorImage& im) {
+    HleGxState& st = g_hleGxState;
+    if (im.vcdLo) {  // VcdLo: the matrix-index, position, normal and colour descriptors; NBT none
+        const bool changed = std::memcmp(st.vtxDesc, im.desc, 13 * sizeof(GXAttrType)) != 0 ||
+                             st.vtxDesc[GX_VA_NBT] != GX_NONE;
+        std::memcpy(st.vtxDesc, im.desc, 13 * sizeof(GXAttrType));
+        st.vtxDesc[GX_VA_NBT] = GX_NONE;
+        if (changed) st.InvalidateVtxLayoutHash();
+    }
+    if (im.vcdHi) {  // VcdHi: the texture coordinate descriptors
+        const bool changed = std::memcmp(&st.vtxDesc[GX_VA_TEX0], &im.desc[GX_VA_TEX0], 8 * sizeof(GXAttrType)) != 0;
+        std::memcpy(&st.vtxDesc[GX_VA_TEX0], &im.desc[GX_VA_TEX0], 8 * sizeof(GXAttrType));
+        if (changed) st.InvalidateVtxLayoutHash();
+    }
+    if (im.vat != 0) {
+        VtxAttrFmt* attrs = st.vtxAttrFmt[im.fmt];
+        const auto put = [&](int attr, bool cnt, bool frac, bool& changed) {
+            VtxAttrFmt& d = attrs[attr];
+            const VtxAttrFmt& s = im.attrs[attr];
+            if (cnt) {
+                changed |= d.cnt != s.cnt || d.type != s.type;
+                d.cnt = s.cnt;
+                d.type = s.type;
+            }
+            if (frac) {
+                changed |= d.frac != s.frac;
+                d.frac = s.frac;
+            }
+        };
+        if ((im.vat & 1u) != 0) {  // VatA: position, normal, both colours, texture 0
+            bool changed = false;
+            for (int attr = GX_VA_POS; attr <= GX_VA_TEX0; ++attr) put(attr, true, true, changed);
+            if (changed) st.InvalidateVtxLayoutHash();
+        }
+        if ((im.vat & 2u) != 0) {  // VatB: textures 1-4 count and type, 1-3 fraction
+            bool changed = false;
+            for (int tex = 1; tex <= 4; ++tex) put(GX_VA_TEX0 + tex, true, tex != 4, changed);
+            if (changed) st.InvalidateVtxLayoutHash();
+        }
+        if ((im.vat & 4u) != 0) {  // VatC: texture 4 fraction, textures 5-7
+            bool changed = false;
+            put(GX_VA_TEX0 + 4, false, true, changed);
+            for (int tex = 5; tex <= 7; ++tex) put(GX_VA_TEX0 + tex, true, true, changed);
+            if (changed) st.InvalidateVtxLayoutHash();
+        }
+    }
+    for (uint32_t m = im.baseMask; m != 0; m &= m - 1) {
+        const int attr = __builtin_ctz(m);
+        st.vtxArray[attr].base = im.arrays[attr].base;
+    }
+    for (uint32_t m = im.strideMask; m != 0; m &= m - 1) {
+        const int attr = __builtin_ctz(m);
+        st.vtxArray[attr].stride = im.arrays[attr].stride;
+    }
+}
+
+// GX_LIST_IMAGE_CHECK=1: the vertex fields a list's writes can touch, and the hash bookkeeping, byte for byte.
+struct ListMirrorFields {
+    GXAttrType desc[26];
+    VtxAttrFmt attrs[GX_MAX_VTXFMT][26];
+    HleGxState::VtxArray arrays[26];
+    uint32_t generation;
+    bool dirty;
+    void Save() {
+        std::memcpy(desc, g_hleGxState.vtxDesc, sizeof(desc));
+        std::memcpy(attrs, g_hleGxState.vtxAttrFmt, sizeof(attrs));
+        std::memcpy(arrays, g_hleGxState.vtxArray, sizeof(arrays));
+        generation = g_hleGxState.vtxStateGeneration;
+        dirty = g_hleGxState.vtxLayoutHashDirty;
+    }
+    void Load() const {
+        std::memcpy(g_hleGxState.vtxDesc, desc, sizeof(desc));
+        std::memcpy(g_hleGxState.vtxAttrFmt, attrs, sizeof(attrs));
+        std::memcpy(g_hleGxState.vtxArray, arrays, sizeof(arrays));
+        g_hleGxState.vtxStateGeneration = generation;
+        g_hleGxState.vtxLayoutHashDirty = dirty;
+    }
+    bool Same(const ListMirrorFields& o) const {
+        return std::memcmp(desc, o.desc, sizeof(desc)) == 0 && std::memcmp(attrs, o.attrs, sizeof(attrs)) == 0 &&
+               std::memcmp(arrays, o.arrays, sizeof(arrays)) == 0 && generation == o.generation && dirty == o.dirty;
+    }
+};
+constexpr uint32_t kListMirrorSlots = 2048;  // a P+ Training frame calls a few hundred distinct lists
+constexpr uint32_t kListMirrorProbes = 8;
+
+// This thread's cache (the game thread's), never freed: the entry answering for the list at `generation` (hit), else
+// the slot a walk of it refills.
+ListMirrorEntry* ListMirrorProbe(uint32_t listAddr, uint32_t nbytes, uint64_t generation, bool& hit) {
+    static thread_local ListMirrorEntry* s_table = nullptr;
+    if (s_table == nullptr) s_table = new ListMirrorEntry[kListMirrorSlots]();
+    hit = false;
+    const uint32_t home = ((listAddr >> 5) * 0x9E3779B1u) >> (32 - 11);
+    static_assert(kListMirrorSlots == 1u << 11);
+    for (uint32_t i = 0; i < kListMirrorProbes; ++i) {
+        ListMirrorEntry& e = s_table[(home + i) & (kListMirrorSlots - 1)];
+        if (e.addr == listAddr) {
+            hit = e.nbytes == nbytes && e.generation == generation;
+            return &e;  // a stale one is refilled
+        }
+        if (e.addr == 0) return &e;
+    }
+    return &s_table[home];
+}
+
+// A walk's result kept in the slot ListMirrorProbe gave for it, right after the walk applied its writes.
+void ListMirrorFill(ListMirrorEntry* slot, uint32_t listAddr, uint32_t nbytes, uint64_t generation,
+                    const std::vector<DlCpWrite>& writes, uint32_t fmtMask) {
+    if (writes.size() <= ListMirrorEntry::kMaxWrites) {
+        slot->addr = listAddr;
+        slot->nbytes = nbytes;
+        slot->generation = generation;
+        slot->fmtMask = static_cast<uint8_t>(fmtMask);
+        slot->nwrites = static_cast<uint8_t>(writes.size());
+        for (size_t w = 0; w < writes.size(); ++w) {
+            slot->regs[w] = writes[w].reg;
+            slot->values[w] = writes[w].value;
+        }
+        slot->imaged = CaptureListImage(slot, writes);
+    } else if (slot->addr == listAddr) {
+        slot->addr = 0;  // a stale entry for this list must not answer again
+    }
+}
+}  // namespace
+
+extern "C" bool GX_HLE_ApplyListVertexState(uint32_t listAddr, uint32_t nbytes, uint32_t* drawFmtMask) {
+    *drawFmtMask = 0;
+    if (nbytes == 0 || listAddr == 0) return true;
+    const uint64_t generation = GxGuestWrite::FineGenerationForRange(listAddr, nbytes);
+    ListMirrorEntry* slot = nullptr;
+    if (generation != kDlWriteGenerationUntracked) {
+        bool hit = false;
+        slot = ListMirrorProbe(listAddr, nbytes, generation, hit);
+        if (hit) {
+            if (slot->imaged && s_listImageCheck) {
+                static thread_local ListMirrorFields s_before, s_decoded, s_imaged;
+                s_before.Save();
+                for (uint32_t w = 0; w < slot->nwrites; ++w) ApplyCpRegWrite(slot->regs[w], slot->values[w]);
+                s_decoded.Save();
+                s_before.Load();
+                ApplyListImage(*slot->image);
+                s_imaged.Save();
+                ++s_listImageChecked;
+                if (!s_imaged.Same(s_decoded) && s_listImageBad++ < 20) {
+                    RT_LOGF(RT_TAG_GX, "[dlmirror] list image MISMATCH list 0x%08X size %u writes %u\n", listAddr,
+                            nbytes, slot->nwrites);
+                }
+                ++s_listImageHits;
+            } else if (slot->imaged) {
+                ApplyListImage(*slot->image);
+                ++s_listImageHits;
+            } else {
+                for (uint32_t w = 0; w < slot->nwrites; ++w) ApplyCpRegWrite(slot->regs[w], slot->values[w]);
+                if (slot->nwrites != 0) ++s_listWriteHits;
+            }
+            *drawFmtMask = slot->fmtMask;
+            return true;
+        }
+    }
+    const uint8_t* list = static_cast<const uint8_t*>(GuestToHostPtr(listAddr, nbytes));
+    if (list == nullptr) return false;
+    static thread_local std::vector<DlCpWrite> s_writes;
+    s_writes.clear();
+    DlVertexStateVisitor visitor{&s_writes};
+    if (!WalkDisplayList(list, nbytes, visitor, 0)) return false;
+    *drawFmtMask = visitor.mixed ? 0xFFu : visitor.fmt < GX_MAX_VTXFMT ? 1u << visitor.fmt : 0u;
+    if (slot != nullptr) ListMirrorFill(slot, listAddr, nbytes, generation, s_writes, *drawFmtMask);
+    return true;
+}
+
+// The stats line (g3d_native.cpp G3dNativeLogStats): per frame. Game thread.
+extern "C" void GX_HLE_LogListImageStats(double frames) {
+    if (frames <= 0 || (s_listImageHits | s_listWriteHits) == 0) return;
+    RT_LOGF(RT_TAG_VI, "gx list mirror: %.1f/frame cached lists with writes applied from an image, %.1f/frame decoded "
+            "again (GX_LIST_IMAGE=%d); checked %.1f/frame (GX_LIST_IMAGE_CHECK=1), %llu mismatches\n",
+            s_listImageHits / frames, s_listWriteHits / frames, s_listImages ? 1 : 0, s_listImageChecked / frames,
+            static_cast<unsigned long long>(s_listImageBad));
+    s_listImageHits = s_listWriteHits = s_listImageChecked = 0;
+}
+
+// This thread's mirrors of what Aurora holds, invalidated (a deferred draw's replay changed it elsewhere, or a draw
+// worker starts a job on a stale copy): the next draw publishes vertex state, arrays and textures again.
+extern "C" void GX_HLE_InvalidatePublishedState() {
+    InvalidateAppliedAuroraState();
+    g_boundTexMaps.fill(BoundTexInfo{});
+}
+
+// A draw worker starting a job that follows its previous one in the command stream (g3d_native.cpp): the mirrors still
+// describe what the GX thread holds, but the job loads the game thread's HLE vertex state, whose generation counter is
+// the game thread's and may equal the mirror's without the same contents, so the generation shortcut is dropped
+// (every publish compares field by field).
+extern "C" void GX_HLE_KeepPublishedStateForNewJob() {
+    s_appliedVtxStateMatchesHle = false;
+}
+
+// The game thread after recording a deferred draw: Aurora's register shadow (__gx) as the replay leaves it - when the
+// draw drew, the vertex descriptors and the formats it drew with from the (exact) HLE vertex state, as its last
+// publishes set them (ApplyAuroraVtxDesc, ApplyAuroraVtxAttrFmt: the same attributes), with the dirty bits its list
+// calls flush cleared - and the published-state mirrors invalidated. zCompLoc: the last GXSetZCompLoc the draw made,
+// or -1. drawFmtMask: the formats its lists drew with (GX_HLE_ApplyListVertexState).
+extern "C" void GXShadowAfterDeferredDraw(int zCompLoc);  // aurora GXManage.cpp
+extern "C" void GX_HLE_AfterDeferredDraw(int zCompLoc, uint32_t drawFmtMask) {
+    if (drawFmtMask != 0) {
+        // The SDK's list forms: the same register shadow as one GXSetVtxDesc / GXSetVtxAttrFmt per attribute, in that
+        // order (the normal-type bits follow the final descriptors either way), in one call each; the dirty bits they
+        // set are cleared below.
+        GXVtxDescList descs[27];
+        int n = 0;
+        for (int attr = 0; attr < 26; ++attr) {
+            if (attr == GX_VA_NBT) continue;
+            descs[n++] = GXVtxDescList{static_cast<GXAttr>(attr), g_hleGxState.vtxDesc[attr]};
+        }
+        descs[n] = GXVtxDescList{GX_VA_NULL, GX_NONE};
+        GXSetVtxDescv(descs);
+        for (int fmt = 0; fmt < GX_MAX_VTXFMT; ++fmt) {
+            if (!(drawFmtMask & (1u << fmt))) continue;
+            GXVtxAttrFmtList fmts[27];
+            int m = 0;
+            for (int attr = 0; attr < 26; ++attr) {
+                if (attr == GX_VA_NBT || IsMatrixIndexAttr(static_cast<GXAttr>(attr))) continue;
+                const VtxAttrFmt& f = g_hleGxState.vtxAttrFmt[fmt][attr];
+                fmts[m++] = GXVtxAttrFmtList{static_cast<GXAttr>(attr), f.cnt, f.type, f.frac};
+            }
+            fmts[m] = GXVtxAttrFmtList{GX_VA_NULL, GX_POS_XY, GX_U8, 0};
+            GXSetVtxAttrFmtv(static_cast<GXVtxFmt>(fmt), fmts);
+        }
+    }
+    GXShadowAfterDeferredDraw(zCompLoc);
+    GX_HLE_InvalidatePublishedState();
+}
+
+// GX_HLE_AfterDeferredDraw over a run of draws the take-back mirrors one after another (g3d_native.cpp
+// MaterializeJobsVertexState, which saves the dirty bits first and puts them back after): one publication at the end
+// instead of one per draw. What each draw's publication leaves: the descriptor fields from GXSetVtxDescv (a full list
+// without GX_VA_NBT, so every field it sets it sets whatever was there), each drawn format's VAT fields from
+// GXSetVtxAttrFmtv (SETVAT: a function of its arguments alone), cleared dirty bits, invalidated mirrors. So after the
+// run the descriptors are the last publishing draw's and each format's fields the last draw's that drew it: the HLE
+// state at those draws is kept (Note) and published once (Finish). Vanilla Training mirrors 8-21 draws a frame (as
+// far as the game thread runs ahead of the draw worker); each publication saved is ~2,000 instructions
+// (GXSetVtxDescv and one GXSetVtxAttrFmtv per drawn format).
+namespace {
+struct DeferredPublishBatch {
+    bool any = false;    // a draw was noted (the mirrors are invalidated at Finish)
+    bool descs = false;  // a draw drew: vtxDesc holds the last one's descriptors
+    uint8_t fmtMask = 0;
+    GXAttrType vtxDesc[26]{};
+    VtxAttrFmt vtxAttrFmt[GX_MAX_VTXFMT][26]{};
+};
+DeferredPublishBatch s_publishBatch;  // game thread
+}  // namespace
+extern "C" void GX_HLE_DeferredPublishBegin() {
+    s_publishBatch.any = s_publishBatch.descs = false;
+    s_publishBatch.fmtMask = 0;
+}
+extern "C" void GX_HLE_DeferredPublishNote(uint32_t drawFmtMask) {
+    DeferredPublishBatch& b = s_publishBatch;
+    b.any = true;
+    if (drawFmtMask == 0) return;
+    b.descs = true;
+    std::memcpy(b.vtxDesc, g_hleGxState.vtxDesc, sizeof(b.vtxDesc));
+    for (int fmt = 0; fmt < GX_MAX_VTXFMT; ++fmt) {
+        if (!(drawFmtMask & (1u << fmt))) continue;
+        std::memcpy(b.vtxAttrFmt[fmt], g_hleGxState.vtxAttrFmt[fmt], sizeof(b.vtxAttrFmt[fmt]));
+        b.fmtMask |= static_cast<uint8_t>(1u << fmt);
+    }
+}
+// published: the run mirrored to its end (else the take-back loads the worker's state over the fields: only the
+// mirrors' invalidation is owed for the draws noted).
+extern "C" void GX_HLE_DeferredPublishFinish(bool published) {
+    const DeferredPublishBatch& b = s_publishBatch;
+    if (!b.any) return;
+    if (published && b.descs) {
+        GXVtxDescList descs[27];
+        int n = 0;
+        for (int attr = 0; attr < 26; ++attr) {
+            if (attr == GX_VA_NBT) continue;
+            descs[n++] = GXVtxDescList{static_cast<GXAttr>(attr), b.vtxDesc[attr]};
+        }
+        descs[n] = GXVtxDescList{GX_VA_NULL, GX_NONE};
+        GXSetVtxDescv(descs);
+        for (int fmt = 0; fmt < GX_MAX_VTXFMT; ++fmt) {
+            if (!(b.fmtMask & (1u << fmt))) continue;
+            GXVtxAttrFmtList fmts[27];
+            int m = 0;
+            for (int attr = 0; attr < 26; ++attr) {
+                if (attr == GX_VA_NBT || IsMatrixIndexAttr(static_cast<GXAttr>(attr))) continue;
+                const VtxAttrFmt& f = b.vtxAttrFmt[fmt][attr];
+                fmts[m++] = GXVtxAttrFmtList{static_cast<GXAttr>(attr), f.cnt, f.type, f.frac};
+            }
+            fmts[m] = GXVtxAttrFmtList{GX_VA_NULL, GX_POS_XY, GX_U8, 0};
+            GXSetVtxAttrFmtv(static_cast<GXVtxFmt>(fmt), fmts);
+        }
+    }
+    GXShadowAfterDeferredDraw(-1);
+    GX_HLE_InvalidatePublishedState();
+}
+
 extern "C" void nw4r__lyt__detail__DrawQuad_80084d20(CpuContext* ctx) {
+    GX_HLE_MaterializeIfPending();  // a named override, not a thunk: publishes the HLE vertex descriptors
     uint32_t colors[4];
     const uint32_t colorAddr = ctx->gpr[7];
     const uint32_t* colorPtr = nullptr;
@@ -1576,3 +2380,5 @@ extern "C" void nw4r__lyt__detail__DrawQuad_80084d20(CpuContext* ctx) {
 
     EmitLytDrawQuad(ctx->gpr[3], ctx->gpr[4], static_cast<int32_t>(ctx->gpr[5]), ctx->gpr[6], colorPtr);
 }
+
+#include "gx_vertex_state_overrides_end.h"  // pairs with the include at the top (unity build)

@@ -376,10 +376,12 @@ struct JobAllocBlock
     }
     return nullptr;
   }
-  /* if all freed, delete the block */
+  /* if all freed, delete the block. acq_rel as release_unused: each holder's writes into its job (is_done,
+   * function = nullptr) must happen before the last holder's delete; relaxed lets a weakly ordered CPU (ARM)
+   * land them after the block is freed and reused */
   void deref(void)
   {
-    uint32_t left = this->ref_count.fetch_sub(1, std::memory_order_relaxed);
+    uint32_t left = this->ref_count.fetch_sub(1, std::memory_order_acq_rel);
     if (left == 1)
       delete this;
   }

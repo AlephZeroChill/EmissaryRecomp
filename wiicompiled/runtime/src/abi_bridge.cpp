@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
@@ -12,6 +13,11 @@
 #include <vector>
 #include "generated/RuntimeConfig.h"
 #include "runtime_log.h"
+
+#if MKW_HZ_PERF && !defined(__SWITCH__)
+// The counter table Horizon builds define in platform/horizon.c, for an MKW_HZ_PERF=1 build elsewhere (hz_perf.h).
+extern "C" volatile unsigned long long g_hzPerf[48] = {};
+#endif
 
 // Nothing reads CpuContext by offset; these asserts just canary accidental field reordering
 // (the order is a cache-locality choice explained at the struct definition).
@@ -484,3 +490,245 @@ void InitializePersistentCpuContext() {
         g_persistentCpu.gpr[13] = RuntimeConfig::SDA1_BASE;
     }
 }
+
+#if MKW_INDIRECT_IC
+// Slow paths of the per-site indirect caches (indirect_call_site.h): everything but an unguarded hit in the current
+// context. Each one runs what InvokeIndirectCpu / InvokeIndirectJump run, with the site's record standing in for the
+// lookup when it matches, and refills the site after a lookup.
+namespace {
+// MKW_INDIRECT_IC=0 in the environment: never fill a site, so every call takes the old lookup and dispatch.
+const bool g_indirectSiteFillEnabled = [] {
+    const char* value = std::getenv("MKW_INDIRECT_IC");
+    return !(value && value[0] == '0');
+}();
+
+#if MKW_INDIRECT_IC_STATS
+// Debug counters (-DMKW_INDIRECT_IC_STATS=1). Plain load/store increments: a lost count under a race is fine here.
+struct IndirectSiteStats {
+    std::atomic<uint64_t> guarded{0};         // lookup found a guarded record (kept in the other slot)
+    std::atomic<uint64_t> otherHit{0};        // the site's other slot held the target (no lookup)
+    std::atomic<uint64_t> matchedContext{0};  // site matched, call switches CpuContext
+    std::atomic<uint64_t> empty{0};           // site never filled (first call, or only guarded/unregistered targets)
+    std::atomic<uint64_t> mismatch{0};        // site held another target
+    std::atomic<uint64_t> unregistered{0};    // lookup found no record (interpreter, natives without raw record)
+    std::atomic<uint64_t> memoHit{0};         // lookups the thread-local memo answered
+    std::atomic<uint64_t> memoMiss{0};        // lookups that searched the generated table
+    std::atomic<uint64_t> slowCalls{0};
+};
+IndirectSiteStats g_indirectSiteStats;
+
+struct IndirectSiteInfo {
+    MkwIndirectSite* site;
+    uintptr_t caller;
+    bool jump;
+    uint64_t lastHits;
+    uint64_t lastSlow;
+    uint32_t lastFills;
+    uint32_t lastTarget;
+};
+std::mutex g_indirectSitesMutex;
+std::vector<IndirectSiteInfo> g_indirectSites;
+std::chrono::steady_clock::time_point g_indirectSiteLastDump = std::chrono::steady_clock::now();
+uint64_t g_indirectSiteLastTotals[9] = {};
+
+void Bump(std::atomic<uint64_t>& counter) {
+    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+void DumpIndirectSiteStatsLocked() {
+    auto& s = g_indirectSiteStats;
+    const uint64_t totals[9] = {s.guarded.load(), s.matchedContext.load(), s.empty.load(), s.mismatch.load(),
+                                s.unregistered.load(), s.memoHit.load(), s.memoMiss.load(), s.slowCalls.load(),
+                                s.otherHit.load()};
+    uint64_t d[9];
+    for (int i = 0; i < 9; ++i) {
+        d[i] = totals[i] - g_indirectSiteLastTotals[i];
+        g_indirectSiteLastTotals[i] = totals[i];
+    }
+    uint64_t hits = 0, slow = 0, active = 0, polymorphic = 0, hitsJump = 0, slowJump = 0;
+    struct Top { uint64_t slow, hits; uint32_t fills; size_t index; };
+    std::vector<Top> top;
+    for (size_t i = 0; i < g_indirectSites.size(); ++i) {
+        auto& info = g_indirectSites[i];
+        const uint64_t h = info.site->hits.load() - info.lastHits;
+        const uint64_t sl = info.site->slow.load() - info.lastSlow;
+        const uint32_t f = info.site->fills.load() - info.lastFills;
+        info.lastHits += h;
+        info.lastSlow += sl;
+        info.lastFills += f;
+        if (const auto* record = info.site->record.load()) {
+            info.lastTarget = record->address;
+        }
+        hits += h;
+        slow += sl;
+        if (info.jump) {
+            hitsJump += h;
+            slowJump += sl;
+        }
+        if (h + sl != 0) ++active;
+        if (f >= 2) ++polymorphic;
+        if (sl != 0) top.push_back({sl, h, f, i});
+    }
+    const uint64_t calls = hits + slow;
+    std::fprintf(stderr,
+                 "[indirect-ic] interval: %llu calls (%llu jumps), fast hits %.2f%%, slow %llu: matched in another "
+                 "context %llu, empty %llu, mismatch %llu; other slot held it %llu; lookups: memo hit %llu, memo miss "
+                 "%llu, guarded record %llu, no record %llu; sites %zu known, %llu active, %llu refilled 2+ times\n",
+                 (unsigned long long)calls, (unsigned long long)(hitsJump + slowJump),
+                 calls ? 100.0 * hits / calls : 0.0, (unsigned long long)slow, (unsigned long long)d[1],
+                 (unsigned long long)d[2], (unsigned long long)d[3], (unsigned long long)d[8], (unsigned long long)d[5],
+                 (unsigned long long)d[6], (unsigned long long)d[0], (unsigned long long)d[4],
+                 g_indirectSites.size(), (unsigned long long)active, (unsigned long long)polymorphic);
+    std::sort(top.begin(), top.end(), [](const Top& a, const Top& b) { return a.slow > b.slow; });
+    const uintptr_t anchor = reinterpret_cast<uintptr_t>(&MkwInvokeIndirectCpuSiteSlow);
+    for (size_t k = 0; k < top.size() && k < 12; ++k) {
+        const auto& info = g_indirectSites[top[k].index];
+        const auto owner = TranslatedFunctionRegistry::FindByHostAddress(info.caller);
+        std::fprintf(stderr,
+                     "[indirect-ic]   site %s caller %s (anchor%+lld) last target %08X: slow %llu, hits %llu, "
+                     "fills %u\n",
+                     info.jump ? "jump" : "call", owner ? owner->name : "?",
+                     static_cast<long long>(info.caller - anchor), info.lastTarget,
+                     (unsigned long long)top[k].slow, (unsigned long long)top[k].hits, top[k].fills);
+    }
+    std::fflush(stderr);
+}
+
+enum class SlowKind { MatchedContext, Empty, Mismatch };
+
+void RecordIndirectSiteSlow(MkwIndirectSite& site, bool jump, void* caller, SlowKind kind) {
+    auto& s = g_indirectSiteStats;
+    switch (kind) {
+    case SlowKind::MatchedContext: Bump(s.matchedContext); break;
+    case SlowKind::Empty: Bump(s.empty); break;
+    case SlowKind::Mismatch: Bump(s.mismatch); break;
+    }
+    site.slow.store(site.slow.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (site.registered.exchange(1) == 0) {
+        std::lock_guard<std::mutex> lock(g_indirectSitesMutex);
+        g_indirectSites.push_back({&site, reinterpret_cast<uintptr_t>(caller), jump, 0, 0, 0, 0});
+    }
+    const uint64_t n = s.slowCalls.load(std::memory_order_relaxed) + 1;
+    s.slowCalls.store(n, std::memory_order_relaxed);
+    if ((n & 4095u) == 0 && std::chrono::steady_clock::now() - g_indirectSiteLastDump >= std::chrono::seconds(5)) {
+        std::lock_guard<std::mutex> lock(g_indirectSitesMutex);
+        g_indirectSiteLastDump = std::chrono::steady_clock::now();
+        DumpIndirectSiteStatsLocked();
+    }
+}
+
+void RecordIndirectSiteLookup(uint32_t target) {
+    const auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(target)];
+    Bump(cached.valid && cached.address == target ? g_indirectSiteStats.memoHit : g_indirectSiteStats.memoMiss);
+}
+
+SlowKind ClassifyIndirectSiteSlow(const RawDispatchRecord* record, uint32_t target) {
+    if (record == nullptr) return SlowKind::Empty;
+    if (record->address != target) return SlowKind::Mismatch;
+    return SlowKind::MatchedContext;
+}
+#endif
+
+bool IsUnguardedRecord(const RawDispatchRecord* record) {
+    return record->nonvolatileFprWriteMask == 0 && !record->preserveNonvolatileGprs;
+}
+
+// The target's record from the site's slots, else from the lookup, which then refills the site. Only records with an
+// entry and a nonzero address are kept (so a filled slot never matches target 0, and the hit's execution-address store
+// needs no test). An unguarded record goes to the hit path's slot and the record it displaces to the other slot; a
+// guarded one only to the other slot (see indirect_call_site.h). An unguarded record found in the other slot swaps
+// back into the hit path's slot, so a site that mostly calls one target keeps it there.
+MKW_PPC_FORCE_INLINE const RawDispatchRecord* ResolveIndirectSite(uint32_t target, MkwIndirectSite& site) {
+    const RawDispatchRecord* primary = site.record.load(std::memory_order_relaxed);
+    if (primary != nullptr && primary->address == target) {
+        return primary;
+    }
+    const RawDispatchRecord* other = site.other.load(std::memory_order_relaxed);
+    if (other != nullptr && other->address == target) {
+#if MKW_INDIRECT_IC_STATS
+        Bump(g_indirectSiteStats.otherHit);
+#endif
+        if (IsUnguardedRecord(other) && g_indirectSiteFillEnabled) {
+            site.record.store(other, std::memory_order_release);
+            site.other.store(primary, std::memory_order_release);
+        }
+        return other;
+    }
+#if MKW_INDIRECT_IC_STATS
+    RecordIndirectSiteLookup(target);
+#endif
+    const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
+    if (record != nullptr && record->entry != nullptr && record->address != 0 && g_indirectSiteFillEnabled) {
+        if (IsUnguardedRecord(record)) {
+            if (primary != nullptr) {
+                site.other.store(primary, std::memory_order_release);
+            }
+            site.record.store(record, std::memory_order_release);
+        } else {
+            site.other.store(record, std::memory_order_release);
+        }
+#if MKW_INDIRECT_IC_STATS
+        site.fills.store(site.fills.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+#endif
+    }
+#if MKW_INDIRECT_IC_STATS
+    if (record == nullptr) {
+        Bump(g_indirectSiteStats.unregistered);
+    } else if (!IsUnguardedRecord(record)) {
+        Bump(g_indirectSiteStats.guarded);
+    }
+#endif
+    return record;
+}
+
+// TryDispatchRawCpuTarget, with its unguarded case spelled out: for such a record the FPR and GPR guards do nothing,
+// and constructing them is two out-of-line calls in the old path.
+MKW_PPC_FORCE_INLINE bool DispatchIndirectSiteRecord(const RawDispatchRecord* record, CpuContext* cpu) {
+    if (record != nullptr && record->entry != nullptr && IsUnguardedRecord(record)) {
+        RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+        if (TryGetCpuContext() != cpu) {
+            CpuContextScope scope(cpu);
+            record->entry(cpu);
+        } else {
+            record->entry(cpu);
+        }
+        return true;
+    }
+    return TryDispatchRawCpuTarget(record, cpu);
+}
+}  // namespace
+
+// InvokeIndirectCpu with the site standing in for the lookup.
+void MkwInvokeIndirectCpuSiteSlow(uint32_t target, CpuContext* ctx, MkwIndirectSite& site) {
+    HZ_EXCLUSIVE_PAUSE_IF_ACTIVE();
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    if (target == 0) {
+        ReportMissingCpuTarget(target, cpu);
+    }
+#if MKW_INDIRECT_IC_STATS
+    RecordIndirectSiteSlow(site, false, __builtin_return_address(0),
+                           ClassifyIndirectSiteSlow(site.record.load(std::memory_order_relaxed), target));
+#endif
+    if (DispatchIndirectSiteRecord(ResolveIndirectSite(target, site), cpu)) {
+        return;
+    }
+    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {
+        return;
+    }
+    RunUntranslatedOrFail(target, cpu);
+}
+
+// InvokeIndirectJump with the site standing in for the lookup. A target without a record goes to InvokeIndirectJump
+// itself for its fallbacks (interpreter, fatal report); its own lookup of the target finds nothing again.
+void MkwInvokeIndirectJumpSiteSlow(uint32_t target, CpuContext* ctx, MkwIndirectSite& site) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+#if MKW_INDIRECT_IC_STATS
+    RecordIndirectSiteSlow(site, true, __builtin_return_address(0),
+                           ClassifyIndirectSiteSlow(site.record.load(std::memory_order_relaxed), target));
+#endif
+    if (DispatchIndirectSiteRecord(ResolveIndirectSite(target, site), cpu)) {
+        return;
+    }
+    InvokeIndirectJump(target, cpu);
+}
+#endif

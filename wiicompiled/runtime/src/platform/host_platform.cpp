@@ -68,7 +68,12 @@ std::optional<std::filesystem::path> ExecutablePath() noexcept {
 }
 
 std::optional<std::filesystem::path> ExecutableDirectory() noexcept {
-#if defined(__ANDROID__)
+#if defined(__SWITCH__)
+    // An NRO has no directory of its own to read from: the files a desktop build keeps beside its
+    // executable (DSP ROM, pipeline cache, Wii bootstrap NAND, CA bundle) go in the game's SD card
+    // folder, with its Config.toml.
+    return std::filesystem::path("sdmc:/WiiCompiled");
+#elif defined(__ANDROID__)
     // The game is a library inside an APK, so there is no executable directory. The app unpacks
     // the files a desktop build keeps beside its executable (DSP ROM, pipeline cache, Wii
     // bootstrap NAND, CA bundle) and names that directory before SDL starts the game.

@@ -14,6 +14,7 @@ extern "C" void GX_HLE_FIFO_Write8(uint8_t val);
 // Keep HLE fallbacks only for known missing alias entry points.
 
 extern "C" void EGG__LightTexture__SetupTevFinish_HLE_8022e2bc(CpuContext* ctx) {
+    GX_HLE_MaterializeIfPending();  // calls GX__Begin_HLE directly (gx_internal.h, the vertex-state carry)
     const uint32_t self = ctx->gpr[3];
     const uint32_t stageCount = Memory::Read8(self + 0x75);
     const uint32_t tevCount = Memory::Read16(self + 0x78);

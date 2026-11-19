@@ -10,6 +10,7 @@ void InitializeRuntimeSettings() noexcept;
 void HandleEvents(const AuroraEvent* events) noexcept;
 void Draw() noexcept;
 bool StartupScreenVisible() noexcept;
+const char* StartupScreenReason() noexcept;  // which StartupScreenVisible() condition holds, for logs
 // A long job before the game can go on (building the mods' SD card): shown on the title card with its progress
 // bar (0..1) until cleared with nullptr. Game thread only.
 void SetBusyProgress(const char* label, float fraction) noexcept;

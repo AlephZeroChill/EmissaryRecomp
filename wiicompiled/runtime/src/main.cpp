@@ -43,11 +43,21 @@
 #include <dbghelp.h>
 #else
 #include <signal.h>
+#if !defined(__SWITCH__)  // Horizon delivers no signals to user code
 #include "host_fault_context.h"
+#endif
 #include <unistd.h>
 #endif
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
+#endif
+#if defined(__SWITCH__)
+#include <SDL3/SDL_hints.h>
+extern "C" void HorizonTrace(const char* text);  // platform/horizon.c: the kernel debug channel
+extern "C" int HorizonDisplaySize(unsigned* width, unsigned* height);  // platform/horizon.c: the VI layer's size
+#define HZ_TRACE(text) HorizonTrace(text)
+#else
+#define HZ_TRACE(text) ((void)0)
 #endif
 
 #include "hle/gecko.h"
@@ -243,11 +253,15 @@ const std::filesystem::path& GetRunLogDirectory() {
     // Never destroyed: a crash log written during exit (std::terminate from a static's destructor) used to read this
     // after its destructor ran and created a file with a garbage name next to the executable.
     static const std::filesystem::path& runDirectory = *new std::filesystem::path([] {
+        HZ_TRACE("[horizon] run log: root");
         const std::filesystem::path logRoot = GetDefaultRuntimeLogDirectory();
+        HZ_TRACE(("[horizon] run log: create " + logRoot.string()).c_str());
 
         std::error_code ec;
         std::filesystem::create_directories(logRoot, ec);
+        HZ_TRACE("[horizon] run log: prune");
         PruneOldRunLogs(logRoot);
+        HZ_TRACE("[horizon] run log: pruned");
 
 #if defined(_WIN32)
         const unsigned long pid = ::GetCurrentProcessId();
@@ -879,6 +893,35 @@ void WriteCrashArtifacts(std::string_view reason, std::string_view extraDetails,
     std::exit(EXIT_FAILURE);
 }
 
+[[noreturn]] void FatalVariantJumpIntoItself(uint32_t variant, uint32_t block, uint32_t target, CpuContext* cpu) noexcept {
+    std::ostringstream message;
+    message << std::hex << std::uppercase << std::setfill('0')
+            << "The code variant of 0x" << std::setw(8) << variant << " (a translation of mod-patched code) jumped from"
+            << " its block 0x" << std::setw(8) << block << " to 0x" << std::setw(8) << target
+            << ", inside its own code but not a target it was translated with (a missed jump-table case or computed"
+            << " jump). Continuing would run that code in the interpreter from the middle of the function.\n\n"
+            << "lr 0x" << std::setw(8) << (cpu ? cpu->lr : 0u) << ", r1 0x" << std::setw(8) << (cpu ? cpu->gpr[1] : 0u)
+            << "\nGuest callers (stack back chain, saved lr):";
+    // The EABI back chain: 0(r1) is the caller's frame, and a frame's 4(sp) holds the lr its callee saved there.
+    uint32_t frame = cpu ? cpu->gpr[1] : 0u;
+    for (int depth = 0; depth < 8 && frame != 0 && Memory::Contains(frame, 8); ++depth) {
+        frame = Memory::Read32(frame);
+        if (frame == 0 || !Memory::Contains(frame + 4, 4)) break;
+        message << " 0x" << std::setw(8) << Memory::Read32(frame + 4);
+    }
+    RT_LOG(RT_TAG_RUNTIME) << message.str() << std::endl;
+    PpcInterpreter::DumpRecentBranches();
+    try {
+        SystemBridge::DumpCpuState(cpu);
+    } catch (...) {
+    }
+    std::fflush(stderr);
+    WriteCrashArtifacts("variant_jump", message.str(), &target);
+    ShowRuntimeFatalPopup("Code variant jumped into itself", message.str());
+    MarkFatalErrorReported();
+    std::abort();
+}
+
 } // namespace RuntimeCrash
 
 
@@ -1029,7 +1072,7 @@ LONG ReportFatalSehAndExit(EXCEPTION_POINTERS* info) {
     message.Fatal();
 }
 
-#else
+#elif !defined(__SWITCH__)
 // POSIX has one process-wide signal handler. It attempts guest mapping recovery
 // before reporting an unhandled fault; Windows installs that recovery in GuestFlat.
 // Only async-signal-safe operations belong here: the interrupted thread may hold
@@ -1179,10 +1222,12 @@ int RuntimeMain(int argc, char** argv) {
     ConfigureWindowsFatalDialogBehavior();
     SetUnhandledExceptionFilter(UnhandledSehFilter);
     WindowsTimerResolutionGuard timerResolutionGuard;
-#else
+#elif !defined(__SWITCH__)
     InstallPosixMemoryFaultHandler();
 #endif
+    HZ_TRACE("[horizon] RuntimeMain: transcript");
     InitializeProcessTranscript(argc, argv);
+    HZ_TRACE("[horizon] RuntimeMain: transcript done");
     if (std::signal(SIGABRT, AbortSignalHandler) == SIG_ERR) {
         FaultReport::Message message;
         message.Text("[runtime] FATAL installing SIGABRT handler; errno=").Decimal(errno).Fatal();
@@ -1194,9 +1239,11 @@ int RuntimeMain(int argc, char** argv) {
     std::string currentEntryLabel;
 
     try {
+#if !defined(__SWITCH__)  // Horizon's homebrew loader supplies argv itself; none of it comes from a player
         if (argc != 1) {
             throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
         }
+#endif
         RuntimeConfigFile::LogLoadedConfig();
         // The player's own extracted game (game_folder.h); on Windows it is asked for at first start.
         if (!GameFolder::EnsureConfigured()) {
@@ -1313,6 +1360,17 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.windowHeight = 480;
         auroraConfig.windowWidth = RuntimeConfigFile::WindowWidth(auroraConfig.windowWidth);
         auroraConfig.windowHeight = RuntimeConfigFile::WindowHeight(auroraConfig.windowHeight);
+#if defined(__SWITCH__)
+        // The "window" is the VI layer: any other size reaches the screen rescaled by the compositor, with the
+        // wrong shape. Present at the display's own size; aspect handling then happens inside it, as on desktop.
+        {
+            unsigned displayWidth = 0, displayHeight = 0;
+            if (HorizonDisplaySize(&displayWidth, &displayHeight)) {
+                auroraConfig.windowWidth = displayWidth;
+                auroraConfig.windowHeight = displayHeight;
+            }
+        }
+#endif
         auroraConfig.hasWindowPosition = RuntimeConfigFile::WindowPosition(
             auroraConfig.windowPosX, auroraConfig.windowPosY);
         auroraConfig.allowJoystickBackgroundEvents = true;
@@ -1340,16 +1398,14 @@ int RuntimeMain(int argc, char** argv) {
         static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"metal", BACKEND_METAL},
         }};
-// only vulkan for linux
-#elif defined(__linux__)
-            static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
-            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},
-        }};
 #elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
         }};
-
+#else  // only vulkan elsewhere
+        static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},
+        }};
 #endif
         const auto backendDisplayName = [](AuroraBackend value) -> const char* {
             for (const auto& entry : kGraphicsBackends) {
@@ -1372,7 +1428,19 @@ int RuntimeMain(int argc, char** argv) {
         // SDL only reads its Wii driver hint when the joystick subsystem starts, which
         // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be
         // visible on that first scan.
+#if defined(__SWITCH__)
+        WiiRemoteInput::ConfigureSdlHints(false);  // no Bluetooth HID for applications on Horizon
+#else
         WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
+#endif
+#if defined(__SWITCH__)
+        // SDL has no Horizon drivers: its dummy video and audio drivers, which only start when named.
+        // Aurora presents through Dawn on libnx's window; platform/horizon.c feeds the gamepad.
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+        SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+        // SDL_GPU says why it rejects a Vulkan device only at verbose level.
+        SDL_SetHint(SDL_HINT_LOGGING, "gpu=verbose,*=info");
+#endif
 #if defined(__ANDROID__)
         // Graphics debugging on a phone without a rebuild: `adb shell setprop debug.nsmbw.gfx
         // validate,robust` reaches aurora's device setup as AURORA_GFX_FLAGS (webgpu/gpu.cpp).

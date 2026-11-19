@@ -22,7 +22,14 @@ uint64_t VI_HLE_DetNextRetraceTicks();
 void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace);
 bool VI_HLE_IsAdvancingRetrace();
 void VI_HLE_SetXfbReady(uint32_t xfbAddr); // Called by GXCopyDisp to signal EFB→XFB copy
-void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros);
+// Rollback resimulation (brawl_rollback.cpp): while set, VI_HLE_PresentFrame ends Aurora frames without showing them
+// (aurora_end_frame_unpresented): the guest and Aurora's frame boundaries are unchanged, nothing is presented.
+void VI_HLE_SetPresentSuppressed(bool suppressed);
+bool VI_HLE_PresentSuppressed();
+// Rollback (BRAWL_RESIM_LIGHT_LAST): while set, GXCopyDisp clears the EFB but leaves the display copy holding the image
+// already in it, which the next present shows.
+void VI_HLE_SetKeepDisplayCopy(bool keep);
+bool VI_HLE_KeepDisplayCopy();void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros);
 void Audio_HLE_Poll(CpuContext* ctx);
 // Deferred twin of Audio_HLE_Poll for the long host waits that already service
 // retraces and alarms (the VI retrace pacing loop, the Aurora frame-worker wait

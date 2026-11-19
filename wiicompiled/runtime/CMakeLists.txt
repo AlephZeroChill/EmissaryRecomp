@@ -39,6 +39,9 @@ elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|arm
     else()
         set(MKW_PLATFORM_MACOS_ARM64 TRUE)
     endif()
+elseif(NINTENDO_SWITCH AND MKW_TARGET_ARM64)
+    # Cross-built with cmake/Horizon.cmake. The game is an NRO; see cmake/PublicProducts.cmake.
+    set(MKW_PLATFORM_SWITCH TRUE)
 elseif(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     # Cross-built with the NDK. The game is a shared library (libmain.so) that SDL's Android
     # activity loads; see cmake/PublicProducts.cmake.
@@ -65,6 +68,11 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     if(MKW_HOST_ISA STREQUAL "v1")
         set(MKW_BASELINE_ARCH_FLAG -march=x86-64)
+    elseif(MKW_HOST_ISA STREQUAL "v3")
+        # -mno-vzeroupper: guest operations are preserve_all calls (MKW_OUTLINE_GUEST_OPS, isa/ppc_isa_config.h),
+        # whose callers keep YMM registers live across them; a vzeroupper before such a callee's ret (Clang emits
+        # one once its YMM saves dirty the upper halves) would zero those values.
+        set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3 -mno-vzeroupper)
     else()
         set(MKW_BASELINE_ARCH_FLAG -march=x86-64-${MKW_HOST_ISA})
     endif()
@@ -73,9 +81,45 @@ else()
 endif()
 
 option(MKW_FLAT_MEMORY "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" ON)
+if(MKW_PLATFORM_SWITCH AND MKW_FLAT_MEMORY)
+    # Horizon has no fixed-address mappings or page-fault handlers for user code.
+    set(MKW_FLAT_MEMORY OFF CACHE BOOL "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" FORCE)
+endif()
+
+# MKW_LEAN_MEMORY (include/memory_access.h): every guest access goes to one masked 1 GiB window, with no page table
+# and no fault handler. Horizon's default: src/memory.cpp reserves the window there and backs only the guest regions
+# and the runtime's tables in it (src/platform/horizon.c). Other builds may also define it in CMAKE_CXX_FLAGS.
+if(MKW_PLATFORM_SWITCH)
+    set(MKW_LEAN_MEMORY_DEFAULT ON)
+else()
+    set(MKW_LEAN_MEMORY_DEFAULT OFF)
+endif()
+option(MKW_LEAN_MEMORY "Use one masked 1 GiB window for guest memory (needs MKW_FLAT_MEMORY=OFF)" ${MKW_LEAN_MEMORY_DEFAULT})
+if(MKW_LEAN_MEMORY AND MKW_FLAT_MEMORY)
+    message(FATAL_ERROR "MKW_LEAN_MEMORY replaces MKW_FLAT_MEMORY: configure with -DMKW_FLAT_MEMORY=OFF")
+endif()
+
+# MKW_LEAN_DIRTY_MARKS (include/brawl_dirty_memory.h): OFF drops rollback's per-store dirty marks. Only for builds that
+# never run rollback: the vanilla EABI translation (its rollback hooks need the mod-patched, interpreted main loop).
+# Rollback aborts if asked to track writes in such a build. -2.8% game-thread instructions on vanilla Training.
+option(MKW_LEAN_DIRTY_MARKS "Mark rollback's dirty map at every guest store (lean memory)" ON)
+# MKW_HZ_PERF_HOT_COUNTERS (include/hz_perf.h): Horizon's per-call counters (each FIFO write, HLE thunk, indirect call
+# and display list). OFF for timing builds; the per-frame phases and counts stay.
+option(MKW_HZ_PERF_HOT_COUNTERS "Horizon per-call perf counters" ON)
+# MKW_FAST_FLOAT (include/isa/ppc_isa_float.h): host float instructions for single-precision loads, stores and
+# arithmetic instead of bit-exact Gekko emulation. NOT bit-exact with hardware or Dolphin (subnormals, NaN payloads,
+# fmuls' 25-bit C rounding, stfs of non-single values); builds made the same way agree with each other. Vanilla
+# Training: -1.45M game-thread instructions/frame (-17.5%), gameplay hash identical over the match, MEM2
+# differs. Default OFF.
+option(MKW_FAST_FLOAT "Host float instructions instead of bit-exact Gekko float emulation" OFF)
 
 option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
 option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
+
+# Profile-guided code layout (MKW_PGO_PROFILE etc.). Directory-scoped compile options, included before any target and
+# before aurora-main's add_subdirectory(), so the runtime, Aurora, the third-party libraries and the translated shards
+# are all built against the same profile.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/Layout.cmake")
 
 # Preprocessor definitions that belong to this project's own code (the runtime,
 # the translated shards and the product glue) and to nothing else. They are
@@ -84,6 +128,18 @@ option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
 # libraries and the products in cmake/PublicProducts.cmake) inherits them while
 # aurora-main and its third-party tree stay unaffected.
 set(MKW_PROJECT_COMPILE_DEFINITIONS NOMINMAX MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
+if(MKW_LEAN_MEMORY)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_LEAN_MEMORY=1)
+endif()
+if(NOT MKW_LEAN_DIRTY_MARKS)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_LEAN_DIRTY_MARKS=0)
+endif()
+if(NOT MKW_HZ_PERF_HOT_COUNTERS)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_HZ_PERF_HOT=0)
+endif()
+if(MKW_FAST_FLOAT)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_FAST_FLOAT=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -207,7 +263,16 @@ if(NOT MKW_PLATFORM_WINDOWS)
         set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
         set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
         set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
+        if(MKW_PLATFORM_SWITCH)
+            set(MBEDTLS_USER_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/cmake/mbedtls-horizon.h" CACHE FILEPATH "" FORCE)
+        endif()
         FetchContent_MakeAvailable(mkw_mbedtls_upstream)
+        if(MKW_PLATFORM_SWITCH)
+            # libnx's sockets and newlib's clocks are the POSIX ones Mbed TLS's Unix paths use.
+            foreach(target mbedcrypto mbedx509 mbedtls)
+                target_compile_definitions(${target} PRIVATE __unix__=1)
+            endforeach()
+        endif()
         target_link_libraries(mkw_mbedtls INTERFACE MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
     endif()
 endif()
@@ -231,19 +296,28 @@ set(MKW_TRANSLATED_PPC_FP_OPTIONS -fno-fast-math -ffp-contract=off)
 
 # kpad.cpp derives the accelerometer values the game reads (magnitude, speed, acc_vertical) in
 # native float math; network play needs them bit-identical on x86 and ARM, as the translated
-# code is.
+# code is. axfx_native.cpp replays the AXFX reverb/delay callbacks' Broadway float operations; game_natives.cpp
+# replays Havok's matrix decomposition in host single precision (each FMA is written out, never contracted).
 set(MKW_PPC_SEMANTIC_RUNTIME_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/src/ppc_helpers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/fpu_helpers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/hle/input/kpad.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/src/guest_ops_outlined.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/input/kpad.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/audio/axfx_native.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/game_natives.cpp")
 set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON
     COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
-# Match the optimization policy of the translated callers as well as their FP policy.
-set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
-    COMPILE_OPTIONS "$<$<CONFIG:Release>:-O2>" -fno-slp-vectorize)
+# game_natives.cpp checks the host FP exception flags after each native: an auto-vectorized operation computes lanes
+# the original never does (a 4-lane divide padded with 0 raised divide-by-zero on every call), so it stays scalar.
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/hle/game_natives.cpp" APPEND PROPERTY
+    COMPILE_OPTIONS -fno-slp-vectorize -fno-vectorize)
+# Match the optimization policy of the translated callers as well as their FP policy. guest_ops_outlined.cpp holds
+# operations translated code used to inline (MKW_OUTLINE_GUEST_OPS): the same options keep them bit-identical.
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" "${CMAKE_CURRENT_LIST_DIR}/src/guest_ops_outlined.cpp"
+    APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:-O2>" -fno-slp-vectorize)
 
 # ----------------------------------------------------------------------
 # Third-party: aurora-main (provides SDL3 + GPU backends)
@@ -348,6 +422,11 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
+# The lean window base's one writable definition (memory_access.h): every other source declares it const, so it must
+# not share a unity batch or the precompiled header with them.
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/lean_base.cpp" PROPERTIES
+    SKIP_UNITY_BUILD_INCLUSION ON
+    SKIP_PRECOMPILE_HEADERS ON)
 if(NOT MKW_FLAT_MEMORY)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
 endif()
@@ -407,7 +486,7 @@ option(MKW_BUILD_INTERPRETER_TESTS "Build CPU-only interpreter regression tests"
 if(MKW_BUILD_INTERPRETER_TESTS)
     add_executable(mkw_interpreter_call_forms_tests
         tests/interpreter_call_forms_tests.cpp tests/interpreter_test_support.cpp
-        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/guest_flat_memory.cpp
+        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/guest_flat_memory.cpp
         src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
     target_include_directories(mkw_interpreter_call_forms_tests PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")

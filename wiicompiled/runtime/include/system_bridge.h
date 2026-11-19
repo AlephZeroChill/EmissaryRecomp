@@ -29,6 +29,11 @@ void WriteCrashArtifacts(std::string_view reason,
 // stderr diagnostics, crash artifacts, popup, exit.
 [[noreturn]] void FatalMissingGuestTarget(uint32_t target, struct CpuContext* cpu) noexcept;
 
+// Full fatal path for a code variant's indirect jump into the middle of its own code (CheckVariantIndirectJump):
+// the variant, the jumping block, the target and the guest callers on stderr, crash artifacts, popup, exit.
+[[noreturn]] void FatalVariantJumpIntoItself(uint32_t variant, uint32_t block, uint32_t target,
+                                             struct CpuContext* cpu) noexcept;
+
 } // namespace RuntimeCrash
 
 // Shows a user-facing explanation for a fatal runtime error. Declared here with

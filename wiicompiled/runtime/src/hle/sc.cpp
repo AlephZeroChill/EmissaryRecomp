@@ -102,7 +102,7 @@ extern "C" uint32_t SCGetProductSN_HLE(uint32_t serialAddress)
 
 extern "C" uint32_t SCGetProductGameRegion_HLE()
 {
-    return LookupProductRegion(0x8047FAB0u, 4, 4,  // SC game-region table {code, "JP"...} (NSMBW)
+    return LookupProductRegion(0x8047C528u, 4, 4,  // SC game-region table {0 "JP", 1 "US", 2 "EU", 0xFF} (Brawl SCGetProductGameRegion 0x802103AC)
                                RuntimeConsoleIdentity::Current().gameRegion);
 }
 

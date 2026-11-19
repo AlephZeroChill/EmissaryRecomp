@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -126,7 +127,8 @@ namespace {
 
 // The two guest aliases a DSP ARAM address can resolve through. Dolphin's Wii DSP ARAM
 // path treats bit 0x10000000 as the MEM2/EXRAM selector; otherwise reads wrap through
-// MEM1 using the next-power-of-two retail RAM mask (24 MB real, 32 MB masked).
+// MEM1 using the next-power-of-two retail RAM mask (24 MB real, 32 MB masked). MEM2
+// wraps likewise at the next power of two of its mapping.
 struct AramAliases {
     uint32_t physical;
     uint32_t cached;
@@ -134,7 +136,7 @@ struct AramAliases {
 
 AramAliases AramAliasesFor(uint32_t addr) {
     if (addr & 0x10000000u) {
-        const uint32_t exramOffset = addr & static_cast<uint32_t>(Memory::kMem2Size - 1u);
+        const uint32_t exramOffset = addr & static_cast<uint32_t>(std::bit_ceil(Memory::kMem2Size) - 1u);
         return {0x10000000u | exramOffset, 0x90000000u | exramOffset};
     }
     const uint32_t ramOffset = addr & 0x01ffffffu;

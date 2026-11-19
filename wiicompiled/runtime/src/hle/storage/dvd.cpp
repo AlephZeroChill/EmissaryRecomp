@@ -1,4 +1,5 @@
 ﻿#include "hle_stubs.h"
+#include "guest_thread_guard.h"
 #include "isa/big_endian.h"
 #include "hle/dvd_contract.h"
 #include "hle/runtime_parse_helpers.h"
@@ -212,10 +213,31 @@ extern "C" void DVDInit_HLE();
 extern "C" uint32_t g_dvdFstReservedBase;
 extern "C" uint32_t g_dvdFstReservedSize;
 
-// Byte-wise copy into guest RAM plus the DMA notification the GX caches need.
+// Copy into guest RAM plus the DMA notification the GX caches need. The bytes and dirty marks are exactly the ones
+// Memory::Write8 makes byte by byte: a 1 MiB page with a writable bias (plain data, where Write8 marks each byte with
+// BrawlDirtyMemory::Mark and stores it directly) takes one memcpy for its part of the range, after the marks of the
+// whole run plus the last byte's own (a lean byte mark also marks the next 64-byte block; non-lean marks are exact,
+// so it is redundant there). Any other page (executable, MMIO, unmapped) keeps the byte-wise Write8 and its slow
+// path. The byte loop cost ~20 host instructions per byte on the game thread; the scripted Training attack frames
+// that read the disc (stream data) carried most of it.
 static void CopyToGuestAsDma(uint32_t dest, const uint8_t* data, size_t size) {
-    for (size_t i = 0; i < size; ++i) {
-        Memory::Write8(dest + static_cast<uint32_t>(i), data[i]);
+    size_t done = 0;
+    while (done < size) {
+        const uint32_t addr = dest + static_cast<uint32_t>(done);
+        const uint32_t page = addr >> MemoryInline::kPageShift;
+        const size_t pageLeft = ((static_cast<size_t>(page) + 1u) << MemoryInline::kPageShift) - addr;
+        const size_t chunk = std::min(size - done, pageLeft);
+        const uintptr_t bias = MemoryInline::g_fullWritablePageBias[page];
+        if (bias != 0) {
+            BrawlDirtyMemory::Mark(addr, chunk);
+            BrawlDirtyMemory::Mark(addr + static_cast<uint32_t>(chunk - 1u), 1);
+            std::memcpy(reinterpret_cast<uint8_t*>((bias - 1u) + addr), data + done, chunk);
+        } else {
+            for (size_t i = 0; i < chunk; ++i) {
+                Memory::Write8(addr + static_cast<uint32_t>(i), data[done + i]);
+            }
+        }
+        done += chunk;
     }
     GxNotifyGuestRamDmaWrite(dest, static_cast<uint32_t>(size));
 }
@@ -297,16 +319,18 @@ static fs::path ResolveDvdMappedHostPath(const std::string& dvdPath, const fs::p
 // does on hardware. Calling them inside DVDReadAsync re-entered SPM's chunked loaders (fontmgrInit ->
 // DVDMgrRead: the callback issues the next chunk before the caller has advanced its offset) without end.
 struct PendingDvdCallback { uint32_t callbackPtr; int32_t result; uint32_t commandBlock; };
-static std::mutex g_pendingDvdCallbackMutex;
+// Queued by the DVD HLE and drained by the alarm pump, both on the guest CPU's thread (guest_thread_guard.h); the
+// drain runs ~16 times a frame.
+static GuestThreadGuard g_pendingDvdCallbackGuard{"g_pendingDvdCallbackGuard"};
 static std::deque<PendingDvdCallback> g_pendingDvdCallbacks;
 static void QueueDvdCallback(uint32_t callbackPtr, int32_t result, uint32_t commandBlock) {
     if (callbackPtr == 0) return;
-    std::lock_guard<std::mutex> lock(g_pendingDvdCallbackMutex);
+    std::lock_guard<GuestThreadGuard> lock(g_pendingDvdCallbackGuard);
     g_pendingDvdCallbacks.push_back({callbackPtr, result, commandBlock});
 }
 // Save states wait for none to be queued (save_states.cpp).
 size_t DvdPendingCallbackCount() {
-    std::lock_guard<std::mutex> lock(g_pendingDvdCallbackMutex);
+    std::lock_guard<GuestThreadGuard> lock(g_pendingDvdCallbackGuard);
     return g_pendingDvdCallbacks.size();
 }
 bool DvdProcessPendingCallbacks(CpuContext* cpu) {
@@ -317,7 +341,7 @@ bool DvdProcessPendingCallbacks(CpuContext* cpu) {
     for (;;) {
         PendingDvdCallback cb{};
         {
-            std::lock_guard<std::mutex> lock(g_pendingDvdCallbackMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_pendingDvdCallbackGuard);
             if (g_pendingDvdCallbacks.empty()) break;
             cb = g_pendingDvdCallbacks.front();
             g_pendingDvdCallbacks.pop_front();
@@ -641,8 +665,10 @@ static void ScanDirectory(const fs::path& root, const std::string& virtualPrefix
             return;
         }
 
-        const fs::path relative = fs::relative(entry.path(), root, entryEc);
-        if (entryEc) {
+        // Lexical: entries come from iterating root, and relative() would stat every component of
+        // both paths for each file on the disc.
+        const fs::path relative = entry.path().lexically_relative(root);
+        if (relative.empty()) {
             return;
         }
 

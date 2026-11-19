@@ -215,6 +215,11 @@ bool SpmHostDisplayList(const uint8_t* list, uint32_t n, const uint8_t*& data, u
 }
 
 extern "C" void GX__BeginDisplayList_HLE(uint32_t la, uint32_t s) {
+    // The vertex-state carry (gx_internal.h): take the vertex state back before the guest records a list. A mirroring
+    // take-back inside the recording would encode deferred draws' vertex descriptors and formats (GX_HLE_After
+    // DeferredDraw's GXSetVtxDescv / GXSetVtxAttrFmtv) into the list Aurora records. No draw is deferred while a list
+    // records, so the state then stays exact until it ends.
+    GX_HLE_MaterializeIfPending();
     try {
         uint32_t gd = Memory::Read32(kGXDataPtrAddr);
         if (!gd) return;
@@ -329,5 +334,15 @@ PPC_NATIVE_OVERRIDE(801F4E00, GX__EndDisplayList_HLE, uint32_t, (), ());
 // Flush
 // ============================================================================
 
-extern "C" void GX__Flush_HLE() { GXFlush(); }
+extern "C" void aurora_gx_flush_point();  // aurora.cpp
+// The SDK's GXFlush pushes the write-gather pipe to the GPU, and Aurora's GX thread gets the work submitted so far here
+// too, not at the next sync. Brawl flushes at the end of its scene render, then runs the next update without GX work:
+// the scene's last up-to-32 KB batch used to wait there for the next frame's first GXDrawDone, which then waited for
+// it to be decoded (~0.06 ms a frame, P+ Training). Never inside a display list or an open GXBegin.
+extern "C" void GX__Flush_HLE() {
+    GXFlush();
+    if (!IsDisplayListActive() && !g_hleGxState.inBegin) {
+        aurora_gx_flush_point();
+    }
+}
 PPC_NATIVE_OVERRIDE_VOID(801f0530, GX__Flush_HLE, (), ());

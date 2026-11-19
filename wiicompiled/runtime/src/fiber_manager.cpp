@@ -18,7 +18,7 @@
 
 namespace Fiber {
 
-std::mutex GuestFiberManager::s_mutex;
+GuestThreadGuard GuestFiberManager::s_guard{"GuestFiberManager::s_guard"};
 std::unordered_map<uint32_t, GuestFiber> GuestFiberManager::s_fibers;
 std::vector<void*> GuestFiberManager::s_fibersPendingDelete;
 void* GuestFiberManager::s_schedulerFiber = nullptr;
@@ -29,7 +29,7 @@ thread_local CpuContext* GuestFiberManager::s_cpuContext = nullptr;
 void GuestFiberManager::PurgePendingFibers() {
     std::vector<void*> toDelete;
     {
-        std::lock_guard<std::mutex> lock(s_mutex);
+        std::lock_guard<GuestThreadGuard> lock(s_guard);
         toDelete.swap(s_fibersPendingDelete);
     }
     for (void* f : toDelete) {
@@ -184,7 +184,7 @@ void WakeGuestThreadsOnQueueNoSwitch(uint32_t queueAddr)
 // =============================================================================
 
 void GuestFiberManager::Initialize() {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     
     if (s_initialized) {
         return;
@@ -202,7 +202,7 @@ void GuestFiberManager::Initialize() {
 }
 
 void GuestFiberManager::Shutdown() {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
 
     for (auto& [addr, fiber] : s_fibers) {
         if (fiber.fiber && !fiber.isSchedulerFiber) {
@@ -232,7 +232,7 @@ bool GuestFiberManager::CreateGuestFiber(uint32_t guestThreadAddr, uint32_t entr
         return false;
     }
     
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     
     // Check if fiber already exists for this thread - if so, reset it
     auto existingIt = s_fibers.find(guestThreadAddr);
@@ -283,7 +283,7 @@ bool GuestFiberManager::CreateGuestFiber(uint32_t guestThreadAddr, uint32_t entr
 }
 
 void GuestFiberManager::ResumeGuestThread(uint32_t guestThreadAddr) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     auto it = s_fibers.find(guestThreadAddr);
     if (it == s_fibers.end()) {
         RT_LOG(RT_TAG_OS) << "ResumeGuestThread: no fiber for 0x"
@@ -302,7 +302,7 @@ void GuestFiberManager::ResumeGuestThread(uint32_t guestThreadAddr) {
 }
 
 void GuestFiberManager::SuspendGuestThread(uint32_t guestThreadAddr) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     
     auto it = s_fibers.find(guestThreadAddr);
     if (it == s_fibers.end()) {
@@ -314,7 +314,7 @@ void GuestFiberManager::SuspendGuestThread(uint32_t guestThreadAddr) {
 }
 
 void GuestFiberManager::ExitGuestThread(uint32_t guestThreadAddr, ThreadState finalState) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     
     auto it = s_fibers.find(guestThreadAddr);
     if (it == s_fibers.end()) {
@@ -357,7 +357,7 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
     }
     
     {
-        std::lock_guard<std::mutex> lock(s_mutex);
+        std::lock_guard<GuestThreadGuard> lock(s_guard);
         
         auto it = s_fibers.find(guestThreadAddr);
         if (it == s_fibers.end()) {
@@ -424,7 +424,7 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
     // That does not automatically mean the previous guest thread became runnable
     // again; a different thread may simply have yielded back to the scheduler.
     {
-        std::lock_guard<std::mutex> lock(s_mutex);
+        std::lock_guard<GuestThreadGuard> lock(s_guard);
         uint32_t runningContext = 0;
         uint32_t currentContext = 0;
         try {
@@ -465,18 +465,18 @@ uint32_t GuestFiberManager::GetCurrentGuestThread() {
 }
 
 GuestFiber* GuestFiberManager::GetFiber(uint32_t guestThreadAddr) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     auto it = s_fibers.find(guestThreadAddr);
     return it != s_fibers.end() ? &it->second : nullptr;
 }
 
 bool GuestFiberManager::HasFiber(uint32_t guestThreadAddr) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     return s_fibers.count(guestThreadAddr) > 0;
 }
 
 void GuestFiberManager::DumpGuestThreads(std::ostream& os) {
-    std::unique_lock<std::mutex> lock(s_mutex, std::try_to_lock);
+    std::unique_lock<GuestThreadGuard> lock(s_guard, std::try_to_lock);
     if (!lock.owns_lock()) {
         os << "[fiber] thread dump skipped: fiber table busy" << std::endl;
         return;
@@ -513,7 +513,7 @@ void GuestFiberManager::DumpGuestThreads(std::ostream& os) {
 }
 
 bool GuestFiberManager::IsTerminated(uint32_t guestThreadAddr) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     auto it = s_fibers.find(guestThreadAddr);
     return it != s_fibers.end() && it->second.terminated;
 }
@@ -524,7 +524,7 @@ bool GuestFiberManager::RegisterMainThreadAsFiber(uint32_t guestThreadAddr, CpuC
         return false;
     }
     
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     
     // Check if already registered
     if (s_fibers.count(guestThreadAddr)) {
@@ -586,7 +586,7 @@ void GuestFiberManager::FiberProc(void* param)
     uint32_t entryArg = 0;
     
     {
-        std::unique_lock<std::mutex> lock(s_mutex);
+        std::unique_lock<GuestThreadGuard> lock(s_guard);
         auto it = s_fibers.find(guestThreadAddr);
         if (it == s_fibers.end()) {
             lock.unlock();
@@ -677,7 +677,7 @@ void GuestFiberManager::FiberProc(void* param)
     }
     
     {
-        std::lock_guard<std::mutex> lock(s_mutex);
+        std::lock_guard<GuestThreadGuard> lock(s_guard);
         auto it = s_fibers.find(guestThreadAddr);
         if (it != s_fibers.end()) {
             it->second.terminated = true;
@@ -691,13 +691,13 @@ void GuestFiberManager::FiberProc(void* param)
 }
 
 std::vector<std::pair<uint32_t, GuestFiber>> GuestFiberManager::CopyFibers(uint32_t& currentGuestThread) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     currentGuestThread = s_currentGuestThread;
     return {s_fibers.begin(), s_fibers.end()};
 }
 
 void GuestFiberManager::RestoreFibers(const std::vector<std::pair<uint32_t, GuestFiber>>& fibers, uint32_t currentGuestThread) {
-    std::lock_guard<std::mutex> lock(s_mutex);
+    std::lock_guard<GuestThreadGuard> lock(s_guard);
     // In place: FiberProc keeps a pointer to its entry (the caller checked both sets hold the same threads).
     for (const auto& [thread, fiber] : fibers) {
         if (auto it = s_fibers.find(thread); it != s_fibers.end()) it->second = fiber;

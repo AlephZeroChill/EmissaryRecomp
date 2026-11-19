@@ -1,6 +1,8 @@
 #include "timebase_contract.h"
 #include "det_clock.h"
+#include "guest_thread_guard.h"
 #include "memory.h"
+#include "hz_perf.h"
 #include "guest_interrupt_context.h"
 #include "hle_stubs.h"
 #include "ppc_runtime.h"
@@ -33,7 +35,10 @@ constexpr uint32_t kAIDmaCallbackAddr = 0x805A0A18u;          // __AID_Callback 
 constexpr int kMaxBlocksPerTick = 4;
 
 struct AIDmaState {
-    std::mutex mutex;
+    // Only the guest CPU's thread touches this state (guest_thread_guard.h): the AI HLE, the scheduler's idle and
+    // deterministic audio pumps, and Aurora's frame-wait callback. ~70 lock/unlock pairs a frame in P+ Training as a
+    // mutex.
+    GuestThreadGuard guard{"g_ai.guard"};
     uint32_t startAddr = 0;
     uint32_t registerStartAddr = 0;
     uint32_t length = 0;
@@ -166,7 +171,7 @@ extern "C" void AIClockInit_HLE(uint32_t clock_mode)
     (void)clock_mode;
     uint32_t rate = kDefaultSampleRate;
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         rate = g_ai.sampleRate;
     }
     if (!EnsureAudioBackend(rate)) {
@@ -191,7 +196,7 @@ PPC_NATIVE_OVERRIDE_VOID(801D7414, OSInitAudioSystem_HLE, (), ());
 extern "C" void OSStopAudioSystem_HLE()
 {
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         g_ai.enabled = false;
         g_ai.registerStartAddr = 0;
         g_ai.bytesLeft = 0;
@@ -215,7 +220,7 @@ extern "C" void AIInit_HLE(uint32_t callback_stack_switch)
     uint32_t initialized = 0;
     const bool alreadyInitialized = Memory::TryRead32(kAIInitializedAddr, initialized) && initialized == 1u;
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         g_ai.sampleRate = rate;
         if (!alreadyInitialized) {
             g_ai.callback = 0;
@@ -289,7 +294,7 @@ PPC_NATIVE_OVERRIDE_VOID(80200d90, __AXOutInitDSP_HLE, (CpuContext* ctx), (ctx))
 
 extern "C" void AIInitDMA_HLE(uint32_t start_addr, uint32_t length)
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     g_ai.startAddr = start_addr;
     g_ai.registerStartAddr = EncodeAIDmaStartRegister(start_addr);
     g_ai.length = EncodeAIDmaLengthRegister(length);
@@ -308,7 +313,7 @@ extern "C" uint32_t AIRegisterDMACallback_HLE(uint32_t callback)
     Memory::TryRead32(kAIDmaCallbackAddr, old_callback);
     Memory::TryWrite32(kAIDmaCallbackAddr, callback);
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         g_ai.callback = callback;
         g_ai.loggedMissingCallback = false;
     }
@@ -322,7 +327,7 @@ extern "C" void AIStartDMA_HLE()
 {
     const uint32_t rate = kDefaultSampleRate;
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         g_ai.sampleRate = rate;
         g_ai.enabled = true;
         g_ai.bytesLeft = g_ai.length;
@@ -337,26 +342,26 @@ PPC_NATIVE_OVERRIDE_VOID(801FEC80, AIStartDMA_HLE, (), ());
 
 extern "C" uint32_t AIGetDMABytesLeft_HLE()
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     return g_ai.bytesLeft;
 }
 PPC_NATIVE_OVERRIDE(801FECA8, AIGetDMABytesLeft_HLE, uint32_t, (), ());
 
 extern "C" uint32_t AIGetDMAStartAddr_8012406c()
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     return g_ai.registerStartAddr;
 }
 
 extern "C" uint32_t AIGetDMALength_80124084()
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     return g_ai.length;
 }
 
 extern "C" uint32_t AIGetDSPSampleRate_8012409c()
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     // SDK AIGetDSPSampleRate returns AIDFR^1: 0 for 32 kHz, 1 for 48 kHz.
     return (g_ai.sampleRate == 48000u) ? 1u : 0u;
 }
@@ -401,6 +406,7 @@ PPC_NATIVE_OVERRIDE(802099DC, DSPAssertTask_HLE, uint32_t, (uint32_t taskPtr), (
 // next block, preserving the SoundThread/DSP interleave order real hardware provides.
 void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
 {
+    HZ_PHASE(kHzAudioTickTicks);
     uint32_t startAddr = 0;
     uint32_t length = 0;
     uint32_t callback = 0;
@@ -408,7 +414,7 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
     bool enabled = false;
 
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         enabled = g_ai.enabled;
         startAddr = g_ai.startAddr;
         length = g_ai.length;
@@ -439,7 +445,7 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
             if (!armed) {
                 return;
             }
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             g_ai.tickActive = false;
         }
     } activeTickReset;
@@ -452,13 +458,14 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
 
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
     CpuContextScope scope(cpu);
+    HZ_PERF_ADD(kHzAudioTicks, 1);
 
     int blocksCompleted = 0;
     while (true) {
         // Claim the block in one critical section; sample-then-consume separately gains
         // nothing since the callback below (the only reentrancy point) runs mutex-released.
         {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             if (g_ai.accumulatorSeconds < blockDuration) {
                 break;
             }
@@ -470,10 +477,13 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
         // that reads its PB write-back and aux buffers (__AXOutNewFrame via the AI DMA
         // callback), so the mix worker must finish first; the join also publishes its
         // aux-out shadow.
-        AxDspHle::JoinMixWorker();
+        {
+            HZ_PHASE(kHzAudioJoinTicks);
+            AxDspHle::JoinMixWorker();
+        }
 
         if (!EnsureAudioBackend(sampleRate)) {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             if (!g_ai.loggedBackendFailure) {
                 g_ai.loggedBackendFailure = true;
                 ReportAudioProblem("Audio", "audio backend unavailable; dropping samples");
@@ -481,7 +491,7 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
         } else {
             const bool pushed = PushAudioBlock(startAddr, length);
             if (!pushed) {
-                std::lock_guard<std::mutex> lock(g_ai.mutex);
+                std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
                 if (!g_ai.loggedAccessFailure) {
                     g_ai.loggedAccessFailure = true;
                     ReportAudioProblem("Audio", "failed to read DMA buffer; disabling audio DMA");
@@ -495,21 +505,23 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
             // Pointer lookup avoids copying the registry record per audio block.
             const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(callback);
             if (!info || !info->rawCpuInvoker) {
-                std::lock_guard<std::mutex> lock(g_ai.mutex);
+                std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
                 if (!g_ai.loggedMissingCallback) {
                     g_ai.loggedMissingCallback = true;
                     ReportAudioProblem("Audio", "AI DMA callback not registered; skipping");
                 }
             } else {
                 Memory::TryWrite32(kAICallbackBusyAddr, 1);
+                HZ_PERF_T0();
                 InvokeIndirectCpu(callback, cpu);
+                HZ_PERF_SINCE(kHzAudioCallbackTicks);
                 Memory::TryWrite32(kAICallbackBusyAddr, 0);
                 AxDspHle::ServiceDeferredCallbacks();
             }
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             startAddr = g_ai.startAddr;
             length = g_ai.length;
             callback = g_ai.callback;
@@ -517,13 +529,14 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
             g_ai.bytesLeft = g_ai.length;
         }
 
+        HZ_PERF_ADD(kHzAudioBlocks, 1);
         if (++blocksCompleted >= kMaxBlocksPerTick) {
             break;
         }
     }
 
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         if (g_ai.length != 0) {
             const double bytesRemaining = g_ai.length * (g_ai.accumulatorSeconds / blockDuration);
             if (bytesRemaining < static_cast<double>(g_ai.length)) {
@@ -582,7 +595,7 @@ void AudioTickDeterministic(CpuContext* ctx)
     uint32_t callback = 0;
     uint32_t sampleRate = kDefaultSampleRate;
     {
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         if (!g_ai.enabled || g_ai.startAddr == 0 || g_ai.length == 0 || g_ai.sampleRate == 0 || g_ai.tickActive) {
             return;
         }
@@ -606,7 +619,7 @@ void AudioTickDeterministic(CpuContext* ctx)
     struct ActiveTickReset {
         ~ActiveTickReset()
         {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             g_ai.tickActive = false;
         }
     } activeTickReset;
@@ -616,7 +629,7 @@ void AudioTickDeterministic(CpuContext* ctx)
 
     for (int blocksCompleted = 0; blocksCompleted < kMaxBlocksPerTick; ++blocksCompleted) {
         {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             if (DetClock::Now() < g_ai.detBlockDueTicks) {
                 break;
             }
@@ -626,7 +639,7 @@ void AudioTickDeterministic(CpuContext* ctx)
 
         AxDspHle::JoinMixWorker();
         if (EnsureAudioBackend(sampleRate) && !PushAudioBlock(startAddr, length)) {
-            std::lock_guard<std::mutex> lock(g_ai.mutex);
+            std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             if (!g_ai.loggedAccessFailure) {
                 g_ai.loggedAccessFailure = true;
                 ReportAudioProblem("Audio", "failed to read DMA buffer; disabling audio DMA");
@@ -645,7 +658,7 @@ void AudioTickDeterministic(CpuContext* ctx)
             }
         }
 
-        std::lock_guard<std::mutex> lock(g_ai.mutex);
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
         startAddr = g_ai.startAddr;
         length = g_ai.length;
         callback = g_ai.callback;
@@ -656,7 +669,7 @@ void AudioTickDeterministic(CpuContext* ctx)
         }
     }
 
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     const uint64_t blockTicks = DetBlockTicks(g_ai.length, g_ai.sampleRate);
     const uint64_t now = DetClock::Now();
     if (blockTicks != 0 && g_ai.detBlockDueTicks > now) {
@@ -670,7 +683,7 @@ void AudioTickDeterministic(CpuContext* ctx)
 
 uint64_t Audio_HLE_DetNextEventTicks()
 {
-    std::lock_guard<std::mutex> lock(g_ai.mutex);
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
     if (!g_ai.enabled || g_ai.startAddr == 0 || g_ai.length == 0 || g_ai.sampleRate == 0) {
         return DetClock::kNever;
     }

@@ -19,6 +19,7 @@
 #endif
 
 #include "ppc_runtime.h"
+#include "guest_thread_guard.h"
 
 // Forward declarations
 struct CpuContext;
@@ -117,7 +118,9 @@ private:
     static void SwitchToScheduler();
 
     // Internal state
-    static std::mutex s_mutex;
+    // Guest threads are coroutines on one host thread (guest_thread_guard.h): ~80 lock/unlock pairs a frame in P+
+    // Training as a mutex.
+    static GuestThreadGuard s_guard;
     static std::unordered_map<uint32_t, GuestFiber> s_fibers;
     static std::vector<void*> s_fibersPendingDelete;
     // The scheduler's own host context. Its opaque handle is supplied by the

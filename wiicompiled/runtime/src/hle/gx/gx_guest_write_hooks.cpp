@@ -65,6 +65,22 @@ GuestRamAlias ResolveAlias(uint32_t guestBase, size_t size) noexcept {
 
 } // namespace
 
+bool NoteTrackedHostRange(const void* hostPtr, size_t size) noexcept {
+    if (size == 0) {
+        return false;
+    }
+    for (const auto& alias : g_aliases) {
+        uint32_t addr = 0;
+        if (HostRangeToGuest(alias.hostBase, alias.size, alias.guestBase, hostPtr, 1, addr)) {
+            const uint64_t offset = static_cast<uint64_t>(addr - alias.guestBase);
+            const uint64_t room = alias.size - offset;
+            NoteTrackedRange(addr, static_cast<uint32_t>(static_cast<uint64_t>(size) < room ? size : room));
+            return true;
+        }
+    }
+    return false;
+}
+
 void InstallAuroraHooks() {
     g_aliases[0] = ResolveAlias(Memory::kMem1CachedBase, Memory::kMem1Size);
     g_aliases[1] = ResolveAlias(Memory::kMem2CachedBase, Memory::kMem2Size);

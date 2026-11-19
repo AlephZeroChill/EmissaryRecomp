@@ -30,6 +30,14 @@
 #include <cstring>
 #include <limits>
 
+// MKW_FAST_FLOAT=1: single-precision loads, stores and arithmetic use the host's float instructions directly
+// (cvtss2sd/cvtsd2ss, plain mul/add) instead of bit-exact Gekko emulation. Results differ from hardware only at the
+// edges: subnormals, NaN payloads, fmuls' 25-bit rounding of C, and stfs of a value not already single (Gekko
+// truncates, the host rounds). Every copy of this runtime built the same way still agrees with every other.
+#ifndef MKW_FAST_FLOAT
+#define MKW_FAST_FLOAT 0
+#endif
+
 inline uint64_t PpcBitCastToU64Inline(double value)
 {
     uint64_t integral = 0;
@@ -191,8 +199,13 @@ inline bool MkwHostNiActiveInline() noexcept
     return g_mkwHostNiActive;
 }
 
-inline float PpcForceSingleValueInline(double value)
+// MKW_OUTLINE_GUEST_OPS (ppc_isa_config.h): each exact operation below is its Body, inline, and a Ppc*Inline entry
+// point that calls the Body compiled once in src/guest_ops_outlined.cpp (MKW_GUEST_OP_CC). Bodies call Bodies.
+inline float PpcForceSingleValueBody(double value)
 {
+#if MKW_FAST_FLOAT
+    return static_cast<float>(value);
+#endif
     // FPSCR[NI] flushes an exact pre-round single-subnormal even when rounding would promote it
     // to the smallest normal. g_mkwNiFlushThreshold (2^-126 active, 0.0 inactive) turns the
     // flush into a branchless mask: a set compare lane keeps just the sign bit, a clear lane
@@ -213,6 +226,18 @@ inline float PpcForceSingleValueInline(double value)
     const uint64x1_t signOnly = vand_u64(vreinterpret_u64_f64(v), signMask);
     const uint64x1_t kept = vbsl_u64(flush, signOnly, vreinterpret_u64_f64(v));
     return static_cast<float>(vget_lane_f64(vreinterpret_f64_u64(kept), 0));
+#endif
+}
+
+#if MKW_OUTLINE_GUEST_OPS
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC float PpcForceSingleValueOutlined(double value);
+#endif
+inline float PpcForceSingleValueInline(double value)
+{
+#if MKW_OUTLINE_GUEST_OPS
+    return PpcForceSingleValueOutlined(value);
+#else
+    return PpcForceSingleValueBody(value);
 #endif
 }
 
@@ -247,13 +272,9 @@ inline double PpcForce25BitInline(double value)
     {
         int64_t keepMask = 0xFFFFFFFFF8000000LL;
         uint64_t round = 0x8000000ULL;
-        uint32_t leadingZeros = 0;
-        uint64_t normalizedFraction = fraction;
-        while ((normalizedFraction & (1ULL << 63)) == 0)
-        {
-            normalizedFraction <<= 1;
-            ++leadingZeros;
-        }
+        // Shifts until bit 63 is set, i.e. the leading zero count (fraction is nonzero here): one lzcnt/clz.
+        // __builtin_clzll, not std::countl_zero: some translation units including this header build as C++17.
+        const uint32_t leadingZeros = static_cast<uint32_t>(__builtin_clzll(fraction));
         const uint32_t shift = leadingZeros - (63 - kDoubleFracWidth);
         keepMask >>= shift;
         round >>= shift;
@@ -421,9 +442,9 @@ inline double PpcPackIntegerWordInline(int32_t value)
 
 // Select NaNs in guest operand order and preserve the chosen sign/payload.
 // FMA passes A, B, C even though it computes A*C +/- B.
-inline double PpcResolveNanInline(double result, double a, double b, double c = 0.0)
+// The NaN arm, out of line and cold (MKW_GUEST_OP_CC: the check at each site spills nothing).
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PpcResolveNanSlow(double a, double b, double c)
 {
-    if (!std::isnan(result)) return result;
     constexpr uint64_t quiet = 0x0008000000000000ull;
     for (double operand : {a, b, c})
         if (std::isnan(operand))
@@ -431,35 +452,63 @@ inline double PpcResolveNanInline(double result, double a, double b, double c = 
     return PpcBitCastToDoubleInline(0x7FF8000000000000ull);
 }
 
-inline double PpcFaddInline(double a, double b)
+inline double PpcResolveNanInline(double result, double a, double b, double c = 0.0)
 {
-    return PpcResolveNanInline(a + b, a, b);
+    if (!std::isnan(result)) [[likely]] return result;
+    return PpcResolveNanSlow(a, b, c);
 }
 
-inline double PpcFsubInline(double a, double b)
+// The NaN a two-operand op produces: PpcResolveNanInline on every host (exact), except under MKW_FAST_FLOAT, which
+// keeps the host's NaN. (Skipping it on AArch64 relied on FPCR.DN being clear and still differed for a quiet NaN in a
+// with a signalling NaN in b; not taken.)
+inline double PpcResolveNan2Inline(double result, double a, double b)
 {
-    return PpcResolveNanInline(a - b, a, b);
+#if MKW_FAST_FLOAT
+    (void)a;
+    (void)b;
+    return result;
+#else
+    return PpcResolveNanInline(result, a, b);
+#endif
 }
 
-inline double PpcFmulInline(double a, double b)
+inline double PpcFaddBody(double a, double b)
 {
-    return PpcResolveNanInline(a * b, a, b);
+    return PpcResolveNan2Inline(a + b, a, b);
 }
 
-inline double PpcFdivInline(double a, double b)
+inline double PpcFsubBody(double a, double b)
 {
-    return PpcResolveNanInline(a / b, a, b);
+    return PpcResolveNan2Inline(a - b, a, b);
 }
 
-template <bool Subtract>
+inline double PpcFmulBody(double a, double b)
+{
+    return PpcResolveNan2Inline(a * b, a, b);
+}
+
+inline double PpcFdivBody(double a, double b)
+{
+    return PpcResolveNan2Inline(a / b, a, b);
+}
+
+// CIsSingle: the translator proved C a single-precision value (see PpcFmulsSingleCInline), on which the 25-bit
+// rounding below is the identity.
+template <bool Subtract, bool CIsSingle = false>
 inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double b)
 {
+#if MKW_FAST_FLOAT
+    // Always fused, so x86 and ARM builds round identically (one instruction on x86-64-v3 and every AArch64; a
+    // libm call only on pre-FMA x86, which no product targets). An unfused fallback would make results depend on
+    // the build's target level.
+    return std::fma(a, c, Subtract ? -b : b);
+#endif
     // Gekko single-precision fused operations keep the full precision of A
     // and B, round C to a 25-bit significand, and round only the final result
     // to float32.  A double FMA is almost sufficient, but an exact result just
     // beyond a float32 halfway point can be rounded to a double tie first.
     // Recover the direction of that discarded error for those tie cases.
-    const double roundedC = std::isnan(c) ? c : PpcForce25BitInline(c);
+    const double roundedC = CIsSingle ? c : std::isnan(c) ? c : PpcForce25BitInline(c);
     const double signedB = Subtract ? -b : b;
     double result = std::fma(a, roundedC, signedB);
     const uint64_t resultBits = PpcBitCastToU64Inline(result);
@@ -481,15 +530,18 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
     return PpcResolveNanInline(result, a, b, c);
 }
 
-inline double PpcFmulsInline(double a, double c)
+inline double PpcFmulsBody(double a, double c)
 {
+#if MKW_FAST_FLOAT
+    return static_cast<double>(static_cast<float>(a * c));
+#endif
     return static_cast<double>(
-        PpcForceSingleValueInline(PpcFmulInline(a, std::isnan(c) ? c : PpcForce25BitInline(c))));
+        PpcForceSingleValueBody(PpcFmulBody(a, std::isnan(c) ? c : PpcForce25BitInline(c))));
 }
 
 inline double PpcFmulsNoNiInline(double a, double c)
 {
-    return static_cast<double>(static_cast<float>(PpcFmulInline(a, std::isnan(c) ? c : PpcForce25BitInline(c))));
+    return static_cast<double>(static_cast<float>(PpcFmulBody(a, std::isnan(c) ? c : PpcForce25BitInline(c))));
 }
 
 inline double PpcFmaddInline(double a, double c, double b)
@@ -514,33 +566,120 @@ inline double PpcFnmsubInline(double a, double c, double b)
     return std::isnan(result) ? result : -result;
 }
 
-inline double PpcFmaddsInline(double a, double c, double b)
+inline double PpcFmaddsBody(double a, double c, double b)
 {
     return static_cast<double>(
-        PpcForceSingleValueInline(PpcAccurateSingleMaddIntermediateInline<false>(a, c, b)));
+        PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<false>(a, c, b)));
 }
 
-inline double PpcFmsubsInline(double a, double c, double b)
+inline double PpcFmsubsBody(double a, double c, double b)
 {
     return static_cast<double>(
-        PpcForceSingleValueInline(PpcAccurateSingleMaddIntermediateInline<true>(a, c, b)));
+        PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<true>(a, c, b)));
 }
 
-inline double PpcFnmaddsInline(double a, double c, double b)
+inline double PpcFnmaddsBody(double a, double c, double b)
 {
-    const float result = PpcForceSingleValueInline(
+    const float result = PpcForceSingleValueBody(
         PpcAccurateSingleMaddIntermediateInline<false>(a, c, b));
     return static_cast<double>(std::isnan(result) ? result : -result);
 }
 
-inline double PpcFnmsubsInline(double a, double c, double b)
+inline double PpcFnmsubsBody(double a, double c, double b)
 {
-    const float result = PpcForceSingleValueInline(
+    const float result = PpcForceSingleValueBody(
         PpcAccurateSingleMaddIntermediateInline<true>(a, c, b));
     return static_cast<double>(std::isnan(result) ? result : -result);
 }
 
-#if defined(__aarch64__)
+// fmuls / fmadds / fmsubs / fnmadds / fnmsubs whose C operand the translator proved single-precision (an lfs, a
+// single-precision result, a paired register's PS0, or a move, negation or absolute value of one): Gekko rounds C to a
+// 25-bit significand first, and that rounding (`isnan(c) ? c : PpcForce25BitInline(c)`) is the identity on such a value,
+// NaN included. A single widened to a double has bits 0..28 of its fraction clear, so PpcForce25BitInline's normal arm
+// (`(bits & ~0x7FFFFFF) + (bits & 0x8000000)`) returns it unchanged, and no single is a double subnormal (its other
+// arm). So these are the same functions without that step.
+inline double PpcFmulsSingleCInline(double a, double c)
+{
+#if MKW_FAST_FLOAT
+    return static_cast<double>(static_cast<float>(a * c));
+#endif
+    return static_cast<double>(PpcForceSingleValueBody(PpcFmulBody(a, c)));
+}
+
+inline double PpcFmulsSingleCNoNiInline(double a, double c)
+{
+    return static_cast<double>(static_cast<float>(PpcFmulBody(a, c)));
+}
+
+extern "C" inline double PPC_FmaddsSingleC(double a, double c, double b)
+{
+    return static_cast<double>(
+        PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<false, true>(a, c, b)));
+}
+
+extern "C" inline double PPC_FmsubsSingleC(double a, double c, double b)
+{
+    return static_cast<double>(
+        PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<true, true>(a, c, b)));
+}
+
+extern "C" inline double PPC_FnmaddsSingleC(double a, double c, double b)
+{
+    const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<false, true>(a, c, b));
+    return static_cast<double>(std::isnan(result) ? result : -result);
+}
+
+extern "C" inline double PPC_FnmsubsSingleC(double a, double c, double b)
+{
+    const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<true, true>(a, c, b));
+    return static_cast<double>(std::isnan(result) ? result : -result);
+}
+
+// The entry points translated code calls (see PpcForceSingleValueBody).
+#if MKW_OUTLINE_GUEST_OPS
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFaddOutlined(double a, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFsubOutlined(double a, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFmulOutlined(double a, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFdivOutlined(double a, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFmulsOutlined(double a, double c);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFmaddsOutlined(double a, double c, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFmsubsOutlined(double a, double c, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFnmaddsOutlined(double a, double c, double b);
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFnmsubsOutlined(double a, double c, double b);
+#define MKW_OUTLINE_GUEST_OPS_SELECT(outlined, body) outlined
+#else
+#define MKW_OUTLINE_GUEST_OPS_SELECT(outlined, body) body
+#endif
+inline double PpcFaddInline(double a, double b) { return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFaddOutlined, PpcFaddBody)(a, b); }
+inline double PpcFsubInline(double a, double b) { return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFsubOutlined, PpcFsubBody)(a, b); }
+inline double PpcFmulInline(double a, double b) { return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFmulOutlined, PpcFmulBody)(a, b); }
+inline double PpcFdivInline(double a, double b) { return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFdivOutlined, PpcFdivBody)(a, b); }
+inline double PpcFmulsInline(double a, double c)
+{
+    return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFmulsOutlined, PpcFmulsBody)(a, c);
+}
+inline double PpcFmaddsInline(double a, double c, double b)
+{
+    return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFmaddsOutlined, PpcFmaddsBody)(a, c, b);
+}
+inline double PpcFmsubsInline(double a, double c, double b)
+{
+    return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFmsubsOutlined, PpcFmsubsBody)(a, c, b);
+}
+inline double PpcFnmaddsInline(double a, double c, double b)
+{
+    return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFnmaddsOutlined, PpcFnmaddsBody)(a, c, b);
+}
+inline double PpcFnmsubsInline(double a, double c, double b)
+{
+    return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFnmsubsOutlined, PpcFnmsubsBody)(a, c, b);
+}
+
+#if MKW_FAST_FLOAT
+// Fast float: paired-single results keep the host's NaN (no guest-order payload selection), so the per-op NaN
+// check and its out-of-line resolution compile away.
+inline constexpr uint64_t PpcPairNanLaneBitsInline(PpcPairVec) { return 0; }
+#elif defined(__aarch64__)
 inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
 {
     return vget_lane_u64(vreinterpret_u64_u32(vmvn_u32(vceq_f32(value, value))), 0);
@@ -548,7 +687,7 @@ inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
 
 #endif // defined(__aarch64__)
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !MKW_FAST_FLOAT
 inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
 {
     // Only the low two lanes represent guest values. In particular, the unused
@@ -908,7 +1047,24 @@ inline uint32_t PpcConvertToSingleFTZInline(uint64_t value)
     return static_cast<uint32_t>((value >> 32) & 0x80000000ULL);
 }
 
-inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
+// The word a single-float psq_st (W=1) stores for a paired register on the segment-range and resolved paths: ps0
+// widened and narrowed by the FTZ rule above (Dolphin's ConvertToSingleFTZ), or under MKW_FAST_FLOAT ps0's own bits, as
+// the pair store already does there (no subnormal flush, no sNaN quieting). The flat and stack single stores keep the
+// FTZ rule: a cheaper body there changed Clang's inlining into their generic GQR fallbacks and grew code (+1.5% in a
+// psq-heavy shard), and they are the cold paths.
+inline uint32_t PpcPsqStoreSingleBitsInline(double value)
+{
+#if MKW_FAST_FLOAT
+    return PpcBitCastToU32Inline(PpcGetPs0Inline(value));
+#else
+    return PpcConvertToSingleFTZInline(PpcBitCastToU64Inline(static_cast<double>(PpcGetPs0Inline(value))));
+#endif
+}
+
+// The PowerPC manual's single-to-double algorithm (lfs, ps loads), kept out of line for the inputs the host cast in
+// PpcConvertToDoubleBitsInline can't reproduce: subnormals (a DAZ host would flush them) and NaNs (a host cast sets
+// the quiet bit of a signalling NaN; Gekko keeps the payload). Infinities land here too; their result is the same.
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline uint64_t PpcConvertToDoubleBitsSlow(uint32_t value)
 {
     uint64_t x = value;
     uint64_t exp = (x >> 23) & 0xFFu;
@@ -938,6 +1094,21 @@ inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
     return ((x & 0xC0000000ULL) << 32) | z | ((x & 0x3FFFFFFFULL) << 29);
 }
 
+inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
+{
+    float single;
+    std::memcpy(&single, &value, sizeof(single));
+#if MKW_FAST_FLOAT
+    return PpcBitCastToU64Inline(static_cast<double>(single));
+#endif
+    // Normal singles and zeros widen exactly, so the host cast gives the manual's bits (its normal arm is this exact
+    // widening written in integer ops); everything else takes the manual's algorithm.
+    const uint32_t magnitude = value & 0x7FFFFFFFu;
+    if (magnitude - 0x00800000u < 0x7F000000u || magnitude == 0) [[likely]]
+        return PpcBitCastToU64Inline(static_cast<double>(single));
+    return PpcConvertToDoubleBitsSlow(value);
+}
+
 inline double PpcPackPairedBitsInline(uint32_t ps0, uint32_t ps1)
 {
     return PpcBitCastToDoubleInline((static_cast<uint64_t>(ps0) << 32) | ps1);
@@ -951,24 +1122,24 @@ inline PPC_FPR PpcMakePairedResultInline(float ps0, float ps1)
     return result;
 }
 
-extern "C" void PPC_Mtfsf(uint32_t fieldMask, double source);
-extern "C" void PPC_Mtfsfi(uint32_t field, uint32_t value);
-extern "C" void PPC_Mtfsb0(uint32_t bit);
-extern "C" void PPC_Mtfsb1(uint32_t bit);
-extern "C" double PPC_Mffs();
+extern "C" MKW_GUEST_OP_CC void PPC_Mtfsf(uint32_t fieldMask, double source);
+extern "C" MKW_GUEST_OP_CC void PPC_Mtfsfi(uint32_t field, uint32_t value);
+extern "C" MKW_GUEST_OP_CC void PPC_Mtfsb0(uint32_t bit);
+extern "C" MKW_GUEST_OP_CC void PPC_Mtfsb1(uint32_t bit);
+extern "C" MKW_GUEST_OP_CC double PPC_Mffs();
 
-extern "C" double PPC_PsAdd(double lhs, double rhs);
-extern "C" double PPC_PsSub(double lhs, double rhs);
-extern "C" double PPC_PsDiv(double lhs, double rhs);
-extern "C" double PPC_PsNeg(double value);
-extern "C" double PPC_PsMul(double lhs, double rhs);
-extern "C" double PPC_PsMsub(double lhs, double mul, double sub);
-extern "C" double PPC_PsMadd(double lhs, double mul, double add);
-extern "C" double PPC_PsNmsub(double lhs, double mul, double sub);
-extern "C" double PPC_PsMadds0(double lhs, double mul, double add);
-extern "C" double PPC_PsMadds1(double lhs, double mul, double add);
-extern "C" double PPC_PsNmadd(double lhs, double mul, double add);
-extern "C" double PPC_PsSel(double lhs, double control, double rhs);
+extern "C" MKW_GUEST_OP_CC double PPC_PsAdd(double lhs, double rhs);
+extern "C" MKW_GUEST_OP_CC double PPC_PsSub(double lhs, double rhs);
+extern "C" MKW_GUEST_OP_CC double PPC_PsDiv(double lhs, double rhs);
+extern "C" MKW_GUEST_OP_CC double PPC_PsNeg(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMul(double lhs, double rhs);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMsub(double lhs, double mul, double sub);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMadd(double lhs, double mul, double add);
+extern "C" MKW_GUEST_OP_CC double PPC_PsNmsub(double lhs, double mul, double sub);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMadds0(double lhs, double mul, double add);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMadds1(double lhs, double mul, double add);
+extern "C" MKW_GUEST_OP_CC double PPC_PsNmadd(double lhs, double mul, double add);
+extern "C" MKW_GUEST_OP_CC double PPC_PsSel(double lhs, double control, double rhs);
 // ps_res is hot in the THP dequant path (148 static call sites in the IDCT
 // region); the out-of-line definition cost a call + full spill barrier per
 // use, so it is defined inline here. The estimate logic is byte-identical to
@@ -982,15 +1153,15 @@ extern "C" inline double PPC_PsRes(double value)
     return PpcPackPairedInline(ps0, ps1);
 }
 
-extern "C" double PPC_PsRsqrte(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_PsRsqrte(double value);
 // Pack a scalar double into a paired-single FPR value (ps0=ps1=float(value)).
-extern "C" double PPC_PsFromScalar(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_PsFromScalar(double value);
 // Extract the ps0 lane as a scalar double (used to feed single-precision ops).
-extern "C" double PPC_PsToScalar(double value);
-extern "C" double PPC_PsMerge00(double a, double b);
-extern "C" double PPC_PsMerge01(double a, double b);
-extern "C" double PPC_PsMerge10(double a, double b);
-extern "C" double PPC_PsMerge11(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_PsToScalar(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMerge00(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMerge01(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMerge10(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMerge11(double a, double b);
 
 // Hot scalar float helpers, defined inline so the compiler can see through them instead of
 // taking a cross-TU caller-saved register barrier at ~2,500 call sites in the hottest float
@@ -1030,15 +1201,15 @@ extern "C" inline double PPC_Fctiwz(double value)
     return PpcPackIntegerWordInline(PpcClampIntegerWordInline(value));
 }
 
-extern "C" double PPC_Fmadd(double multiplicand, double multiplier, double addend);
-extern "C" double PPC_Fmsub(double multiplicand, double multiplier, double subtractor);
-extern "C" double PPC_Fnmadd(double multiplicand, double multiplier, double addend);
-extern "C" double PPC_Fnmsub(double multiplicand, double multiplier, double subtractor);
+extern "C" MKW_GUEST_OP_CC double PPC_Fmadd(double multiplicand, double multiplier, double addend);
+extern "C" MKW_GUEST_OP_CC double PPC_Fmsub(double multiplicand, double multiplier, double subtractor);
+extern "C" MKW_GUEST_OP_CC double PPC_Fnmadd(double multiplicand, double multiplier, double addend);
+extern "C" MKW_GUEST_OP_CC double PPC_Fnmsub(double multiplicand, double multiplier, double subtractor);
 // Single-precision scalar helpers (fadds/fsubs/fmuls/fdivs and fused variants).
-extern "C" double PPC_Fadds(double a, double b);
-extern "C" double PPC_Fsubs(double a, double b);
-extern "C" double PPC_Fmuls(double a, double b);
-extern "C" double PPC_Fdivs(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_Fadds(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_Fsubs(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_Fmuls(double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_Fdivs(double a, double b);
 // The fused single-precision family is a thin wrapper over the Ppc*Inline
 // bodies above; keeping the wrapper out of line meant the wrapper itself was
 // the register barrier. See the block at PPC_Fres for why there is no LTO to
@@ -1063,19 +1234,19 @@ extern "C" inline double PPC_Fnmsubs(double multiplicand, double multiplier, dou
     return PpcFnmsubsInline(multiplicand, multiplier, subtractor);
 }
 
-extern "C" double PPC_Fctiw(double value);   // Convert float to int using FPSCR rounding mode
-extern "C" void PPC_Stfiwx(uint32_t addr, double fprValue);  // Store Float as Integer Word (indexed)
-extern "C" double PPC_PsSum0(double a, double b, double c);
-extern "C" double PPC_PsSum1(double a, double b, double c);
-extern "C" double PPC_PsMuls0(double a, double c);
-extern "C" double PPC_PsMuls1(double a, double c);
-extern "C" double PPC_PsAbs(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_Fctiw(double value);   // Convert float to int using FPSCR rounding mode
+extern "C" MKW_GUEST_OP_CC void PPC_Stfiwx(uint32_t addr, double fprValue);  // Store Float as Integer Word (indexed)
+extern "C" MKW_GUEST_OP_CC double PPC_PsSum0(double a, double b, double c);
+extern "C" MKW_GUEST_OP_CC double PPC_PsSum1(double a, double b, double c);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMuls0(double a, double c);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMuls1(double a, double c);
+extern "C" MKW_GUEST_OP_CC double PPC_PsAbs(double value);
 
 // Floating-point comparison helper (fcmpu/fcmpo)
-extern "C" void PPC_Fcmp(uint32_t crField, double a, double b);
-extern "C" void PPC_PsCmpo0(uint32_t crField, double a, double b);
-extern "C" void PPC_PsCmpu0(uint32_t crField, double a, double b);
-extern "C" void PPC_PsCmpo1(uint32_t crField, double a, double b);
-extern "C" void PPC_PsCmpu1(uint32_t crField, double a, double b);
-extern "C" double PPC_PsNabs(double value);
-extern "C" double PPC_PsMr(double value);
+extern "C" MKW_GUEST_OP_CC void PPC_Fcmp(uint32_t crField, double a, double b);
+extern "C" MKW_GUEST_OP_CC void PPC_PsCmpo0(uint32_t crField, double a, double b);
+extern "C" MKW_GUEST_OP_CC void PPC_PsCmpu0(uint32_t crField, double a, double b);
+extern "C" MKW_GUEST_OP_CC void PPC_PsCmpo1(uint32_t crField, double a, double b);
+extern "C" MKW_GUEST_OP_CC void PPC_PsCmpu1(uint32_t crField, double a, double b);
+extern "C" MKW_GUEST_OP_CC double PPC_PsNabs(double value);
+extern "C" MKW_GUEST_OP_CC double PPC_PsMr(double value);

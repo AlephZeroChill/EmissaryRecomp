@@ -2,6 +2,7 @@
 // Brawl Online GameplayRollback.cpp / gp-v29 (GPL-2.0-or-later).
 #include "brawl_rollback.h"
 #include "abi_bridge.h"
+#include "axfx_async.h"
 #include "det_clock.h"
 #include "brawl_snapshot_store.h"
 #include "brawl_write_watch.h"
@@ -12,6 +13,8 @@
 #include "ppc_runtime.h"
 #include "save_states.h"
 #include "gekkonet.h"
+#include "hle_stubs.h"
+#include "g3d_native.h"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -25,6 +28,10 @@
 #include <atomic>
 #include <random>
 #include <thread>
+#include <unordered_map>
+#include <map>
+#include <tuple>
+#include <iterator>
 #if defined(__x86_64__)
 #include <nmmintrin.h>
 #endif
@@ -180,7 +187,19 @@ void DiscoverRegions() {
         packedOffset+=r.size;
     }
     if(session.trackWrites) {
+#if MKW_LEAN_MEMORY && !MKW_LEAN_DIRTY_MARKS
+        // Guest stores in this build do not mark the dirty map (brawl_dirty_memory.h), so WriteWatch would see no
+        // writes and every snapshot would miss them. Refuse rather than desync.
+        std::fprintf(stderr,"[rollback] built with MKW_LEAN_DIRTY_MARKS=0: no write tracking, rollback unavailable\n");
+        std::abort();
+#endif
+#if MKW_FLAT_MEMORY
         session.writeWatch=std::make_unique<WriteWatch>(reinterpret_cast<uintptr_t>(MKW_FLAT_GUEST_BASE));size_t packed=0;
+#elif MKW_LEAN_MEMORY  // marks are indexed by the canonical window offset (brawl_dirty_memory.h)
+        session.writeWatch=std::make_unique<WriteWatch>(reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase));size_t packed=0;
+#else
+        session.writeWatch=std::make_unique<WriteWatch>();size_t packed=0;  // heap memory: the registered hosts map it
+#endif
         // Register the two RAM backing allocations once for retained HLE pointers.
         // WriteWatch::Add reuses these mappings for their selected subranges.
         BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase,Memory::kMem1Size)),Memory::kMem1Size,Memory::kMem1CachedBase});
@@ -249,6 +268,7 @@ void Configure() {
     std::fprintf(stderr,"[rollback] %s input, limit %u\n",path?path:"live controller",count);
 }
 uint32_t Hash() {
+    AxfxAsync::Join();  // the ranges may include the AXFX jobs' buffers and lines (axfx_async.h)
     uint32_t h=2166136261u;
     for (auto r:session.ranges) {
         auto* p=Memory::GetPointer(r.addr,r.size);
@@ -323,6 +343,7 @@ template<bool Write> MKW_PPC_FORCE_INLINE void TransferPacked(size_t& cursor,siz
     cursor=size_t(at-session.backing.begin());
 }
 void Save(int frame,CpuContext* ctx) {
+    AxfxAsync::Join();  // no AXFX job still writing guest memory (axfx_async.h)
     const auto started=std::chrono::steady_clock::now();
     auto& s=session.snapshots[(frame+16)%16];
     size_t total=0;for(auto r:session.ranges)total+=r.size;
@@ -380,6 +401,7 @@ void Save(int frame,CpuContext* ctx) {
         (unsigned long long)(session.writeWatch?session.writeWatch->captureMergeNs:0));
 }
 void Load(int frame,CpuContext* ctx) {
+    AxfxAsync::Join();  // no AXFX job still writing guest memory (axfx_async.h)
     const auto started=std::chrono::steady_clock::now();
     auto& s=session.snapshots[(frame+16)%16];
     if(s.frame!=frame) throw std::runtime_error("rollback: snapshot outside ring");
@@ -422,6 +444,9 @@ void Load(int frame,CpuContext* ctx) {
         (unsigned long long)(session.writeWatch?session.writeWatch->captureMergeNs:0));
 }
 } // namespace
+
+// The gameplay checksum outside a session, for the determinism diagnostics (det_hash.cpp, NSMBW_DET_HASH).
+uint32_t CurrentGameplayHash() { return GameplayHash(); }
 
 // Called at the loop's IPC safe point, before entering a new match.
 void BeginOnlineMatch(unsigned index,unsigned pad,unsigned mailbox,unsigned mailboxSize) {
@@ -595,6 +620,286 @@ public:
         }
     }
 };
+// BRAWL_ROLLBACK_PHASES=1: a uprobe target for profiling rollback sessions. perf reads the game thread's cycles at each
+// call ({probe,cycles}:S), which splits them into phases: the argument is a phase code (kPhase*; an advance's also
+// carries its index and the event batch's advance count), or the guest address of a call the main loop body makes
+// (LoopCall; the loop body itself after it returns), with kPhaseResim set while resimulating. Never inlined, so the
+// symbol and the call stay.
+extern "C" [[gnu::noinline]] [[gnu::used]] void BrawlRollbackPhaseMarker(uint64_t phase) {
+    asm volatile("" : : "r"(phase) : "memory");
+}
+namespace {
+constexpr uint64_t kPhaseGekko=1,kPhaseLoad=2,kPhaseSave=3,kPhaseAdvance=4,kPhaseAdvanceEnd=5,kPhaseIdle=6;
+constexpr uint64_t kPhaseResim=uint64_t(1)<<32;
+constexpr uint32_t kLoopBody=0x800171B4u,kRender=0x8001789Cu;
+// BRAWL_ROLLBACK_PHASES: 1 marks RunLoop's events and the main phases of an advance (update, render, renderPre,
+// XFB copy + present, draw pass: ~10 uprobe hits per advance); 2 only RunLoop's events; 3 every call of the loop body.
+unsigned PhaseLevel() {
+    static const unsigned level=Env("BRAWL_ROLLBACK_PHASES",0);
+    return level;
+}
+bool PhaseMarkers() {return PhaseLevel()==1 || PhaseLevel()==3;}
+bool MajorCall(uint64_t target) {
+    return target==0x80017618u || target==kRender || target==0x8002E79Cu || target==0x80023AE4u || target==0x8002E844u;
+}
+void Phase(uint64_t phase) {
+    const unsigned level=PhaseLevel();
+    if(!level) return;
+    const bool call=phase>=0x80000000u;  // calls are guest addresses
+    if(call && !(level==3 || (level==1 && MajorCall(phase)))) return;
+    BrawlRollbackPhaseMarker(phase|(session.resimulating?kPhaseResim:0));
+}
+// BRAWL_RESIM_DIFF=<file> (with BRAWL_SNAPSHOT_VERIFY's full copies): at each re-save of a frame, the 32-byte granules
+// of the snapshot ranges that differ from that frame's previous save, counted per granule and by what produced the
+// new state (kind: 0 a real advance, 1 the last resimulated advance of its batch, 2 an earlier resimulated advance,
+// 3 a load); written to <file> with the heap table when the session completes. A diagnostic for comparing the state
+// render-side work leaves in saved memory.
+struct ResaveDiff {
+    std::array<std::unordered_map<uint32_t,uint32_t>,4> granules;
+    std::array<uint64_t,4> resaves{},differing{};
+    unsigned stateKind=0;  // what produced the current state (kind above)
+};
+ResaveDiff resaveDiff;
+const char* ResaveDiffPath() {
+    static const char* path=std::getenv("BRAWL_RESIM_DIFF");
+    return path;
+}
+void DiffResave(int frame,unsigned kind) {
+    if(!ResaveDiffPath()) return;
+    AxfxAsync::Join();  // compares live memory (axfx_async.h)
+    const auto& s=session.snapshots[(frame+16)%16];
+    if(s.frame!=frame || s.bytes.empty()) return;
+    ++resaveDiff.resaves[kind];
+    size_t pos=0;bool any=false;
+    for(auto r:session.ranges) {
+        const auto* live=Memory::GetPointer(r.addr,r.size);
+        const auto* old=s.bytes.data()+pos;
+        if(std::memcmp(live,old,r.size)) for(uint32_t i=0;i<r.size;i+=32) {
+            const uint32_t n=std::min<uint32_t>(32,r.size-i);
+            if(std::memcmp(live+i,old+i,n)) {++resaveDiff.granules[kind][(r.addr+i)&~31u];any=true;}
+        }
+        pos+=r.size;
+    }
+    if(any) ++resaveDiff.differing[kind];
+}
+// BRAWL_RESIM_PAGEHASH=<file> (diagnostics; BRAWL_RESIM_PAGEHASH_STRIDE, default 8): after every advance of a session
+// frame divisible by the stride, one record: u32 advance number, u32 session frame, u32 kind (0 real, 1 last replay,
+// 2 earlier replay), u32 page count, then a CRC32C of each 4 KiB of the snapshot ranges in their packed order (scripts:
+// pagecmp.py). Two runs' files show which memory differs after which advances.
+void PageHashRecord(int frame,unsigned kind) {
+    AxfxAsync::Join();  // hashes live memory (axfx_async.h)
+    static FILE* out=[] {
+        const char* path=std::getenv("BRAWL_RESIM_PAGEHASH");
+        return path?std::fopen(path,"wb"):nullptr;
+    }();
+    static const unsigned stride=std::max(1u,Env("BRAWL_RESIM_PAGEHASH_STRIDE",8));
+    if(!out || frame<0 || unsigned(frame)%stride) return;
+    static bool rangesWritten=false;
+    if(!rangesWritten) {  // <file>.ranges: the snapshot ranges (guest address, size) in packed order, and the heaps
+        rangesWritten=true;
+        if(FILE* f=std::fopen((std::string(std::getenv("BRAWL_RESIM_PAGEHASH"))+".ranges").c_str(),"w")) {
+            for(auto r:session.ranges) std::fprintf(f,"range %08x %08x\n",r.addr,r.size);
+            for(unsigned i=1;i<0x48;++i) {
+                const auto entry=0x80494958u+16*i,name=Read(entry);
+                if(!Memory::Contains(name,40)) continue;
+                const char* text=reinterpret_cast<const char*>(Memory::GetPointer(name));
+                std::fprintf(f,"heap %.*s %08x %08x\n",int(strnlen(text,40)),text,Read(entry+4),Read(entry+8));
+            }
+            std::fclose(f);
+        }
+    }
+    std::vector<uint32_t> crcs;
+    uint32_t crc=0;size_t inPage=0;
+    for(auto r:session.ranges) {
+        const auto* p=Memory::GetPointer(r.addr,r.size);
+        for(uint32_t i=0;i<r.size;) {
+            const size_t n=std::min<size_t>(4096-inPage,r.size-i);
+#if defined(__x86_64__)
+            size_t j=0;
+            for(;j+8<=n;j+=8) {uint64_t w;std::memcpy(&w,p+i+j,8);crc=uint32_t(_mm_crc32_u64(crc,w));}
+            for(;j<n;++j) crc=_mm_crc32_u8(crc,p[i+j]);
+#else
+            for(size_t j=0;j<n;++j) crc=(crc^p[i+j])*16777619u;
+#endif
+            i+=uint32_t(n);inPage+=n;
+            if(inPage==4096) {crcs.push_back(crc);crc=0;inPage=0;}
+        }
+    }
+    if(inPage) crcs.push_back(crc);
+    const uint32_t head[4]={uint32_t(session.advances),uint32_t(frame),kind,uint32_t(crcs.size())};
+    std::fwrite(head,4,4,out);std::fwrite(crcs.data(),4,crcs.size(),out);std::fflush(out);
+}
+void WriteResaveDiff() {
+    if(!ResaveDiffPath()) return;
+    FILE* f=std::fopen(ResaveDiffPath(),"w");
+    if(!f) return;
+    for(unsigned k=0;k<4;++k)
+        std::fprintf(f,"# kind %u resaves %llu differing %llu granules %zu\n",k,(unsigned long long)resaveDiff.resaves[k],
+            (unsigned long long)resaveDiff.differing[k],resaveDiff.granules[k].size());
+    for(unsigned i=1;i<0x48;++i) {
+        const auto entry=0x80494958u+16*i,name=Read(entry);
+        if(!Memory::Contains(name,40)) continue;
+        const char* text=reinterpret_cast<const char*>(Memory::GetPointer(name));
+        std::fprintf(f,"heap %.*s %08x %08x\n",int(strnlen(text,40)),text,Read(entry+4),Read(entry+8));
+    }
+    for(unsigned k=0;k<4;++k) {
+        std::vector<std::pair<uint32_t,uint32_t>> rows(resaveDiff.granules[k].begin(),resaveDiff.granules[k].end());
+        std::sort(rows.begin(),rows.end());
+        for(auto [address,count]:rows) std::fprintf(f,"%u %08x %u\n",k,address,count);
+    }
+    std::fclose(f);
+}
+} // namespace
+// Resimulation skips (BRAWL_RESIM_SKIP, default 1; 0 replays frames as before). No replayed advance is presented
+// (VI_HLE_SetPresentSuppressed): each advance's render first copies the EFB the previous advance drew, so the real
+// advance presents the last replayed advance's image, and the batch's earlier presents only flashed stale frames (the
+// hidden advance's, without models). Their Aurora frames still end and submit (aurora_end_frame_unpresented): ending
+// them later moved Aurora's frame-latent EFB readbacks and changed the shown image (41 pixels). The guest's
+// copy, draw-sync and XFB bookkeeping run unchanged.
+// The last replayed advance must still draw (the real advance presents its image). An earlier ("hidden") one draws an
+// image nobody sees, but its draw pass is not render-only: gfSceneRoot::render also draws the effects, and skipping it
+// leaves saved state that differs into the following advances (the Effect heap, its allocator header included, and
+// the camera EffectManager copies at each effect draw; BRAWL_RESIM_DIFF). BRAWL_RESIM_SKIP_CALLS (hex
+// guest addresses of main-loop or render calls, comma-separated) skips calls in hidden advances, for experiments only.
+std::vector<uint32_t> HexList(const char* text) {
+    std::vector<uint32_t> out;
+    for(const char* p=text?text:"";*p;) {
+        char* end=nullptr;
+        const auto value=std::strtoul(p,&end,16);
+        if(end==p) {++p;continue;}
+        out.push_back(uint32_t(value));
+        p=end;
+    }
+    return out;
+}
+struct ResimSkips {
+    bool on=Env("BRAWL_RESIM_SKIP",1)!=0;
+    std::vector<uint32_t> hidden=HexList(std::getenv("BRAWL_RESIM_SKIP_CALLS"));
+    // BRAWL_RESIM_INLINE (hex list, diagnostics): functions the loop body calls that are interpreted inline, so their
+    // own calls reach LoopCall too (phase markers, attribution, skips).
+    std::vector<uint32_t> inlined=HexList(std::getenv("BRAWL_RESIM_INLINE"));
+};
+const ResimSkips& Skips() {
+    static const ResimSkips skips;
+    return skips;
+}
+bool Listed(const std::vector<uint32_t>& list,uint32_t target) {
+    return std::find(list.begin(),list.end(),target)!=list.end();
+}
+// Light draws: an advance whose models are not drawn but whose guest state is a full draw's. Everything runs as usual,
+// renderPre and the draw pass included, except the leaf that draws a model, nw4r::g3d::DrawResMdlDirectly (the native
+// path, g3d_native.cpp), which only does the guest-visible part of its work (its Z sorts, which advance MSL std::sort's
+// shared pivot generator, and G3DState's PosNrm array; g3dn::SetDrawSuppressed). The rest of the draw pass has to run:
+// its writes persist (BRAWL_RESIM_ATTRIB + BRAWL_RESIM_PAGEHASH): nw4r::ef's particle draws with their
+// begin/end and the emitters' restore walk, the scene graph's calc, child insert/remove and the models' draw callbacks
+// (a Tmp-heap word fighters read, stage state), the task scheduler's phase; so does renderPre's fighter model calc,
+// which later effects follow. Skipping the scene graph's draw calls instead (or hiding layers, as ResimHide does, which
+// also drops their calc) leaves state that later frames read.
+// BRAWL_RESIM_HIDE: how replays before the last one of their batch draw: 1 with ResimHide (model layers and shadows
+// hidden, their calc too: the replay's state differs from a full one, 39 pages of Effect heap, stage and System at
+// distance 3, unseen by the checksums); 2 light (exactly a full draw's state); 0 in full (diagnostics).
+unsigned HideLevel() {
+    static const unsigned level=Env("BRAWL_RESIM_HIDE",2);
+    return level;
+}
+// BRAWL_RESIM_LIGHT_LAST=1 (default 0; needs BRAWL_RESIM_SKIP): the last replay of a batch draws light too, and the real
+// advance after it shows the image already in the display copy, the frame that was mispredicted, for that one frame
+// (its own copy only clears the EFB). The guest state is that of a full replay; only the picture differs.
+bool LightLast() {
+    static const bool on=Env("BRAWL_RESIM_LIGHT_LAST",0)!=0 && Env("BRAWL_RESIM_SKIP",1)!=0;
+    return on;
+}
+bool hiddenAdvance=false;  // the current advance is a hidden replay (RunLoop)
+bool inAdvance=false;      // RunLoop is running an advance's gameProc
+
+// BRAWL_RESIM_ATTRIB=<file of hex 32-byte granule addresses> (diagnostics): during real advances, which call of the
+// loop body (or of a function it runs inline) changes each listed granule. A call's leaf execution runs between its
+// LoopCall and LoopCallDone; interpreted code between two such events is charged to "interp after <call>". Written to
+// <file>.attrib before the session's COMPLETE line: granule, call (bit 31 clear: interpreted segment), count.
+struct Attribution {
+    std::vector<uint32_t> granules;
+    std::vector<uint8_t> shadow;  // the granules' contents at the previous event
+    std::map<std::tuple<uint32_t,uint32_t,uint32_t>,uint32_t> writes;  // (granule, segment, major phase) -> count
+    uint32_t last=0;              // the previous event's call
+    uint32_t phase=0;             // the latest major call (MajorCall) of the advance: update, renderPre, draw pass...
+    bool active=false;
+};
+Attribution& Attrib() {
+    static Attribution a=[] {
+        Attribution out;
+        if(const char* path=std::getenv("BRAWL_RESIM_ATTRIB")) {
+            std::ifstream in(path);
+            std::string text((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+            for(auto g:HexList(text.c_str())) if(Memory::Contains(g&~31u,32)) out.granules.push_back(g&~31u);
+            std::sort(out.granules.begin(),out.granules.end());
+            out.granules.erase(std::unique(out.granules.begin(),out.granules.end()),out.granules.end());
+            out.shadow.resize(out.granules.size()*32);
+            out.active=!out.granules.empty();
+            std::fprintf(stderr,"[resim-attrib] watching %zu granules\n",out.granules.size());
+        }
+        return out;
+    }();
+    return a;
+}
+// Charges every watched granule that changed since the previous event to `segment`, and re-reads the shadow.
+void AttribEvent(uint32_t segment) {
+    auto& a=Attrib();
+    if(!a.active || !inAdvance || session.resimulating) return;
+    for(size_t i=0;i<a.granules.size();++i) {
+        const auto* live=Memory::GetPointer(a.granules[i],32);
+        auto* old=a.shadow.data()+32*i;
+        if(std::memcmp(live,old,32)) {++a.writes[{a.granules[i],segment,a.phase}];std::memcpy(old,live,32);}
+    }
+}
+void AttribReset() {  // at an advance's start: the shadow is the state the advance begins from
+    auto& a=Attrib();
+    if(!a.active) return;
+    for(size_t i=0;i<a.granules.size();++i) std::memcpy(a.shadow.data()+32*i,Memory::GetPointer(a.granules[i],32),32);
+    a.last=kLoopBody;
+    a.phase=kLoopBody;
+}
+void WriteAttrib() {
+    auto& a=Attrib();
+    const char* path=std::getenv("BRAWL_RESIM_ATTRIB");
+    if(!a.active || !path) return;
+    FILE* f=std::fopen((std::string(path)+".attrib").c_str(),"w");
+    if(!f) return;
+    for(const auto& [key,count]:a.writes)
+        std::fprintf(f,"%08x %08x %u %08x\n",std::get<0>(key),std::get<1>(key),count,std::get<2>(key));
+    std::fclose(f);
+}
+// BRAWL_RESIM_CALLTRACE=<n> (diagnostics): log every call LoopCall sees during the n-th real advance (target, call
+// site, depth of inline frames is not tracked), as "[resim-call] phase target site".
+bool CallTraceActive() {
+    static const unsigned n=Env("BRAWL_RESIM_CALLTRACE",0);
+    static unsigned realAdvances=0;
+    static uint64_t lastAdvance=~0ull;
+    if(!n || session.resimulating) return false;
+    if(session.advances!=lastAdvance) {lastAdvance=session.advances;++realAdvances;}
+    return realAdvances==n;
+}
+LoopCallAction LoopCall(CpuContext* ctx,uint32_t target) {
+    if(!session.active) return LoopCallAction::Invoke;
+    if(CallTraceActive()) std::fprintf(stderr,"[resim-call] %08x %08x %08x\n",Attrib().phase,target,ctx->lr-4);
+    Phase(target);
+    AttribEvent(Attrib().last&0x7FFFFFFFu);  // interpreted code since the previous event
+    Attrib().last=target;
+    if(MajorCall(target) && target!=kRender) Attrib().phase=target;
+    if(hiddenAdvance && Skips().on && Listed(Skips().hidden,target)) {
+        LoopCallDone(target);
+        return LoopCallAction::Skipped;
+    }
+    if(Listed(Skips().inlined,target)) return LoopCallAction::Inline;
+    if(target==kRender && (PhaseMarkers() || Attrib().active || (hiddenAdvance && Skips().on && !Skips().hidden.empty())))
+        return LoopCallAction::Inline;  // the render's own calls come through here
+    return LoopCallAction::Invoke;
+}
+void LoopCallDone(uint32_t target) {
+    if(!session.active) return;
+    if(PhaseLevel()==3 || (PhaseLevel()==1 && MajorCall(target)))  // back in the caller (charged as loop-body glue)
+        BrawlRollbackPhaseMarker(kLoopBody|(session.resimulating?kPhaseResim:0));
+    AttribEvent(target|0x80000000u);
+}
 bool DrivesLoop() {return session.active;}
 void Run(CpuContext* ctx,GuestFunction gameProc) {gameProc(ctx);}
 void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
@@ -650,6 +955,7 @@ void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
     }
     int count=0;
     GekkoGameEvent** events=nullptr;
+    Phase(kPhaseGekko);
     const auto waitStart=std::chrono::steady_clock::now();
     do {
         BrawlOnline::Poll();
@@ -663,11 +969,14 @@ void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
     } while(true);
     bool advanced=false,ended=session.stopRequested;
     unsigned advanceCount=0,advanceIndex=0;
+    bool lightLastBefore=false;  // the previous advance was a light last replay (BRAWL_RESIM_LIGHT_LAST)
     for(int i=0;i<count;++i)if(events[i]->type==GekkoAdvanceEvent)++advanceCount;
     for(int i=0;i<count;++i) {
         auto& e=*events[i];
-        if(e.type==GekkoLoadEvent) Load(e.data.load.frame,ctx);
+        if(e.type==GekkoLoadEvent) {Phase(kPhaseLoad);Load(e.data.load.frame,ctx);resaveDiff.stateKind=3;}
         else if(e.type==GekkoSaveEvent) {
+            Phase(kPhaseSave);
+            DiffResave(e.data.save.frame,resaveDiff.stateKind);
             Save(e.data.save.frame,ctx);
             *e.data.save.state_len=4;
             std::memcpy(e.data.save.state,&e.data.save.frame,4);
@@ -695,14 +1004,31 @@ void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
             const auto pacingStart=DetClock::PacingNanoseconds();
             const auto advanceStart=std::chrono::steady_clock::now();
             DetClock::SetRollbackResimulating(session.resimulating);
+            hiddenAdvance=session.resimulating && advanceIndex+2<advanceCount;
+            const bool lightLast=session.resimulating && advanceIndex+2==advanceCount && LightLast();
+            const bool light=(hiddenAdvance && HideLevel()==2) || lightLast;  // models not drawn (see Light draws)
+            VI_HLE_SetPresentSuppressed(session.resimulating && Skips().on);
+            VI_HLE_SetKeepDisplayCopy(!session.resimulating && lightLastBefore);
+            Phase(kPhaseAdvance|uint64_t(advanceIndex&0xff)<<8|uint64_t(advanceCount&0xff)<<16);
+            inAdvance=true;AttribReset();
+            g3dn::SetDrawSuppressed(light);
             {
-                ResimHide hide(session.resimulating && advanceIndex+2<advanceCount);
+                ResimHide hide(hiddenAdvance && HideLevel()==1);
                 AnchorPads();gameProc(ctx);
                 WaitForResourceLoads(ctx);
             }
+            g3dn::SetDrawSuppressed(false);
+            lightLastBefore=lightLast;
+            VI_HLE_SetKeepDisplayCopy(false);
+            AttribEvent(Attrib().last&0x7FFFFFFFu);inAdvance=false;
+            resaveDiff.stateKind=!session.resimulating?0:advanceIndex+2<advanceCount?2:1;
+            PageHashRecord(e.data.adv.frame,resaveDiff.stateKind);
             ++advanceIndex;++session.advances;
             DetClock::SetRollbackResimulating(false);
+            VI_HLE_SetPresentSuppressed(false);
+            hiddenAdvance=false;
             session.resimulating=false;
+            Phase(kPhaseAdvanceEnd);
             const auto advanceEnd=std::chrono::steady_clock::now();
             std::fprintf(session.trace,"%d,%u,%08x,%08x,%08x,%08x,%d,%08x,",e.data.adv.frame,
                 Read(0x901812A4),Read(0x805A00BC),Read(0x805A0424),Read(0x8059FF58),session.regionHash?Hash():0,e.data.adv.rolling_back,GameplayHash());
@@ -713,11 +1039,14 @@ void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
                 (unsigned long long)(DetClock::PacingNanoseconds()-pacingStart));
         }
     }
+    Phase(kPhaseIdle);
     auto** status=gekko_session_events(session.gekko,&count);
     for(int i=0;i<count;++i) if(status[i]->type==GekkoDesyncDetected) ++session.mismatches;
     std::fflush(session.trace);
     if(advanced && !session.udpPort) ++session.cursor;
     if(ended || (session.cursor>=session.limit && (!session.udpPort || gekko_confirmed_frame(session.gekko)>=int(session.limit)-1))) {
+        WriteResaveDiff();  // before COMPLETE: the harness stops the game when it reads that line
+        WriteAttrib();
         std::fprintf(stderr,"[rollback] COMPLETE frames=%u saves=%llu loads=%llu advances=%llu desyncs=%llu region_differences=%llu\n",
             session.cursor,(unsigned long long)session.saves,(unsigned long long)session.loads,
             (unsigned long long)session.advances,(unsigned long long)session.mismatches,(unsigned long long)session.regionDifferences);

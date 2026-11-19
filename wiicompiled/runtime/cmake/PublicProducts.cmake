@@ -173,6 +173,36 @@ target_precompile_headers(mkw_base_shared PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/inc
 
 
 function(mkw_configure_product target)
+    # Expansion gate, before any other post-link step: the static host instructions per translated guest instruction
+    # against MKW_MAX_EXPANSION (cmake/expansion_gate.py). It reports by default. The static ratio is not a speed
+    # measure: outlining guest operations (MKW_OUTLINE_GUEST_OPS) met 4:1 while the game thread ran ~11% more cycles
+    # per frame, so the per-frame cycle measurement (nf-measure.sh PFRAME=1) decides changes, not this number.
+    # MKW_ENFORCE_EXPANSION_GATE=ON: a product build over the cap fails and its binary is deleted.
+    set(MKW_MAX_EXPANSION "4.0" CACHE STRING "Maximum host instructions per translated guest instruction")
+    option(MKW_ENFORCE_EXPANSION_GATE "Fail the product build and delete the binary over MKW_MAX_EXPANSION" OFF)
+    # MKW_TEST_BINARY: a separately named verification binary (WiiCompiled-test); the gate never enforces there.
+    option(MKW_TEST_BINARY "Build WiiCompiled-test with the expansion gate in report-only mode" OFF)
+    if(MKW_TEST_BINARY)
+        set(mkw_gate_mode "report")
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${target}-test")
+    elseif(MKW_ENFORCE_EXPANSION_GATE)
+        set(mkw_gate_mode "enforce")
+    else()
+        set(mkw_gate_mode "report")
+    endif()
+    if(MKW_PLATFORM_SWITCH)  # first: CMake finds the host's objdump as CMAKE_OBJDUMP, which cannot read AArch64
+        set(mkw_gate_objdump "${DEVKITPRO}/devkitA64/bin/aarch64-none-elf-objdump")
+    elseif(CMAKE_OBJDUMP)
+        set(mkw_gate_objdump "${CMAKE_OBJDUMP}")
+    else()
+        set(mkw_gate_objdump "objdump")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${MKW_RUNTIME_SOURCE_DIR}/cmake/expansion_gate.py" "$<TARGET_FILE:${target}>"
+                "${MKW_RUNTIME_SOURCE_DIR}/../generated/base_translation_output.json" "${mkw_gate_objdump}"
+                "${MKW_MAX_EXPANSION}" "${mkw_gate_mode}"
+        VERBATIM)
     target_link_libraries(${target} PRIVATE GekkoNet)
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
@@ -228,6 +258,35 @@ function(mkw_configure_product target)
         target_link_libraries(${target} PRIVATE android log ${CMAKE_DL_LIBS})
         target_link_options(${target} PRIVATE "LINKER:-z,max-page-size=16384" "LINKER:--no-undefined")
         set_target_properties(${target} PROPERTIES OUTPUT_NAME main)
+    elseif(MKW_PLATFORM_SWITCH)
+        # No loader on Horizon: Dawn calls Mesa NVK's Vulkan entry points directly.
+        set(MKW_HORIZON_VULKAN_LIBRARY "" CACHE FILEPATH "Mesa NVK for Horizon, static (libvulkan.a)")
+        if(NOT EXISTS "${MKW_HORIZON_VULKAN_LIBRARY}")
+            message(FATAL_ERROR "Set MKW_HORIZON_VULKAN_LIBRARY to Mesa NVK's static libvulkan.a for Horizon")
+        endif()
+        target_link_libraries(${target} PRIVATE "${MKW_HORIZON_VULKAN_LIBRARY}" zstd z expat)
+        # NVK's ICD entry point is only referenced by Dawn, which links after it.
+        target_link_options(${target} PRIVATE "LINKER:-u,vk_icdGetInstanceProcAddr"
+            # platform/horizon.c logs every static initializer and these calls, on entry and return
+            "LINKER:--wrap=__libc_init_array" "LINKER:--wrap=fopen" "LINKER:--wrap=open" "LINKER:--wrap=opendir"
+            "LINKER:--wrap=readdir" "LINKER:--wrap=stat" "LINKER:--wrap=mkdir" "LINKER:--wrap=rename"
+            "LINKER:--wrap=unlink" "LINKER:--wrap=pthread_create" "LINKER:--wrap=pthread_join"
+            "LINKER:--wrap=pthread_cond_wait" "LINKER:--wrap=nanosleep" "LINKER:--wrap=exit"
+            "LINKER:--wrap=abort" "LINKER:--wrap=__cxa_throw" "LINKER:--wrap=__emutls_get_address"
+            # Native thread_local: each new thread sets its thread pointer before its entry runs
+            "LINKER:--wrap=threadCreate")
+        # An object, not part of a library: SDL and imgui reference it from later on the link line.
+        target_sources(${target} PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/src/platform/horizon.c")
+        set_source_files_properties("${MKW_RUNTIME_SOURCE_DIR}/src/platform/horizon.c" PROPERTIES
+            SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON  # C, not the C++ precompiled header
+            COMPILE_OPTIONS "-fexceptions;-funwind-tables")  # C++ exceptions unwind through its __cxa_throw wrapper
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND "${Python3_EXECUTABLE}" "${MKW_RUNTIME_SOURCE_DIR}/cmake/horizon_nop_chkfeat.py" "$<TARGET_FILE:${target}>"
+            COMMAND "${HORIZON_NACPTOOL}" --create WiiCompiled WiiCompiled 1.0 "$<TARGET_FILE_DIR:${target}>/${target}.nacp"
+            COMMAND "${HORIZON_ELF2NRO}" "$<TARGET_FILE:${target}>" "$<TARGET_FILE_DIR:${target}>/${target}.nro"
+                    "--nacp=$<TARGET_FILE_DIR:${target}>/${target}.nacp"
+            VERBATIM)
     endif()
     if(MKW_PLATFORM_WINDOWS)
         foreach(runtime_dll libc++.dll libunwind.dll)

@@ -64,11 +64,47 @@ void InitializeHostLightFromGuest(GXLightObj& host, uint32_t guestAddr) {
 // Light Object Load
 // ============================================================================
 
+// The XF packet GXLoadLightObjImm writes for the guest object, built from its bytes: 0x10, the register word (light
+// idx's 16 words at 0x600 + 0x10 * idx), three zero words, then the object's 13 words from +0x0C (colour, cosine and
+// distance attenuation, position, direction) - big-endian in guest memory as in the FIFO. The component path reads
+// them into a host GXLightObj (the colour word split into bytes and packed back; the floats by their bits; the
+// direction negated once here and once by GXInitLightDir) and writes them back in that order, so the bytes are the
+// same; only for a light id of one bit (GXLoadLightObjImm's log2 of it is then that bit's index). Each load was 13
+// guest reads, four Aurora setters and 17 FIFO writes (the count per frame is on the [vi] gx raw begins line).
+static bool BuildLightPacket(uint32_t la, uint32_t lid, uint8_t (&packet)[69]) {
+    if (lid == 0 || (lid & (lid - 1)) != 0) return false;
+    const auto* src = static_cast<const uint8_t*>(GuestToHostPtr(la + kColorOffset, 52));
+    if (src == nullptr) return false;
+    const uint32_t reg = (0x600u + 0x10u * static_cast<uint32_t>(__builtin_ctz(lid))) | (0xFu << 16);
+    packet[0] = 0x10;
+    packet[1] = static_cast<uint8_t>(reg >> 24);
+    packet[2] = static_cast<uint8_t>(reg >> 16);
+    packet[3] = static_cast<uint8_t>(reg >> 8);
+    packet[4] = static_cast<uint8_t>(reg);
+    std::memset(packet + 5, 0, 12);
+    std::memcpy(packet + 17, src, 52);
+    return true;
+}
+
 extern "C" void GX__LoadLightObjImm_HLE(uint32_t la, uint32_t lid) {
+    G3D_REC_HLE(g3dn::kRecLoadLightObj, la, lid);
     if (!ValidateGuestLightObj(la, "GXLoadLightObjImm")) return;
+    uint8_t packet[69];
+    const int mode = GxRawPacketMode();
+    const bool built = mode != 0 && BuildLightPacket(la, lid, packet);
+    if (built && mode == 1) {
+        GxAuroraFifoWrite(packet, sizeof packet);  // this thread's FIFO (the draw worker's: its job's)
+        if (!t_gxDrawWorker) ++g_gxLightPackets;
+        return;
+    }
     GXLightObj host{};
     InitializeHostLightFromGuest(host, la);
     GXLoadLightObjImm(&host, static_cast<GXLightID>(lid));
+    namespace d = aurora::gx::fifo::detail;
+    if (built && !d::sInDisplayList) {  // GX_RAW_BEGIN=2: the packet against the bytes just written
+        GxNoteLightPacketCheck(d::sBufferSize >= sizeof packet &&
+                               std::memcmp(d::sBufferData + d::sBufferSize - sizeof packet, packet, sizeof packet) == 0);
+    }
 }
 PPC_NATIVE_OVERRIDE_VOID(801F2418, GX__LoadLightObjImm_HLE, (uint32_t la, uint32_t lid), (la, lid));
 

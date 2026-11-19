@@ -1,5 +1,6 @@
 #include <vector>
 #include "guest_code_patch.h"
+#include "guest_thread_guard.h"
 #include "hle/gecko.h"
 #include "save_states.h"
 #include "frame_input.h"
@@ -153,7 +154,9 @@ struct ViState {
     bool flushArmed = false;
 };
 
-std::mutex g_viMutex;
+// Guest-thread state (guest_thread_guard.h): the VI HLE, retrace pumping and Aurora's frame-wait callback all run on
+// the guest CPU's thread. ~35 lock/unlock pairs a frame in P+ Training as a mutex.
+GuestThreadGuard g_viGuard{"g_viGuard"};
 ViState g_vi;
 
 
@@ -194,7 +197,7 @@ struct DisplayLock {
     Clock::time_point lastQuery{};
     bool logged = false;
 };
-DisplayLock g_displayLock;  // under g_viMutex
+DisplayLock g_displayLock;  // under g_viGuard
 
 void RefreshDisplayLockLocked(Clock::time_point now) {
     DisplayLock& d = g_displayLock;
@@ -282,6 +285,13 @@ constexpr std::chrono::microseconds kFinalSpinWindow{500};
 
 void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false,
                          std::chrono::microseconds spinWindow = 750us) {
+    // BRAWL_PACE_NO_SPIN=1 (measurement): sleep to the deadline instead of busy-polling its last 500-750 us. Every frame
+    // with slack spun that whole window (~2.3M cycles, ~20% of the game thread's cycles in 60 fps Training), which the
+    // per-frame cycle counts (nf-measure PFRAME) charged as game work; a CPU-bound Switch has no slack to spin in.
+    static const bool noSpin = std::getenv("BRAWL_PACE_NO_SPIN") != nullptr;
+    if (noSpin) {
+        finishWithSpin = false;
+    }
     const auto now = Clock::now();
     if (now >= deadline) {
         return;
@@ -399,6 +409,16 @@ static std::atomic<bool> s_inAdvanceRetrace{false};
 // end the freshly pre-warmed empty frame and show it as a black frame group.
 static std::atomic<bool> s_presentSequenceActive{false};
 
+// VI_HLE_SetPresentSuppressed (hle_stubs.h): set by rollback while it replays frames nobody will see.
+static std::atomic<bool> s_presentSuppressed{false};
+} // namespace
+void VI_HLE_SetPresentSuppressed(bool suppressed) { s_presentSuppressed.store(suppressed, std::memory_order_relaxed); }
+bool VI_HLE_PresentSuppressed() { return s_presentSuppressed.load(std::memory_order_relaxed); }
+static std::atomic<bool> s_keepDisplayCopy{false};
+void VI_HLE_SetKeepDisplayCopy(bool keep) { s_keepDisplayCopy.store(keep, std::memory_order_relaxed); }
+bool VI_HLE_KeepDisplayCopy() { return s_keepDisplayCopy.load(std::memory_order_relaxed); }
+namespace {
+
 // Frames the guest actually handed to the presenter (an XFB was ready).
 static std::atomic<uint32_t> s_presentedXfbFrames{0};
 extern "C" { extern int g_spmDrawDump; }  // aurora command_processor (SPM bring-up diagnostics)
@@ -455,7 +475,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     uint32_t currentFb = 0;
     bool isBlack = false;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         
         // Commit pending state if VIFlush armed it (see ViState).
@@ -586,7 +606,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
     if (DetClock::Enabled()) {
         for (int catchUpCount = 0; catchUpCount < maxToProcess; ++catchUpCount) {
             {
-                std::lock_guard<std::mutex> lock(g_viMutex);
+                std::lock_guard<GuestThreadGuard> lock(g_viGuard);
                 if (!g_vi.initialized) {
                     return advancedAny;
                 }
@@ -606,7 +626,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
         Clock::time_point target;
         auto now = Clock::now();
         {
-            std::lock_guard<std::mutex> lock(g_viMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             if (!g_vi.initialized) {
                 return advancedAny;
             }
@@ -632,7 +652,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
 void VI_HLE_ForceRetrace(CpuContext* ctx) {
     Clock::time_point target;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         target = g_vi.lastRetrace + ActiveIntervalLocked();
     }
@@ -677,7 +697,7 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess) {
 }
 
 uint64_t VI_HLE_DetNextRetraceTicks() {
-    std::lock_guard<std::mutex> lock(g_viMutex);
+    std::lock_guard<GuestThreadGuard> lock(g_viGuard);
     if (!g_vi.initialized) {
         return DetClock::kNever;
     }
@@ -687,7 +707,7 @@ uint64_t VI_HLE_DetNextRetraceTicks() {
 void VI_HLE_WaitForNextRetracePoll() {
     Clock::time_point retraceDeadline;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         retraceDeadline = g_vi.lastRetrace + ActiveIntervalLocked();
     }
@@ -758,6 +778,21 @@ struct FrameTimes {
     int frames = 0;
 };
 
+// Called once per presented frame, on the game's thread. Does nothing: it is a uprobe target, so perf can split a
+// cycles recording into frames (cycles per frame, independent of the host clock, which swings 1.5-5 GHz here as the
+// mostly sleeping thread runs). The uprobe also reads the arguments (first and second argument registers): this
+// thread's time blocked during the frame waiting for Aurora's GX thread and for its frame worker, which lengthens the
+// frame without costing it cycles. Never inlined, so the symbol and the call stay.
+extern "C" [[gnu::noinline]] [[gnu::used]] void BrawlFrameCpuMarker(uint64_t gxWaitNanos, uint64_t frameWorkerWaitNanos) {
+    asm volatile("" : : "r"(gxWaitNanos), "r"(frameWorkerWaitNanos) : "memory");
+}
+extern "C" uint64_t aurora_gx_take_sync_wait_nanos();
+extern "C" uint64_t aurora_take_frame_worker_wait_nanos();
+// Summed over the presented frames of the current fps-log window (NSMBW_LOG_FPS).
+static uint64_t s_frameUnmergedDraws = 0, s_frameMergedDraws = 0;
+void G3dNativeLogStats(double frames);  // hle/g3d_native.cpp: the native nw4r g3d draw path's counters
+void GameNativesLogStats(double frames);  // hle/game_natives.cpp: the game-code natives' counters
+
 static bool LogFpsEnabled() {
     static const bool on = std::getenv("NSMBW_LOG_FPS") != nullptr;
     return on;
@@ -770,11 +805,25 @@ uint32_t DvdReadCount();
 // Test captures: shots.txt beside the executable lists seconds after the first presented frame; at each, the next
 // rendered frame is saved as shot_<n>.bmp (Aurora reads it back from the GPU, so it works with the window covered).
 // shots.txt: capture times, each "<seconds>" after launch or "<scene>+<seconds>" after the game first enters <scene>.
+// "<scene>#<frames>": after that many presented frames in <scene> instead (frame-exact, for comparing builds).
 static std::mutex s_shotSceneMutex;
 static std::unordered_map<std::string, Clock::time_point> s_shotSceneStart;
+static std::unordered_map<std::string, uint32_t> s_shotSceneStartFrame;
 void NoteSceneForCaptures(const std::string& scene) {
     std::lock_guard<std::mutex> lock(s_shotSceneMutex);
     s_shotSceneStart.emplace(scene, Clock::now());
+    const bool first = s_shotSceneStartFrame.emplace(scene, s_presentedXfbFrames.load(std::memory_order_relaxed)).second;
+    // BRAWL_TEST_SEED=<n> (test captures): on entering each scene the first time, the game's random generators
+    // (the three seeds Brawl Online's WriteMatchSeeds sets) get fixed values from n and the scene's name, so runs with
+    // the same pad script make the same random choices (Training's CPU fighter) without deterministic timing.
+    if (const char* seed = std::getenv("BRAWL_TEST_SEED"); seed != nullptr && first) {
+        uint32_t h = static_cast<uint32_t>(std::strtoul(seed, nullptr, 0)) ^ 0x9E3779B9u;
+        for (const char c : scene) h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
+        Memory::Write32(0x805A00BC, h & 0x7FFFFFFFu);
+        Memory::Write32(0x805A0424, (h * 2654435761u) & 0x7FFFFFFFu);
+        Memory::Write32(0x8059FF58, h * 40503u + 1u);
+        RT_LOGF(RT_TAG_VI, "[testseed] %s: seeded from %s\n", scene.c_str(), seed);
+    }
 }
 
 void RequestScheduledCaptures() {
@@ -789,13 +838,14 @@ void RequestScheduledCaptures() {
         return false;
     }();
     (void)frameCaptureRequested;
-    struct Shot { std::string scene; double seconds; };
+    struct Shot { std::string scene; double seconds; long frames = -1; };
     static const std::vector<Shot> shots = [] {
         std::vector<Shot> out;
         std::ifstream in("shots.txt");
         for (std::string token; in >> token;) {
-            const size_t plus = token.find('+');
-            if (plus == std::string::npos) out.push_back({{}, std::atof(token.c_str())});
+            const size_t plus = token.find('+'), hash = token.find('#');
+            if (hash != std::string::npos) out.push_back({token.substr(0, hash), 0.0, std::atol(token.c_str() + hash + 1)});
+            else if (plus == std::string::npos) out.push_back({{}, std::atof(token.c_str())});
             else out.push_back({token.substr(0, plus), std::atof(token.c_str() + plus + 1)});
         }
         return out;
@@ -805,6 +855,17 @@ void RequestScheduledCaptures() {
     static std::string path;
     if (next >= shots.size()) return;
     Clock::time_point base = start;
+    if (shots[next].frames >= 0) {
+        std::lock_guard<std::mutex> lock(s_shotSceneMutex);
+        const auto it = s_shotSceneStartFrame.find(shots[next].scene);
+        if (it == s_shotSceneStartFrame.end() ||
+            s_presentedXfbFrames.load(std::memory_order_relaxed) - it->second < static_cast<uint32_t>(shots[next].frames))
+            return;
+        path = "shot_" + std::to_string(next) + ".bmp";
+        aurora_request_frame_capture(0, path.c_str());
+        ++next;
+        return;
+    }
     if (!shots[next].scene.empty()) {
         std::lock_guard<std::mutex> lock(s_shotSceneMutex);
         const auto it = s_shotSceneStart.find(shots[next].scene);
@@ -844,10 +905,38 @@ static void LogWatchedWords() {
     }
 }
 
+// After aurora_end_frame: the frame is no longer active, the XFB it showed is consumed, and the next frame is begun so
+// subsequent GX work has a valid frame context (Aurora's frame worker prepares it only once a frame is begun).
+static void FinishEndedFrame(bool presentedXfb) {
+    g_auroraFrameActive.store(false, std::memory_order_release);
+    g_auroraFrameHadWork.store(false, std::memory_order_release);
+    if (presentedXfb) {
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
+        g_vi.hasValidXfb = false;
+        g_vi.readyXfb = 0;
+    }
+    // Pre-warm the next frame so subsequent GX work has a valid frame context.
+    {
+        UpdateAuroraAndProcessEvents();
+        if (BeginAuroraFrame()) {
+            g_auroraFrameActive.store(true, std::memory_order_release);
+        }
+    }
+}
+
 void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     LogWatchedWords();
     GuestCodePatch::SyncFrame();  // code patches made outside the code handler (mod plugins)
     if (s_presentSequenceActive.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // A frame rollback replays to catch up (VI_HLE_SetPresentSuppressed): it ends as below, so Aurora's frame
+    // boundaries, frame-latent EFB readbacks and the VI/XFB state keep their schedule, but it is not shown, counted,
+    // paced or captured.
+    if (VI_HLE_PresentSuppressed()) {
+        aurora_end_frame_unpresented();
+        FinishEndedFrame(presentedXfb);
+        s_presentSequenceActive.store(false, std::memory_order_release);
         return;
     }
     RequestScheduledCaptures();
@@ -906,7 +995,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         uint64_t intervalNanos = 0;
         uint32_t retraceCount = 0;
         {
-            std::lock_guard<std::mutex> lock(g_viMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             EnsureInitializedLocked();
             paceDeadline = g_vi.lastRetrace + ActiveIntervalLocked();
             retraceCount = g_vi.retraceCount;
@@ -955,15 +1044,22 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
 
     const Clock::time_point endFrameStart = Clock::now();
     aurora_end_frame();
+    if (presentedXfb) {  // Aurora's draw commands this frame (unmerged) and the primitives merged into them
+        if (const AuroraStats* stats = aurora_get_stats()) {
+            s_frameUnmergedDraws += stats->drawCallCount;
+            s_frameMergedDraws += stats->mergedDrawCallCount;
+        }
+    }
     const Clock::time_point paceStart = Clock::now();
     if (paceThisFrame) {
         PaceToRetraceBoundary(paceDeadline);
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         s_lastPacedRetraceCount = g_vi.retraceCount;
     }
     // Always on: a frame that took over 20 ms (a dropped frame at 60) goes to the log with where the
     // time went, so a report of drops on someone's machine comes with its cause. At most 30 a minute.
     if (presentedXfb) {
+        BrawlFrameCpuMarker(aurora_gx_take_sync_wait_nanos(), aurora_take_frame_worker_wait_nanos());
         static Clock::time_point s_lastEnd{}, s_windowStart{};
         static int s_logged = 0;
         static uint64_t s_lastGx = 0, s_lastDvd = 0;
@@ -1024,6 +1120,11 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
                     n * 1000.0 / window, times.gameMs / n, gxNanos / 1e6 / n, lockNanos / 1e6 / n, draws / n,
                     copies / n, creates / n, times.endFrameMs / n, times.paceMs / n, times.worstMs,
                     std::sqrt(std::max(0.0, times.sumSq / n - (window / n) * (window / n))), times.slow);
+            RT_LOGF(RT_TAG_VI, "aurora: %.1f draw commands (unmerged), %.1f merged primitives per frame\n",
+                    s_frameUnmergedDraws / n, s_frameMergedDraws / n);
+            s_frameUnmergedDraws = s_frameMergedDraws = 0;
+            G3dNativeLogStats(n);
+            GameNativesLogStats(n);
             static uint64_t lastInstructions = 0;
             const uint64_t instructions = PpcInterpreter::InstructionCount();
             RT_LOGF(RT_TAG_VI, "interpreter: %.2fM instructions per frame\n", (instructions - lastInstructions) / 1e6 / n);
@@ -1046,20 +1147,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         }
     }
     settings_overlay::AdvancePresentedFrame();
-    g_auroraFrameActive.store(false, std::memory_order_release);
-    g_auroraFrameHadWork.store(false, std::memory_order_release);
-    if (presentedXfb) {
-        std::lock_guard<std::mutex> lock(g_viMutex);
-        g_vi.hasValidXfb = false;
-        g_vi.readyXfb = 0;
-    }
-    // Pre-warm the next frame so subsequent GX work has a valid frame context.
-    {
-        UpdateAuroraAndProcessEvents();
-        if (BeginAuroraFrame()) {
-            g_auroraFrameActive.store(true, std::memory_order_release);
-        }
-    }
+    FinishEndedFrame(presentedXfb);
 }
 
 // -----------------------------------------------------------------------------
@@ -1076,7 +1164,7 @@ void VI_HLE_SetXfbReady(uint32_t xfbAddr) {
             break;
         }
     }
-    std::lock_guard<std::mutex> lock(g_viMutex);
+    std::lock_guard<GuestThreadGuard> lock(g_viGuard);
     g_vi.hasValidXfb = true;
     g_vi.readyXfb = xfbAddr;
     if (g_vi.currentFrameBuffer == 0 && g_vi.nextFrameBuffer == 0) {
@@ -1097,7 +1185,7 @@ static void SeedViStateForInit(CpuContext* ctx, const char* who)
 {
     RT_LOG(RT_TAG_VI) << who << " called: seeding VI state (HLE)" << std::endl;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
     }
     ViSetR3(ctx, 0);
@@ -1145,7 +1233,7 @@ extern "C" void VISetPreRetraceCallback_HLE(CpuContext* ctx)
     const uint32_t newCb = ctx ? ctx->gpr[3] : 0;
     uint32_t prev = 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         prev = g_vi.preRetraceCallback;
         g_vi.preRetraceCallback = newCb;
@@ -1163,7 +1251,7 @@ extern "C" void VISetPostRetraceCallback_HLE(CpuContext* ctx)
     const uint32_t newCb = ctx ? ctx->gpr[3] : 0;
     uint32_t prev = 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         prev = g_vi.postRetraceCallback;
         g_vi.postRetraceCallback = newCb;
@@ -1202,7 +1290,7 @@ extern "C" void VIConfigure_HLE(CpuContext* ctx)
     const uint32_t decodedTvFormat =
         ExtractTvFormat(static_cast<uint32_t>(renderMode.viTVmode));
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
 
         // Write to PENDING state - will be committed on next retrace after VIFlush
@@ -1229,7 +1317,7 @@ extern "C" void VIFlush_HLE(CpuContext* ctx)
 {
     uint32_t guestNextFb = 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
 
         if (g_vi.pendingNextFrameBuffer == 0) {
@@ -1266,7 +1354,7 @@ extern "C" void VISetNextFrameBuffer_HLE(CpuContext* ctx)
 {
     const uint32_t fbPtr = ctx ? ctx->gpr[3] : 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         // Write to PENDING state - will be committed on next retrace after VIFlush
         g_vi.pendingNextFrameBuffer = fbPtr;
@@ -1283,7 +1371,7 @@ extern "C" void VIGetNextFrameBuffer_HLE_801bab24(CpuContext* ctx)
 {
     uint32_t fb = 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         // Return PENDING value - what was set by VISetNextFrameBuffer
         fb = g_vi.pendingNextFrameBuffer;
@@ -1296,7 +1384,7 @@ extern "C" void VISetBlack_HLE(CpuContext* ctx)
 {
     const bool makeBlack = ctx ? (ctx->gpr[3] != 0) : false;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         // Write to PENDING state - will be committed on next retrace after VIFlush
         g_vi.pendingBlack = makeBlack;
@@ -1309,7 +1397,7 @@ extern "C" void VIGetRetraceCount_HLE(CpuContext* ctx)
 {
     uint32_t count = 0;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         count = g_vi.retraceCount;
     }
@@ -1322,7 +1410,7 @@ extern "C" void VIGetNextField_HLE(CpuContext* ctx)
 {
     bool fieldOdd = false;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         fieldOdd = g_vi.fieldOdd;
     }
@@ -1337,7 +1425,7 @@ extern "C" void VIGetCurrentLine_HLE(CpuContext* ctx)
     std::chrono::nanoseconds interval{16666us};
     Clock::time_point last;
     {
-        std::lock_guard<std::mutex> lock(g_viMutex);
+        std::lock_guard<GuestThreadGuard> lock(g_viGuard);
         EnsureInitializedLocked();
         height = g_vi.xfbHeight;
         interval = ActiveIntervalLocked();
@@ -1347,7 +1435,7 @@ extern "C" void VIGetCurrentLine_HLE(CpuContext* ctx)
     if (DetClock::Enabled()) {
         uint64_t lastTicks = 0;
         {
-            std::lock_guard<std::mutex> lock(g_viMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             lastTicks = g_vi.detLastRetraceTicks;
         }
         const uint64_t now = DetClock::Now();
@@ -1372,7 +1460,7 @@ extern "C" void VIWaitForRetrace_HLE(CpuContext* ctx)
         const int32_t irqState = OS__DisableInterrupts_HLE();
         uint32_t retraceCount = 0;
         {
-            std::lock_guard<std::mutex> lock(g_viMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             EnsureInitializedLocked();
             retraceCount = g_vi.retraceCount;
         }
@@ -1382,7 +1470,7 @@ extern "C" void VIWaitForRetrace_HLE(CpuContext* ctx)
             OSSleepThread_HLE(cpu);
 
             {
-                std::lock_guard<std::mutex> lock(g_viMutex);
+                std::lock_guard<GuestThreadGuard> lock(g_viGuard);
                 EnsureInitializedLocked();
                 if (g_vi.retraceCount != retraceCount) {
                     break;
@@ -1395,7 +1483,7 @@ extern "C" void VIWaitForRetrace_HLE(CpuContext* ctx)
         std::chrono::nanoseconds interval{16666us};
         Clock::time_point target;
         {
-            std::lock_guard<std::mutex> lock(g_viMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             EnsureInitializedLocked();
             interval = ActiveIntervalLocked();
             target = g_vi.lastRetrace + interval;

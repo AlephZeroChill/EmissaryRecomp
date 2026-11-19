@@ -3,10 +3,12 @@
 #include "save_states.h"
 
 #include "abi_bridge.h"
+#include "axfx_async.h"
 #include "det_clock.h"
 #include "fiber_manager.h"
 #include "generated/RuntimeConfig.h"
 #include "guest_code_patch.h"
+#include "guest_thread_guard.h"
 #include "hle/os/os_internal.h"
 #include "host_context.h"
 #include "memory.h"
@@ -33,9 +35,9 @@
 size_t DvdPendingCallbackCount();  // hle/storage/dvd.cpp
 
 namespace OsHleInternal {
-extern std::mutex gSleepTimerMutex;
+extern GuestThreadGuard gSleepTimerGuard;
 extern std::vector<SleepTimerEntry> gSleepTimers;
-extern std::mutex gOutstandingParkMutex;
+extern GuestThreadGuard gOutstandingParkGuard;
 extern std::unordered_set<uint32_t> gOutstandingParks;
 } // namespace OsHleInternal
 
@@ -134,16 +136,17 @@ void Unpack(const std::vector<uint8_t>& packed, uint8_t* out, size_t size) {
 
 // Runs on the helper fiber: every guest fiber (the main one included) is switched out here.
 void TakeSnapshot(Snapshot& s) {
+    AxfxAsync::Join();  // no AXFX job still writing guest memory (axfx_async.h)
     if (g_packer.joinable()) g_packer.join();
     s.valid = false;
     s.cpu = GetPersistentCpuContext();
     s.threads = Fiber::GuestFiberManager::CopyFibers(s.currentThread);
     {
-        std::lock_guard<std::mutex> lock(OsHleInternal::gSleepTimerMutex);
+        std::lock_guard<GuestThreadGuard> lock(OsHleInternal::gSleepTimerGuard);
         s.sleepTimers = OsHleInternal::gSleepTimers;
     }
     {
-        std::lock_guard<std::mutex> lock(OsHleInternal::gOutstandingParkMutex);
+        std::lock_guard<GuestThreadGuard> lock(OsHleInternal::gOutstandingParkGuard);
         s.parks = OsHleInternal::gOutstandingParks;
     }
     s.stacks.clear();
@@ -175,6 +178,7 @@ void TakeSnapshot(Snapshot& s) {
 }
 
 void PutBack(const Snapshot& s) {
+    AxfxAsync::Join();  // no AXFX job still writing guest memory (axfx_async.h)
     if (g_packer.joinable()) g_packer.join();
     // All fibers are now suspended, so their current switch positions are
     // authoritative. Never overwrite the live return path below SwitchBelow's pad.
@@ -198,11 +202,11 @@ void PutBack(const Snapshot& s) {
     GetPersistentCpuContext() = s.cpu;
     Fiber::GuestFiberManager::RestoreFibers(s.threads, s.currentThread);
     {
-        std::lock_guard<std::mutex> lock(OsHleInternal::gSleepTimerMutex);
+        std::lock_guard<GuestThreadGuard> lock(OsHleInternal::gSleepTimerGuard);
         OsHleInternal::gSleepTimers = s.sleepTimers;
     }
     {
-        std::lock_guard<std::mutex> lock(OsHleInternal::gOutstandingParkMutex);
+        std::lock_guard<GuestThreadGuard> lock(OsHleInternal::gOutstandingParkGuard);
         OsHleInternal::gOutstandingParks = s.parks;
     }
     g_justLoaded = true;
@@ -276,7 +280,11 @@ void MarkStackTop(void* top) { g_fibers[HostContext::Current()].top = static_cas
     pad[0] = 0;
     // Make the whole array escape so optimization cannot shrink it to pad[0].
     asm volatile("" : : "r"(pad) : "memory");
-    HostContext::Switch(target);
+    {
+        // Another guest thread runs until this fiber resumes: none of that is this fiber's HLE time.
+        HZ_EXCLUSIVE_PAUSE_IF_ACTIVE();
+        HostContext::Switch(target);
+    }
     asm volatile("" : : "r"(pad) : "memory");
     ResumeSaved(HostContext::Current());
 }

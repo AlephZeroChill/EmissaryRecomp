@@ -30,7 +30,9 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
+#if !defined(__SWITCH__)
 #include <ifaddrs.h>
+#endif
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -907,6 +909,13 @@ std::vector<LocalInterface> LocalInterfaces() {
             }
         }
         break;
+    }
+#elif defined(__SWITCH__)
+    // libnx reports the console's one IPv4 address (0 when offline); no broadcast address.
+    if (const long host = gethostid(); host != 0) {
+        LocalInterface entry;
+        entry.ip = ntohl(static_cast<uint32_t>(host));
+        result.push_back(entry);
     }
 #else
     ifaddrs* list = nullptr;

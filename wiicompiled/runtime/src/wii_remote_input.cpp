@@ -31,6 +31,7 @@
 
 void NoteDrawDumpScene(const std::string& scene);  // gx_vertex.cpp: scene-relative drawdump.txt
 void NoteSceneForCaptures(const std::string& scene);  // vi.cpp: scene-relative shots.txt
+void G3dNativeNoteScene();  // hle/g3d_native.cpp: drops the native g3d path's per-scene caches
 uint32_t SpmPresentedFrames();                     // vi.cpp
 
 namespace WiiRemoteInput {
@@ -811,6 +812,7 @@ void NoteGameReport(const std::string& line) {
     const std::string scene = line.substr(arrow + 3, end - arrow - 3);
     NoteDrawDumpScene(scene);
     NoteSceneForCaptures(scene);
+    G3dNativeNoteScene();
     if (!Script().active) return;
     std::lock_guard<std::mutex> lock(g_sceneMutex);
     if (!scene.empty()) (scene.rfind("sq", 0) == 0 ? g_currentSequence : g_currentScene) = scene;

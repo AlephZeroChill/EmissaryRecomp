@@ -50,24 +50,37 @@ inline void UpdateCurrentContextInterruptFlag(bool enabled)
 }
 } // namespace
 
+namespace {
+// The flag's only writers run on the game thread (guest code, every guest thread being a fiber there, and the OS/VI
+// HLEs it calls), so the old value is a plain load and the new one a release store, which other threads' acquire loads
+// (OS_HLE_InterruptsEnabled) pair with as before. An atomic exchange was a full barrier (x86 lock xchg; an exclusive
+// load/store loop plus barrier on the A57) on calls translated code makes thousands of times per frame.
+inline bool SetInterruptsEnabledOnGameThread(bool enabled)
+{
+    const bool previous = g_interrupts_enabled.load(std::memory_order_relaxed);
+    if (previous != enabled) g_interrupts_enabled.store(enabled, std::memory_order_release);
+    return previous;
+}
+} // namespace
+
 // Minimal, host-side replacements for early OS interrupt/exception helpers.
 extern "C" int32_t OS__DisableInterrupts_HLE()
 {
-    const bool previous = g_interrupts_enabled.exchange(false);
+    const bool previous = SetInterruptsEnabledOnGameThread(false);
     UpdateCurrentContextInterruptFlag(false);
     return previous ? 1 : 0;
 }
 
 extern "C" int32_t OS__RestoreInterrupts_HLE(int32_t level)
 {
-    const bool prev = g_interrupts_enabled.exchange(level != 0);
+    const bool prev = SetInterruptsEnabledOnGameThread(level != 0);
     UpdateCurrentContextInterruptFlag(level != 0);
     return prev ? 1 : 0;
 }
 
 extern "C" int32_t OS__EnableInterrupts_HLE()
 {
-    const bool prev = g_interrupts_enabled.exchange(true);
+    const bool prev = SetInterruptsEnabledOnGameThread(true);
     UpdateCurrentContextInterruptFlag(true);
     return prev ? 1 : 0;
 }
@@ -482,27 +495,41 @@ PPC_NATIVE_OVERRIDE_VOID(80211ad0, IPCWriteReg_HLE, (uint32_t index, uint32_t va
 PPC_NATIVE_OVERRIDE(80211ac0, IPCReadReg_HLE, uint32_t, (uint32_t index), (index));
 
 // ----------------------------------------------------------------------------
-// IPCCltInit (0x802247D0): hardware parts (interrupt handler, MMIO) are stubbed, but we still
-// call translated IPCInit (0x802242A0) to init the IPC buffer globals; skip it and
-// IPCGetBufferLo/Hi return 0, so ISFS_OpenLib fails with "APP ERROR: Not enough IPC arena".
+// IPCCltInit (Brawl 0x80211F28), as Brawl's runs it, once (its Initialized flag, r13-0x3824): IPCInit (translated,
+// IPCBufferLo/Hi from __OSGetIPCBufferLo/Hi; without it ISFS_OpenLib finds no IPC arena), then the 4 KiB iosHeap at the
+// buffer's low end - -22 when it does not fit below IPCBufferHi, else iosCreateHeap(lo, 0x1000) with its id at
+// r13-0x5754 and IPCSetBufferLo(lo + 0x1000) - then the IOS request tables (0x80213994). Left out: the IPC interrupt
+// handler and unmask and the IPC control register write (IPCWriteReg_HLE aborts), hardware the HLE IOS bypasses.
 // ----------------------------------------------------------------------------
 extern "C" int32_t IPCCltInit_HLE(CpuContext* ctx)
 {
-    RT_LOG(RT_TAG_OS) << "IPCCltInit_HLE called: calling IPCInit for buffer setup" << std::endl;
-    
-    // Sets IPCBufferLo/Hi + Initialized (NSMBW 0x8056E004/B0/A0) from __OSGetIPCBufferLo/Hi.
-    InvokeIndirectCpu(0x80211A2Cu, ctx);
+    constexpr uint32_t kInitializedOffset = 0x3824u;  // IPCCltInit's Initialized flag
+    constexpr uint32_t kBufferLoOffset = 0x3844u;     // IPCBufferLo (IPCGetBufferLo 0x80211AE8, IPCSetBufferLo 0x80211AF0)
+    constexpr uint32_t kBufferHiOffset = 0x3840u;     // IPCBufferHi (IPCGetBufferHi 0x80211AE0)
+    constexpr uint32_t kIosHeapIdOffset = 0x5754u;    // the iosHeap's id
+    constexpr uint32_t kIosHeapSize = 0x1000u;
+    const uint32_t r13 = ctx->gpr[13];
+    if (Memory::Read32(r13 - kInitializedOffset) != 0) return 0;
+    Memory::Write32(r13 - kInitializedOffset, 1);
 
-    // Advance the buffer lo pointer by 0x1000 (iosHeap size), matching real IPCCltInit.
-    uint32_t bufferLo = Memory::Read32(ctx->gpr[13] - 0x6F24u); // SPM IPCBufferLo (IPCGetBufferLo)
-    uint32_t newBufLo = bufferLo + 0x1000; // Advance by 4KB for iosHeap
-    Memory::Write32(ctx->gpr[13] - 0x6F24u, newBufLo);
-    
-    RT_LOG(RT_TAG_OS) << "IPCCltInit: IPC buffer lo advanced from 0x" << std::hex << bufferLo
-              << " to 0x" << newBufLo << std::dec << std::endl;
-    
-    // Skip the rest (interrupt handler, IPC MMIO access) - those are hardware-specific
-    return 0; // Success
+    InvokeIndirectCpu(0x80211A2Cu, ctx);  // IPCInit
+    const uint32_t lo = Memory::Read32(r13 - kBufferLoOffset);
+    if (lo + kIosHeapSize > Memory::Read32(r13 - kBufferHiOffset)) return -22;  // IPC_EINVAL: no room for the iosHeap
+
+    const uint32_t savedLr = ctx->lr;
+    ctx->gpr[3] = lo;
+    ctx->gpr[4] = kIosHeapSize;
+    ctx->lr = 0x80211F88u;  // as called from IPCCltInit
+    InvokeDirectCpu<0x80213468u>(ctx);  // iosCreateHeap
+    Memory::Write32(r13 - kIosHeapIdOffset, ctx->gpr[3]);
+    Memory::Write32(r13 - kBufferLoOffset, lo + kIosHeapSize);  // IPCSetBufferLo
+    ctx->lr = 0x80211FBCu;
+    InvokeDirectCpu<0x80213994u>(ctx);  // the IOS request tables
+    ctx->lr = savedLr;
+
+    RT_LOG(RT_TAG_OS) << "IPCCltInit: iosHeap 0x" << std::hex << lo << "+0x1000, IPC buffer lo now 0x" << lo + kIosHeapSize
+                      << std::dec << std::endl;
+    return 0;
 }
 
 PPC_NATIVE_OVERRIDE(80211F28, IPCCltInit_HLE, int32_t, (CpuContext* ctx), (ctx));

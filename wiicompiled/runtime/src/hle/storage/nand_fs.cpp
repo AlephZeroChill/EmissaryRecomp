@@ -114,8 +114,49 @@ bool NandRemove(const std::filesystem::path& path) {
     return std::filesystem::remove(path, ec) && !ec;
 }
 
+#if defined(__SWITCH__)
+// Horizon's fsFsRenameFile refuses a destination that exists, where POSIX rename replaces it atomically. A replace is
+// three steps instead: the old file steps aside to <to>.old, the new one takes its name, then the old one goes. A crash
+// between the first two leaves only <to>.old; RecoverReplacedFile (every NAND path lookup) moves it back, so a reader
+// still sees the complete old file or the complete new one.
+static std::filesystem::path AsideName(const std::filesystem::path& to) {
+    std::filesystem::path aside = to;
+    aside += ".old";
+    return aside;
+}
+
+static void RecoverReplacedFile(const std::filesystem::path& path) {
+    std::error_code ec;
+    const std::filesystem::path aside = AsideName(path);
+    if (!std::filesystem::exists(aside, ec)) return;
+    if (std::filesystem::exists(path, ec)) {
+        std::filesystem::remove(aside, ec);  // the replace completed; only the cleanup was lost
+    } else {
+        std::filesystem::rename(aside, path, ec);
+    }
+}
+#endif
+
 bool NandRename(const std::filesystem::path& from, const std::filesystem::path& to) {
     std::error_code ec;
+#if defined(__SWITCH__)
+    if (std::filesystem::is_regular_file(to, ec)) {
+        const std::filesystem::path aside = AsideName(to);
+        std::filesystem::remove(aside, ec);
+        ec.clear();
+        std::filesystem::rename(to, aside, ec);
+        if (ec) return false;
+        std::filesystem::rename(from, to, ec);
+        if (ec) {
+            std::error_code restore;
+            std::filesystem::rename(aside, to, restore);
+            return false;
+        }
+        std::filesystem::remove(aside, ec);
+        return true;
+    }
+    ec.clear();
+#endif
     std::filesystem::rename(from, to, ec);
     return !ec;
 }
@@ -133,6 +174,9 @@ static std::filesystem::path BuildHostNandPath(const std::string& wiiPathStr) {
         }
         cursor = end + 1;
     }
+#if defined(__SWITCH__)
+    RecoverReplacedFile(hostPath);
+#endif
     return hostPath;
 }
 

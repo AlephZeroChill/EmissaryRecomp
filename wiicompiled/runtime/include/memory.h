@@ -12,7 +12,9 @@ class Memory {
 public:
 
     static constexpr size_t kMem1Size = 24u * 1024u * 1024u;
-    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;
+    // The game sees a retail console's 64 MiB (system_bridge.cpp); the mapping above it holds the translated .rel
+    // modules' homes (hle/brawl_modules.cpp) and, just above them, the runtime FST.
+    static constexpr size_t kMem2Size = 80u * 1024u * 1024u;
     // Dolphin exposes a 256 KiB locked-cache compatibility window.
     static constexpr uint32_t kLockedCacheBase = 0xE0000000u;
     static constexpr size_t kLockedCacheSize = 0x40000u;

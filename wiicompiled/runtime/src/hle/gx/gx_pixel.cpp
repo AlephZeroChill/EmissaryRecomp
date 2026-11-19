@@ -35,6 +35,7 @@ extern "C" void GX__SetZMode_HLE(uint32_t ce, uint32_t f, uint32_t ue) {
 PPC_NATIVE_OVERRIDE_VOID(801F4774, GX__SetZMode_HLE, (uint32_t ce, uint32_t f, uint32_t ue), (ce, f, ue));
 
 extern "C" void GX__SetZCompLoc_HLE(uint32_t bt) {
+    G3D_REC_HLE(g3dn::kRecSetZCompLoc, bt);
     GXSetZCompLoc(static_cast<GXBool>(bt));
 }
 PPC_NATIVE_OVERRIDE_VOID(801F47A8, GX__SetZCompLoc_HLE, (uint32_t bt), (bt));
@@ -63,15 +64,20 @@ PPC_NATIVE_OVERRIDE_VOID(801f48ac, GX__SetDstAlpha_HLE, (uint32_t en, uint32_t a
 // ============================================================================
 
 extern "C" void GX__SetFog_HLE(uint32_t t, float sz, float ez, float nz, float fz, uint32_t cp) {
+    // The colour by value: nw4r passes a stack temporary, whose address depends on the caller's stack depth.
+    G3D_REC_HLE(g3dn::kRecSetFog, t, g3dn::F32Bits(sz), g3dn::F32Bits(ez), g3dn::F32Bits(nz), g3dn::F32Bits(fz),
+                g3dn::g_recOn ? Memory::Read32(cp) : 0u);
     GXSetFog((GXFogType)t, sz, ez, nz, fz, DecodeGxColor(Memory::Read32(cp)));
+}
+// The same with the colour word by value: the replay of a recorded native draw (g3d_native.cpp, G3D_NATIVE_ASYNC).
+extern "C" void GX_HLE_SetFogHost(uint32_t t, float sz, float ez, float nz, float fz, uint32_t color) {
+    GXSetFog((GXFogType)t, sz, ez, nz, fz, DecodeGxColor(color));
 }
 PPC_NATIVE_OVERRIDE_VOID(801f421c, GX__SetFog_HLE, (uint32_t t, float sz, float ez, float nz, float fz, uint32_t cp), (t, sz, ez, nz, fz, cp));
 
 extern "C" void GX__SetAlphaCompare_HLE(uint32_t c0, uint32_t r0, uint32_t op, uint32_t c1, uint32_t r1) {
     if (SpmDumpFrame()) RT_LOGF(RT_TAG_GX, "[drawdump] alphacmp %u %u %u %u %u\n", c0, r0, op, c1, r1);
     g_alphaCompareValid = true;
-    static const bool s_alphaExperiment = std::filesystem::exists("alphatest_off.txt");  // SPM bring-up experiment
-    if (s_alphaExperiment && c0 == 6 && r0 == 128) { c0 = 7; op = 1; c1 = 7; }
     GXSetAlphaCompare((GXCompare)c0, (u8)r0, (GXAlphaOp)op, (GXCompare)c1, (u8)r1);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F3FD8, GX__SetAlphaCompare_HLE, (uint32_t c0, uint32_t r0, uint32_t op, uint32_t c1, uint32_t r1), (c0, r0, op, c1, r1));

@@ -1,10 +1,12 @@
 #include "brawl_dirty_memory.h"
 #include "ax_dsp.h"
+#include "guest_thread_guard.h"
 
 #include "ax_internal.h"
 
 #include "abi_bridge.h"
 #include "audio_backend.h"
+#include "axfx_async.h"
 #include "ax_mix_kernels.h"
 #include "isa/big_endian.h"
 #include "memory.h"
@@ -69,7 +71,7 @@ public:
         // worker first: the mix owns those members outright while it runs.
         JoinMix();
         RefreshMixMemoryMap();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mixWorkerEnabled = RuntimeConfigFile::AudioMixWorkerEnabled(true);
         MarkDspInitialized();
         ResetDspTaskGlobals();
@@ -94,7 +96,7 @@ public:
 
     void Stop() {
         JoinMix();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mailState = MailState::WaitingForCmdListSize;
         m_cmdListSize = 0;
         m_toDspBusy = false;
@@ -109,11 +111,14 @@ public:
         // ConfigureFromTaskLocked rewrites the ucode CRC and the PB/command
         // layouts, all of which the mix reads.
         JoinMix();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         ConfigureFromTaskLocked(taskPtr);
     }
 
     void JoinMix() {
+        // The AXFX jobs first (axfx_async.h): they process the bus buffers PublishAuxOutputs writes and the next
+        // command list reads.
+        AxfxAsync::Join();
         if (m_mixThread.joinable()) {
             std::unique_lock<std::mutex> lock(m_mixMutex);
             m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
@@ -134,25 +139,25 @@ public:
     }
 
     void SetMixWorkerEnabled(bool enabled) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mixWorkerEnabled = enabled;
     }
 
     void SendMail(uint32_t mail) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         HandleMail(mail);
         m_toDspBusy = false;
     }
 
     void QueueResumeCallback() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         ++m_deferredResumeCallbacks;
     }
 
     void ServiceDeferredCallbacks() {
         while (true) {
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                std::lock_guard<GuestThreadGuard> lock(m_guard);
                 if (m_deferredResumeCallbacks == 0) {
                     return;
                 }
@@ -163,17 +168,17 @@ public:
     }
 
     uint32_t CheckMailToDSP() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         return m_toDspBusy ? 1u : 0u;
     }
 
     uint32_t CheckMailFromDSP() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         return m_cpuMails.empty() ? 0u : 1u;
     }
 
     uint32_t ReadMailFromDSP() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         if (m_cpuMails.empty()) {
             return m_lastCpuMail & 0x7fffffffu;
         }
@@ -322,6 +327,7 @@ private:
     // guest thread: the DSP sync mails OUTPUT commands raise (so the mail sequence doesn't
     // depend on where the mix runs)
     void DispatchCommandList() {
+        AxfxAsync::Join();  // the command list reads the buffers the AXFX jobs process (normally joined in JoinMix)
         AXCommandLayout layout = m_commandLayout;
         if (layout == AXCommandLayout::Auto) {
             const bool validNew = ScanCommandList(AXCommandLayout::New, nullptr);
@@ -1435,7 +1441,9 @@ private:
         std::fflush(stderr);
     }
 
-    mutable std::mutex m_mutex;
+    // Taken only on the guest CPU's thread (guest_thread_guard.h): the mix worker hands state over through
+    // m_mixMutex and the join, never this. ~35 lock/unlock pairs a frame in P+ Training as a mutex.
+    mutable GuestThreadGuard m_guard{"AXWii::m_guard"};
     MailState m_mailState = MailState::WaitingForCmdListSize;
     bool m_toDspBusy = false;
     uint32_t m_cmdListSize = 0;

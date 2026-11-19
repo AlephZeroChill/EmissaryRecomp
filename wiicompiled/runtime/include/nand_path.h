@@ -70,7 +70,9 @@ inline std::string GameSaveKey() {
     for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code fileError;
         if (it->is_regular_file(fileError)) {
-            const auto relative = std::filesystem::relative(it->path(), root, fileError).generic_u8string();
+            // Lexical: the iterator's paths are under root as written, and relative() would stat every
+            // component of both paths for each of the disc's thousands of files.
+            const auto relative = it->path().lexically_relative(root).generic_u8string();
             files.emplace_back(std::string(relative.begin(), relative.end()), it->file_size(fileError));
         }
     }

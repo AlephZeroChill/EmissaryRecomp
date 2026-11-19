@@ -35,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include "hz_perf.h"
+
 
 namespace {
 
@@ -385,8 +387,10 @@ std::string CheatFile() { return reinterpret_cast<const char*>(CheatFilePath().u
 
 void RunVbiHook(CpuContext* ctx) {
     if (Memory::Read32(kVbiHookSite) != BranchTo(kVbiHookSite, kHandlerEntry)) return;
+    HZ_PHASE(kHzGeckoTicks);
     InvokeIndirectCpu(kHandlerEntry, ctx);
     GuestCodePatch::Sync();
+    GuestCodePatch::ReleaseBaked();  // once: the handler has now written every patch it makes at boot
 }
 
 } // namespace Gecko

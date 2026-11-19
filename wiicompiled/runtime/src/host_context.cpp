@@ -8,8 +8,12 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)
+#elif (defined(__APPLE__) || defined(__linux__) || defined(__SWITCH__)) && defined(__aarch64__)
+#if defined(__SWITCH__)
+#include <cstdlib>
+#else
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 #include <limits>
 #if defined(__ANDROID__)
@@ -96,7 +100,7 @@ void Switch(Handle target)
     SwitchToFiber(target);
 }
 
-#elif (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)
+#elif (defined(__APPLE__) || defined(__linux__) || defined(__SWITCH__)) && defined(__aarch64__)
 
 namespace {
 struct Context {
@@ -192,6 +196,20 @@ void ShutdownScheduler(Handle scheduler)
 
 Handle Create(std::size_t stackSize, Entry entry, void* argument)
 {
+#if defined(__SWITCH__)
+    // Horizon gives applications no page protection to make a guard page with: heap stacks.
+    constexpr std::size_t kPage = 4096;
+    if (stackSize == 0 || stackSize > std::numeric_limits<std::size_t>::max() - kPage) {
+        return nullptr;
+    }
+    const std::size_t totalSize = (stackSize + kPage - 1) / kPage * kPage;
+    auto* context = new Context();
+    context->stack = std::aligned_alloc(kPage, totalSize);
+    if (!context->stack) {
+        delete context;
+        return nullptr;
+    }
+#else
     const std::size_t guardSize = static_cast<std::size_t>(getpagesize());
     if (stackSize == 0 || stackSize > std::numeric_limits<std::size_t>::max() - 2 * guardSize) {
         return nullptr;
@@ -225,6 +243,7 @@ Handle Create(std::size_t stackSize, Entry entry, void* argument)
         delete context;
         return nullptr;
     }
+#endif
     context->stackSize = totalSize;
 
     auto* stackTop = static_cast<char*>(context->stack) + totalSize;
@@ -244,6 +263,8 @@ void Destroy(Handle context)
         if (mprotect(nativeContext->stack, static_cast<std::size_t>(getpagesize()), PROT_READ | PROT_WRITE) == 0) {
             g_arena.freed.emplace_back(nativeContext->stack, nativeContext->stackSize);
         }
+#elif defined(__SWITCH__)
+        std::free(nativeContext->stack);
 #else
         munmap(nativeContext->stack, nativeContext->stackSize);
 #endif
@@ -276,12 +297,30 @@ void Switch(Handle target)
 
 #elif defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
 
+// ThreadSanitizer builds: libco switches stacks behind TSan's back, which then mixes up the fibers' shadow stacks and
+// reports nonsense. Its fiber API keeps it informed (compiled only under -fsanitize=thread).
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MKW_TSAN_FIBERS 1
+extern "C" void* __tsan_get_current_fiber(void);
+extern "C" void* __tsan_create_fiber(unsigned flags);
+extern "C" void __tsan_destroy_fiber(void* fiber);
+extern "C" void __tsan_switch_to_fiber(void* fiber, unsigned flags);
+#endif
+#endif
+#ifndef MKW_TSAN_FIBERS
+#define MKW_TSAN_FIBERS 0
+#endif
+
 namespace {
 struct Context {
     cothread_t native = nullptr;
     Entry entry = nullptr;
     void* argument = nullptr;
     bool ownsNative = false;
+#if MKW_TSAN_FIBERS
+    void* tsanFiber = nullptr;
+#endif
 };
 
 thread_local Context* g_current = nullptr;
@@ -313,6 +352,9 @@ bool InitializeScheduler(Handle* scheduler)
         return false;
     }
 
+#if MKW_TSAN_FIBERS
+    context->tsanFiber = __tsan_get_current_fiber();
+#endif
     g_current = context;
     g_contexts.emplace(context->native, context);
     *scheduler = context;
@@ -347,6 +389,9 @@ Handle Create(std::size_t stackSize, Entry entry, void* argument)
         delete context;
         return nullptr;
     }
+#if MKW_TSAN_FIBERS
+    context->tsanFiber = __tsan_create_fiber(0);
+#endif
 
     g_contexts.emplace(context->native, context);
     return context;
@@ -362,6 +407,9 @@ void Destroy(Handle context)
     g_contexts.erase(nativeContext->native);
     if (nativeContext->ownsNative) {
         co_delete(nativeContext->native);
+#if MKW_TSAN_FIBERS
+        __tsan_destroy_fiber(nativeContext->tsanFiber);
+#endif
     }
     delete nativeContext;
 }
@@ -385,6 +433,9 @@ void Switch(Handle target)
     }
 
     g_current = destination;
+#if MKW_TSAN_FIBERS
+    __tsan_switch_to_fiber(destination->tsanFiber, 0);
+#endif
     co_switch(destination->native);
     g_current = source;
 }

@@ -14,8 +14,10 @@
 // game's own buffer and the pre-linked image replaces the loaded file in place.
 #include "hle_stubs.h"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "abi_bridge.h"
@@ -26,6 +28,7 @@
 
 extern "C" void func_801DD964(CpuContext* ctx);  // Link(module, bss, fixed), translated
 extern "C" void func_801DD6A4(CpuContext* ctx);  // Relocate(imported-from or null for main, importer), translated
+extern "C" uint32_t g_dvdFstReservedBase;         // system_bridge.cpp
 
 namespace {
 
@@ -275,6 +278,17 @@ void LinkModule(CpuContext* ctx, bool fixed) {
     if (ctx->gpr[3]) {
         FixKnownModBugs(header);
         RedirectHome(header);
+        // Code variants of a mod's in-place code (guest_code_patch.cpp) are keyed by address: whatever was linked here
+        // before, the module's sections (absolute after Link) are checked again before a variant runs there.
+        uint32_t lo = header, hi = header + 0x4Cu;
+        const uint32_t sections = Memory::Read32(header + 0x10u), count = Memory::Read32(header + 0x0Cu);
+        for (uint32_t i = 1; i < count && i < 64; ++i) {
+            const uint32_t offset = Memory::Read32(sections + i * 8u) & ~1u, size = Memory::Read32(sections + i * 8u + 4u);
+            if (offset == 0 || size == 0) continue;
+            lo = std::min(lo, offset);
+            hi = std::max(hi, offset + size);
+        }
+        GuestCodePatch::ModuleLinkedInPlace(lo, hi);
     }
 }
 
@@ -284,6 +298,16 @@ void LinkModule(CpuContext* ctx, bool fixed) {
 // to receive the game's own load of the file): every module's pristine image.
 void BrawlModulesSnapshotImages() {
     std::lock_guard<std::mutex> lock(g_modulesMutex);
+    // The homes end below the FST's reservation at the top of the MEM2 mapping (system_bridge.cpp), else the data
+    // loader skipped what the mapping does not hold and the FST lands on the rest. The last home's veneers
+    // (translated stand-ins, 16 bytes each, build_modules.py) follow its bss.
+    uint32_t homesEnd = 0;
+    for (const BrawlModule& m : kModules)
+        if (!m.resident) homesEnd = std::max({homesEnd, m.image + m.fixSize, m.bss + m.bssSize});
+    if (const auto code = TranslatedFunctionRegistry::FindNearestByAddress(Memory::kMem2CachedEnd - 1u))
+        homesEnd = std::max(homesEnd, code->address + 16u);
+    if (homesEnd > g_dvdFstReservedBase)
+        throw std::runtime_error("the Brawl module homes run into the FST reservation: Memory::kMem2Size is too small");
     for (size_t i = 0; i < sizeof(kModules) / sizeof(kModules[0]); ++i) {
         const auto* image = static_cast<const uint8_t*>(Memory::GetPointer(kModules[i].image, kModules[i].fixSize));
         g_pristine[i].assign(image, image + kModules[i].fixSize);

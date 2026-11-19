@@ -6,7 +6,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 #include <sys/un.h>
 #endif
 
@@ -53,8 +53,8 @@ public:
             std::filesystem::rename(temporary, path);
             endpoint = path;
         } else if (transport == "unix") {
-#ifdef _WIN32
-            throw std::runtime_error("Unix control transport is unavailable on Windows; select TCP");
+#if defined(_WIN32) || defined(__SWITCH__)
+            throw std::runtime_error("Unix control transport is unavailable here; select TCP");
 #else
             sockaddr_un address{}; address.sun_family = AF_UNIX;
             const auto name = path.string();

@@ -190,7 +190,6 @@ int32_t ISFS_OpenLib_Initialize(CpuContext* ctx);
 // Shadow-write machinery, defined with the NANDSafeOpen/NANDSafeClose section below.
 std::filesystem::path SafeTempPathFor(const std::filesystem::path& hostPath);
 bool DiscardStaleSafeTemp(const std::filesystem::path& tempPath);
-bool IsHostPathOpen(const std::filesystem::path& hostPath);
 int32_t CommitAndCloseFd(const char* who, int32_t fd, bool missingFdIsError);
 
 // Synchronous NAND library entry points (defined in nand_api.cpp); the async
