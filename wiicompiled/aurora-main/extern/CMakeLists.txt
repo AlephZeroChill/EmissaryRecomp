@@ -99,6 +99,11 @@ endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraSDL3Provider.cmake)
 
+if (AURORA_ENABLE_GX)
+  # Dawn or the SDL_GPU implementation of the same WebGPU API (needs Dawn's headers and SDL3 above).
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/aurora_sdlgpu.cmake)
+endif ()
+
 if (NOT TARGET xxhash)
   message(STATUS "aurora: Fetching xxhash")
   FetchContent_Declare(xxhash
@@ -268,7 +273,7 @@ if (AURORA_ENABLE_GX)
       ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
     )
     target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} ${AURORA_WEBGPU_TARGET})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)

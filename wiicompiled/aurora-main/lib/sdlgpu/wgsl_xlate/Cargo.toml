@@ -1,0 +1,15 @@
+[package]
+name = "wgsl_xlate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in", "msl-out", "glsl-out", "spv-out"] }
+
+[profile.release]
+opt-level = 3
+panic = "abort"

@@ -28,7 +28,8 @@
 #if defined(WEBGPU_DAWN) && !defined(__MINGW32__)
 #include "../dawn/BackendBinding.hpp"
 #include <dawn/native/DawnNative.h>
-#elif defined(WEBGPU_DAWN)
+#else
+// Also built for the SDL_GPU implementation, which ignores the platform layer the surface descriptor carries.
 #include "../dawn/BackendBinding.hpp"
 #endif
 
