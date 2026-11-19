@@ -302,22 +302,6 @@ if (AURORA_ENABLE_GX)
     target_sources(imgui PRIVATE ${PROJECT_SOURCE_DIR}/lib/imgui_config.cpp)
     target_link_libraries(imgui PRIVATE ${AURORA_SDL3_TARGET})
   endif ()
-
-  if (NOT TARGET sqlite3)
-    message(STATUS "aurora: Fetching sqlite3")
-    FetchContent_Declare(sqlite3
-      URL https://sqlite.org/2026/sqlite-amalgamation-3510300.zip
-      URL_HASH SHA256=acb1e6f5d832484bf6d32b681e858c38add8b2acdfd42ac5df24b8afb46552b4
-      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(sqlite3)
-
-    add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
-    target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
-  else ()
-    message(STATUS "aurora: Using existing sqlite3")
-  endif ()
 endif ()
 
 option(TRACY_ENABLE "Enable Tracy profiling" OFF)

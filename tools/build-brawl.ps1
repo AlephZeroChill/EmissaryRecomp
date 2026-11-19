@@ -57,7 +57,7 @@ function Copy-ReplacingLocked($from, $to) {
 }
 # Everything CMake staged beside the program (runtime/cmake/PublicProducts.cmake): the engine, the libraries it loads
 # and its data files.
-Get-ChildItem (Join-Path $native '*') -File -Include '*.dll', 'dsp_coef.bin', 'initial_pipeline_cache.db' |
+Get-ChildItem (Join-Path $native '*') -File -Include '*.dll', 'dsp_coef.bin' |
     ForEach-Object { Copy-ReplacingLocked $_.FullName (Join-Path $root "Play\$($_.Name)") }
 Copy-Item -LiteralPath (Join-Path $native 'wii_bootstrap') -Destination (Join-Path $root 'Play') -Recurse -Force
 if (-not $OldCpu) { Copy-ReplacingLocked (Join-Path $native 'WiiCompiled.exe') $playExe }

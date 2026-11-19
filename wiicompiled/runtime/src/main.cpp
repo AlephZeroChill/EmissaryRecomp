@@ -1291,8 +1291,7 @@ int RuntimeMain(int argc, char** argv) {
         const std::string auroraCachePath = RuntimeConfigFile::PathToUtf8(rendererCacheDirectory);
         auroraConfig.userPath = auroraUserPath.c_str();
         auroraConfig.cachePath = auroraCachePath.c_str();
-        // initial_pipeline_cache.db (NSMBW's pipelines, merged into the user's cache at startup)
-        // sits beside the executable, or in the app's unpacked runtime folder on Android.
+        // Read-only resources sit beside the executable, or in the app's unpacked runtime folder on Android.
         const auto runtimeDirectory = RuntimeConfigFile::ExecutableDirectory();
         const std::string auroraResourcesPath =
             runtimeDirectory ? RuntimeConfigFile::PathToUtf8(*runtimeDirectory) : std::string();

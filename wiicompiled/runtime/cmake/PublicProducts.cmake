@@ -209,15 +209,6 @@ function(mkw_configure_product target)
         include("${MKW_AURORA_DIR}/cmake/AuroraCopyRuntimeDLLs.cmake")
         aurora_copy_runtime_dlls(${target})
     endif()
-    if(TARGET sqlite3)
-        get_target_property(MKW_SQLITE_TARGET_TYPE sqlite3 TYPE)
-    endif()
-    if(TARGET sqlite3 AND
-       (MKW_SQLITE_TARGET_TYPE STREQUAL "SHARED_LIBRARY" OR
-        MKW_SQLITE_TARGET_TYPE STREQUAL "MODULE_LIBRARY"))
-        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:sqlite3> $<TARGET_FILE_DIR:${target}>)
-    endif()
 
     if(MKW_PLATFORM_WINDOWS)
         target_link_libraries(${target} PRIVATE
@@ -275,18 +266,6 @@ function(mkw_configure_product target)
     endif()
     add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${MKW_DSP_COEFFICIENT_ROM}" "$<TARGET_FILE_DIR:${target}>/dsp_coef.bin")
-
-    # Aurora imports this portable recipe database into each user's writable
-    # pipeline cache. Keep the upstream filename so its default resourcesPath
-    # lookup works without application-specific configuration.
-    set(MKW_INITIAL_PIPELINE_CACHE
-        "${MKW_RUNTIME_SOURCE_DIR}/assets/pipeline/initial_pipeline_cache.db")
-    if(NOT EXISTS "${MKW_INITIAL_PIPELINE_CACHE}")
-        message(FATAL_ERROR "Missing transferable Aurora pipeline cache: ${MKW_INITIAL_PIPELINE_CACHE}")
-    endif()
-    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MKW_INITIAL_PIPELINE_CACHE}"
-        "$<TARGET_FILE_DIR:${target}>/initial_pipeline_cache.db")
 
     # Non-Windows TLS (runtime/src/hle/net/network_ssl.cpp's mbed TLS path) needs a trusted root
     # CA bundle to verify server certificates against - Windows gets this for free from the OS via

@@ -128,7 +128,7 @@ Source: <https://github.com/higan-emu/libco>. Full license text:
 ## Fetched at build time and redistributed in release builds
 
 These are pinned in `aurora-main/extern/CMakeLists.txt`, `aurora-main/CMakeLists.txt`,
-`aurora-main/cmake/AuroraDawnProvider.cmake`, and (for Mbed TLS) `runtime/CMakeLists.txt`. They are
+and (for Mbed TLS) `runtime/CMakeLists.txt`. They are
 not stored in this repository; the build downloads them - each fetch is pinned to an exact version
 with a checked SHA-256 - and links or redistributes the resulting binaries. Their license texts are
 included in the installer's `licenses/` folder. The Windows installer bundles the pinned source
@@ -137,9 +137,6 @@ trees themselves (fetched by `Launcher/Prepare-Dependencies.ps1`) so end-user bu
 | Component | Version | License | Upstream |
 | --- | --- | --- | --- |
 | Mbed TLS | 3.6.7 | Apache-2.0 / GPL-2.0-or-later | <https://github.com/Mbed-TLS/mbedtls> |
-| Dawn (WebGPU) | `v20260603.191052` prebuilt | BSD-3-Clause | <https://dawn.googlesource.com/dawn> |
-| Tint (part of Dawn) | with Dawn | BSD-3-Clause | <https://dawn.googlesource.com/dawn> |
-| DirectXShaderCompiler (`dxcompiler.dll`) | with Dawn | NCSA / University of Illinois Open Source | <https://github.com/microsoft/DirectXShaderCompiler> |
 | SDL | 3.4.4 | zlib | <https://github.com/libsdl-org/SDL> |
 | libusb (linked into SDL on Windows) | 1.0.30 | LGPL-2.1-or-later | <https://github.com/libusb/libusb> |
 | Abseil | LTS 20240722.0 | Apache-2.0 | <https://github.com/abseil/abseil-cpp> |
@@ -149,8 +146,6 @@ trees themselves (fetched by `Launcher/Prepare-Dependencies.ps1`) so end-user bu
 | zlib | 1.3.2 | zlib | <https://github.com/madler/zlib> |
 | libpng | 1.6.58 | PNG Reference Library License v2 | <https://github.com/pnggroup/libpng> |
 | FreeType | 2.14.3 | **FreeType License (FTL)** - see below | <https://freetype.org/> |
-| Zstandard | 1.5.7 | **BSD-3-Clause** - see below | <https://github.com/facebook/zstd> |
-| SQLite | 3.51.3 amalgamation | Public domain | <https://sqlite.org/> |
 | Tracy Profiler | pinned commit | BSD-3-Clause | <https://github.com/wolfpld/tracy> |
 | C++/WinRT | - | MIT (Microsoft) | <https://github.com/microsoft/cppwinrt> |
 | nodtool (disc image extraction) | v2.0.0-alpha.10 | MIT OR Apache-2.0 | <https://github.com/encounter/nod> |
@@ -163,9 +158,6 @@ trees themselves (fetched by `Launcher/Prepare-Dependencies.ps1`) so end-user bu
 
   > Portions of this software are copyright © 2026 The FreeType Project (www.freetype.org).
   > All rights reserved.
-
-- **Zstandard** is offered under BSD-3-Clause or GPL-2.0. **This project elects BSD-3-Clause.**
-  Copyright (c) Meta Platforms, Inc. and affiliates.
 
 ## Windows development toolkit
 

@@ -89,8 +89,7 @@ typedef struct {
   const char* appName;
   const char* userPath;
   const char* cachePath;
-  // Read-only application resources. Defaults to SDL_GetBasePath(), which is
-  // where release builds place initial_pipeline_cache.db.
+  // Read-only application resources. Defaults to SDL_GetBasePath().
   const char* resourcesPath;
   AuroraBackend desiredBackend;
   uint32_t msaa;
