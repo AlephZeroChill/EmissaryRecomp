@@ -1,0 +1,84 @@
+# EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines and the Linux
+# program, the downloads EmissaryRecomp-<tag>-Windows.zip / -Linux.tar.gz, manifest.json and SHA256SUMS, published
+# as the GitHub release <tag> (a tag with a suffix, v0.7.0-rc.1, is a prerelease: never /releases/latest, so no
+# launcher installs it by itself).
+#
+# Runs only when a maintainer starts it: a pushed version tag (pushing tags needs write access) or a manual run
+# (Actions > Release > Run workflow, also write access). Never on pull_request or pull_request_target: the job runs on
+# a self-hosted runner, and a fork's code must never run there.
+#
+# The runner (docs/releases.md, "The release runner"): a Windows PC with the labels self-hosted, Windows, X64 and
+# emissary-release; Python 3.12, Git, PowerShell, gh; the WSL distro EmissaryRecomp-Build (Ubuntu 24.04,
+# tools/linux-build-deps.sh); and an extracted disc, whose DATA folder is in the runner's environment as EMISSARY_GAME
+# (the runner's .env file). The disc never leaves that PC: only the built program is uploaded.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Prerelease suffix (rc.1 makes v<VERSION>-rc.1); empty: the release v<VERSION>'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish the GitHub release (off: build and keep the files as a workflow artifact)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # gh release create
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Only in this repository: forks have no such runner, and a fork's copy must not wait for one forever.
+    if: github.repository == 'kalomaze/EmissaryRecomp'
+    runs-on: [self-hosted, Windows, X64, emissary-release]
+    timeout-minutes: 600
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      # The runner keeps its workspace: build/ (two engine builds, the fetched core), toolchain/ and
+      # wiicompiled/Dependencies are ignored files that make the next release incremental instead of hours. Untracked
+      # files that are not ignored are removed, since the build copies every one it finds (tools/build.py).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: false
+          persist-credentials: false
+      - name: Remove untracked files (keeping the ignored build folders)
+        run: git clean -ffd
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          PUBLISH: ${{ github.ref_type == 'tag' || inputs.publish }}
+        run: |
+          if (-not $env:EMISSARY_GAME) { throw 'EMISSARY_GAME (the extracted disc) is not set on this runner' }
+          $release = @('tools/release.py', '--game', $env:EMISSARY_GAME, '--out', 'dist/release')
+          if ($env:TAG) { $release += @('--tag', $env:TAG) }
+          elseif ($env:PRERELEASE) { $release += @('--prerelease', $env:PRERELEASE) }
+          if ($env:PUBLISH -eq 'true') { $release += '--publish' }
+          python @release
+          if ($LASTEXITCODE -ne 0) { throw "release.py failed ($LASTEXITCODE)" }
+
+      - name: Keep the files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            dist/release/*.zip
+            dist/release/*.tar.gz
+            dist/release/manifest.json
+            dist/release/SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 7
