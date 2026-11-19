@@ -778,6 +778,17 @@ void NoteSceneForCaptures(const std::string& scene) {
 }
 
 void RequestScheduledCaptures() {
+    // BRAWL_CAPTURE_FRAME=<n>: save rendered frame n as frame_<n>.bmp. Frame-exact, so with NSMBW_DETERMINISTIC two
+    // builds can be compared pixel for pixel.
+    static const bool frameCaptureRequested = [] {
+        if (const char* frame = std::getenv("BRAWL_CAPTURE_FRAME")) {
+            static const std::string framePath = std::string("frame_") + frame + ".bmp";
+            aurora_request_frame_capture(static_cast<uint32_t>(std::strtoul(frame, nullptr, 10)), framePath.c_str());
+            return true;
+        }
+        return false;
+    }();
+    (void)frameCaptureRequested;
     struct Shot { std::string scene; double seconds; };
     static const std::vector<Shot> shots = [] {
         std::vector<Shot> out;
