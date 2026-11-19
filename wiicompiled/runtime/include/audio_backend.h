@@ -1,5 +1,8 @@
 #pragma once
 
+#include <condition_variable>
+#include <atomic>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -30,6 +33,11 @@ private:
     AudioBackend& operator=(const AudioBackend&) = delete;
 
     bool EnsureInitializedLocked(uint32_t sampleRate, uint32_t channels);
+    static SDL_AudioStream* OpenDefaultStream(uint32_t sampleRate, uint32_t channels, SDL_AudioSpec& spec,
+                                              bool report);
+    void RetryMain();
+    bool InstallStreamLocked(SDL_AudioStream* stream, const SDL_AudioSpec& spec, uint32_t sampleRate,
+                             uint32_t channels);
     bool QueueHasCapacityLocked(int incomingBytes);
     uint32_t QueueLimitBytesLocked() const;
     float EffectiveGainLocked() const;
@@ -44,7 +52,19 @@ private:
     float m_masterVolume = 1.0f;
     bool m_muted = false;
     bool m_reportedDroppedBlock = false;
-    uint64_t m_lastOpenFailureMs = 0;  // no output device: when opening last failed (retries are spaced out)
+    bool m_openFailed = false;  // no output device: the retry thread owns reopening (EnsureInitializedLocked)
     bool m_reportedOpenFailure = false;
+    bool m_shutdown = false;    // Shutdown ran since the last Init: a retry that lands now must not install
+    uint32_t m_wantRate = 0, m_wantChannels = 0;  // the format the retry thread opens
+    bool m_retryStarted = false;                 // the retry thread: started at the first failed open, then kept
+    std::condition_variable m_retryWake;
     std::vector<int16_t> m_convertBuffer;
+
+#if defined(__SWITCH__)
+    // SDL3 has no Horizon audio driver: m_stream is a device-less SDL stream (rate conversion and gain), drained into
+    // libnx audout by this thread.
+    void AudoutLoop();
+    std::thread m_audoutThread;
+    std::atomic<bool> m_audoutRunning{false};
+#endif
 };
