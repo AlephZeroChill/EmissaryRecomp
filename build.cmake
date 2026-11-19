@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 # Run from any directory, after extract.cmake: cmake -P /path/to/build.cmake
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 set(args --cmake "${CMAKE_COMMAND}")
-foreach(var BUILD_DIR GAME EXTRACT JOBS)  # build.py's own options: -DJOBS=2 -> --jobs=2
+foreach(var BUILD_DIR GAME EXTRACT JOBS CODE_VARIANTS)  # build.py's own options: -DJOBS=2 -> --jobs=2
     if(DEFINED ${var})
         string(TOLOWER "${var}" option)
         string(REPLACE "_" "-" option "${option}")

@@ -5,6 +5,13 @@ https://github.com/wiidev/usbloadergx, GPL), the Gecko OS code handler that Proj
 0x80001800 (entry 0x800018A8). It is translated with the game (tools/build_modules.py adds it to main_translate.dol)
 so codes run natively; only code bodies (C0/C2) go through the interpreter.
 
+The translated entry runs a native body, runtime/src/hle/gecko_handler.cpp: the same instructions on the same
+registers (and stack frame), with stores of a value already in memory skipped and string writes / memory copies that
+would change nothing compared once instead of looped. A mod's list is walked in full at every hooked frame and almost
+all of its writes are such stores (Project+: ~2,900 codes and ~3,900 stores per pass). Code types Project+ does not use
+continue in the interpreter from the handler's own instruction. The wrapper keeps its guest code guard, so a change
+to these words below sends the handler to the interpreter instead; BRAWL_HLE_GECKO=0 runs the translated body.
+
 Changed words (everything else is byte-identical):
 
 | Address    | Original                    | Now                       | Why |

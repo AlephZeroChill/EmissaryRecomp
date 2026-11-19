@@ -72,6 +72,9 @@ def main():
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--native-arg', action='append', default=[],
                         help='extra argument for the native CMake configure; repeatable')
+    parser.add_argument('--code-variants', type=Path,
+                        help="a mod's code-variant spec (projects/brawl/tools/gen_variant_spec.py): its patched "
+                             'functions are translated as it patches them, beside the unmodified translation')
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error('--jobs must be positive')
@@ -168,6 +171,12 @@ def build_game(args, game, build):
         unpack(archive, build)
         (decomp / '.ready').touch()
     translated_stamp = build / 'translated.json'
+    variants = []
+    if args.code_variants:
+        spec = args.code_variants.resolve(strict=True)
+        for path in sorted(spec.parent.iterdir()):  # the spec and the region dumps beside it
+            game_inputs.update(path.name.encode() + path.read_bytes())
+        variants = ['--code-variants', spec, '--code-variants-out', 'generated/code_variants']
     translation_key = json.dumps([fingerprint, game_inputs.hexdigest()])
     if not translated_stamp.exists() or translated_stamp.read_text() != translation_key:
         inputs = work / 'game'
@@ -189,11 +198,12 @@ def build_game(args, game, build):
             '--outdir', 'generated/functions', '--output-metadata', 'generated/base_translation_output.json',
             '--production-source-bundle', 'generated/base_translation_sources.bin', '--no-function-files',
             '--no-state-free-abi', '--data-in-text', 'projects/brawl/resident_data_ranges.txt',
-            '--prune-stale', '--threads', args.jobs, cwd=wc)
+            '--prune-stale', '--threads', args.jobs, *variants, cwd=wc)
         run(dotnet, translator, 'generate-data-init', '--project', project, cwd=wc)
         run(dotnet, translator, 'emit-build-shards', '--project', project,
             '--base-metadata', 'generated/base_translation_output.json', '--base-functions-dir', 'generated/functions',
-            '--native-source-dir', 'runtime/src', '--out', 'generated/build_shards', '--base-shards', '600', cwd=wc)
+            '--native-source-dir', 'runtime/src', '--out', 'generated/build_shards', '--base-shards', '600',
+            *(['--code-variants', 'generated/code_variants'] if variants else []), cwd=wc)
         translated_stamp.write_text(translation_key)
     compilers = f'{shutil.which("clang")}\n{shutil.which("clang++")}'
     compilers_stamp = build / 'native-compilers.txt'

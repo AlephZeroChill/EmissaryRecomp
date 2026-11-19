@@ -20,7 +20,7 @@ from prelink_rels import Rel, link
 
 HOME_BASE = 0x94000000        # synthetic REL load address
 FIRST_HOME = 0x94004000       # room for the synthetic header and section table
-HOME_LIMIT = 0x97C00000       # the runtime maps MEM2 to 0x98000000; the game's arena ends at 0x94000000
+HOME_LIMIT = 0x94DC0000       # the runtime's FST reservation (system_bridge.cpp) above the homes; the game's arena ends at 0x94000000
 # Loaded at boot into OverlayCommon and never unloaded: (image, bss) where the game puts them.
 # (A retail console's MEM1 arena starts at 0x805B5160; these move with it.)
 RESIDENT = {
