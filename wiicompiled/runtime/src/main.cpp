@@ -1292,6 +1292,7 @@ int RuntimeMain(int argc, char** argv) {
         // input from all players (netplay_session.h).
         // A restart out of a LAN room lands here: the session file names the players, and the NAND
         // switches to the session's copy of the host's save before anything reads it.
+#if !MKW_BRAWL_ONLINE_CORE  // Brawl Online's build: online play is Brawl Online's core, never this netplay
         {
             NetplaySession::Config netplay;
             if (NetplayStart::TakePendingSession(netplay)) {
@@ -1301,6 +1302,7 @@ int RuntimeMain(int argc, char** argv) {
             }
             NetplaySession::SetStallHandler(&NetplayUi::OnSessionStall);
         }
+#endif
         // A big mod's SD card takes minutes to build when the game first asks for it: keep the window alive and show
         // how far the build is on the title card, as a network stall does (issue #2: "Not responding").
         SdCard::SetProgressHandler([](uint64_t done, uint64_t total) {

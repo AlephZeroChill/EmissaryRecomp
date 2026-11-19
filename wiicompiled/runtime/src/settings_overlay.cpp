@@ -1588,7 +1588,13 @@ void DrawStartupScreen() {
                 GameLayout::DrawText(list, view, small, u, 0.0f, cardY - 30.0f + bob, Fit(small, u, 17.0f), 0xD6D9E4FFu,
                                      0xB8BCCBFFu, 1.0f, 1, 1);
                 // How to reach the settings, along the card's bottom edge.
+#if MKW_BRAWL_ONLINE_CORE
+                // Brawl Online's build: online play is the launcher's; no save states, fast-forward or the
+                // recomp's own netplay (a save state or fast-forward in a match would leave the other player).
+                const auto hint = GameLayout::Utf16("F10 or Home = options");
+#else
                 const auto hint = GameLayout::Utf16("F10 or Home = options   F5 / F7 = save / load state   F8 = fast-forward   F9 = online");
+#endif
                 GameLayout::DrawText(list, view, small, hint, 0.0f, cardY - hh + 16.0f + bob, Fit(small, hint, 12.0f),
                                      0x8E93A6FFu, 0x8E93A6FFu, 1.0f, 1, 1);
             }
@@ -1824,12 +1830,14 @@ void DrawTopBar() {
         ImGui::EndMenu();
     }
 
+#if !MKW_BRAWL_ONLINE_CORE
     if (bool fast = g_fastForward.load(); ImGui::MenuItem("Fast-forward (F8)", nullptr, &fast)) g_fastForward.store(fast);
 
     if (ImGui::MenuItem("Online (F9)")) {
         OnlineMenu::SetOpen(true);
         SetTopBarVisible(false);
     }
+#endif
 
     if (ImGui::BeginMenu("Controller settings")) {
         DrawControllerSettings();
@@ -1839,10 +1847,12 @@ void DrawTopBar() {
         ImGui::EndMenu();
     }
 
+#if !MKW_BRAWL_ONLINE_CORE
     if (ImGui::BeginMenu("LAN Play")) {
         DrawLanPlaySettings();
         ImGui::EndMenu();
     }
+#endif
 
     const std::string audioLabel = g_audioMuted
         ? "Audio: Muted"
@@ -1992,6 +2002,7 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             SetTopBarVisible(!g_topBarVisible);
             ApplyInputBlockState();
         }
+#if !MKW_BRAWL_ONLINE_CORE
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_F8)) g_fastForward.store(!g_fastForward.load());
         // F5 / F7: save / load state in the chosen slot, F6: the next slot.
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_F5)) SaveStates::RequestSave();
@@ -2007,6 +2018,7 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             if (OnlineMenu::IsOpen()) SetTopBarVisible(false);
             ApplyInputBlockState();
         }
+#endif
         if (!g_rebind.active && g_muteHotkey != PAD_KEY_INVALID &&
             IsToggleKey(ev->sdl, static_cast<SDL_Scancode>(g_muteHotkey))) {
             g_audioMuted = !g_audioMuted;
