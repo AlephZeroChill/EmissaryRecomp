@@ -26,6 +26,31 @@ public sealed partial class CxxLinearCodeGenerator
         private bool _writesCtr;
         private bool _writesXer;
 
+        // Dirty-since-sync tracking. The recording pass logs, per block and in emission order, every local
+        // write and every flush/reload; SolveFlushPlan turns that into the set of locals that can differ from
+        // CpuContext at each flush, and the real pass stores only those. Without a plan every flush stores the
+        // whole write set, as before.
+        private enum SyncEventKind { Write, Flush, Reload }
+        private readonly record struct SyncEvent(SyncEventKind Kind, UInt128 Mask, bool Unconditional);
+        private readonly List<string> _blockOrder = new();
+        private readonly Dictionary<string, List<SyncEvent>> _blockEvents = new(StringComparer.OrdinalIgnoreCase);
+        private string? _block;
+        private bool _eventOutsideBlock;
+        private int _flushOrdinal;
+        private FlushPlan? _flushPlan;
+
+        private sealed record FlushPlan(UInt128[] DirtyAtFlush, string[] BlockAtFlush, UInt128 StoredUnion);
+
+        /// <summary>
+        /// Every register some flush of this body may store into CpuContext (dirty there and in that flush's mask),
+        /// from the solved plan; null without one (then each flush stores its whole mask of the write set).
+        /// </summary>
+        public UInt128? PossiblyStoredByFlushes => _flushPlan?.StoredUnion;
+
+        private const int CrKey = 64;
+        private const int CtrKey = 65;
+        private const int XerKey = 66;
+
         private RegisterResidency(bool recording) => _recording = recording;
 
         public static RegisterResidency CreateRecorder() => new(true);
@@ -69,6 +94,7 @@ public sealed partial class CxxLinearCodeGenerator
         public string Gpr(int index, bool written)
         {
             Track(_gprs, _writtenGprs, index, written, "r");
+            if (_recording && written) RecordWrite(index);
             return GprLocal(index);
         }
 
@@ -76,6 +102,7 @@ public sealed partial class CxxLinearCodeGenerator
         public string FprScalar(int index, bool written)
         {
             Track(_fprs, _writtenFprs, index, written, "f");
+            if (_recording && written) RecordWrite(32 + index);
             return FprScalarLocalName(index);
         }
 
@@ -83,6 +110,7 @@ public sealed partial class CxxLinearCodeGenerator
         public string FprStorage(int index, bool written)
         {
             Track(_fprs, _writtenFprs, index, written, "f");
+            if (_recording && written) RecordWrite(32 + index);
             return FprLocal(index);
         }
 
@@ -92,6 +120,7 @@ public sealed partial class CxxLinearCodeGenerator
             {
                 _cr = true;
                 _writesCr |= written;
+                if (written) RecordWrite(CrKey);
             }
             else if (!_cr || (written && !_writesCr))
             {
@@ -108,6 +137,7 @@ public sealed partial class CxxLinearCodeGenerator
             {
                 _ctr = true;
                 _writesCtr |= written;
+                if (written) RecordWrite(CtrKey);
             }
             else if (!_ctr || (written && !_writesCtr))
             {
@@ -128,6 +158,7 @@ public sealed partial class CxxLinearCodeGenerator
             {
                 _xer = true;
                 _writesXer |= written;
+                if (written) RecordWrite(XerKey);
             }
             else if (!_xer || (written && !_writesXer))
             {
@@ -172,6 +203,63 @@ public sealed partial class CxxLinearCodeGenerator
         }
 
         /// <summary>
+        /// MKW_EABI_REGS register-passing entry: its argument and result registers must be locals of the body even
+        /// when only a callee reads or writes them, and flushable (written) since the arguments arrive dirty.
+        /// </summary>
+        public void RequireLocals(uint gprs, uint fprs)
+        {
+            if (!_recording) throw new InvalidOperationException("Only a recording residency can require locals.");
+            for (var gpr = 0; gpr < 32; ++gpr)
+                if ((gprs & (1u << gpr)) != 0) { _gprs.Add(gpr); _writtenGprs.Add(gpr); }
+            for (var fpr = 0; fpr < 32; ++fpr)
+                if ((fprs & (1u << fpr)) != 0) { _fprs.Add(fpr); _writtenFprs.Add(fpr); }
+        }
+
+        /// <summary>
+        /// Entry of a register-passing body: arguments from the host parameters, r14-r31/f14-f31 from nothing
+        /// (EABI: their entry values are only ever saved to the frame, and CpuContext's copies are stale anyway),
+        /// everything else from CpuContext.
+        /// </summary>
+        public void AppendVariantEntryLoads(StringBuilder sb, GuestEabiVariant variant)
+        {
+            if (_recording) return;
+            foreach (var gpr in _gprs)
+            {
+                sb.Append("    uint32_t ").Append(GprLocal(gpr));
+                if ((variant.InputGprMask & (1u << gpr)) != 0) sb.Append(" = eabi_r").Append(gpr).AppendLine(";");
+                else if ((GuestEabi.NonvolatileGprMask & (1u << gpr)) != 0) sb.AppendLine(" = 0;");
+                else sb.Append(" = ctx->gpr[").Append(gpr).AppendLine("];");
+            }
+            foreach (var fpr in _fprs)
+            {
+                sb.Append("    PPC_FPR ").Append(FprLocal(fpr));
+                if ((variant.InputFprMask & (1u << fpr)) != 0) sb.Append(" = eabi_f").Append(fpr).AppendLine(";");
+                else if ((GuestEabi.NonvolatileFprMask & (1u << fpr)) != 0) sb.AppendLine("{};");
+                else sb.Append(" = ctx->fpr[").Append(fpr).AppendLine("];");
+            }
+            if (_cr) sb.AppendLine($"    uint32_t {CrLocal} = ctx->cr;");
+            if (_ctr) sb.AppendLine($"    uint32_t {CtrLocal} = ctx->ctr;");
+            if (_xer) sb.AppendLine($"    uint32_t {XerLocal} = ctx->xer;");
+        }
+
+        /// <summary>
+        /// Locals of a register-passing body that CpuContext must still receive: the arguments (r1 excepted: the
+        /// caller publishes it before the call). The nonvolatiles started at zero differ from CpuContext too, but its
+        /// copies of them are stale in this mode anyway and no call site reads them back.
+        /// </summary>
+        public UInt128 VariantEntryDirty(GuestEabiVariant variant)
+        {
+            var dirty = UInt128.Zero;
+            foreach (var gpr in _gprs)
+                if (gpr != 1 && (variant.InputGprMask & (1u << gpr)) != 0)
+                    dirty |= UInt128.One << gpr;
+            foreach (var fpr in _fprs)
+                if ((variant.InputFprMask & (1u << fpr)) != 0)
+                    dirty |= UInt128.One << (32 + fpr);
+            return dirty;
+        }
+
+        /// <summary>
         /// Stores the possibly-written localized registers back into
         /// <c>CpuContext</c>. Storing an unmodified register writes the same
         /// value back, so the conservative write set stays correct.
@@ -183,18 +271,210 @@ public sealed partial class CxxLinearCodeGenerator
         /// or overwrite are published; see <see cref="ResidencyBoundarySync"/>
         /// for why the write set has to participate in the flush mask.
         /// </summary>
-        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync) =>
+            AppendFlush(sb, pad, sync, unconditional: false);
+
+        /// <summary>
+        /// <paramref name="unconditional"/>: the flush runs on every path through this point (not in one arm of
+        /// an emitted <c>if</c>, not before a <c>return</c>), so afterwards the flushed locals equal CpuContext.
+        /// Only such flushes let later ones skip a register; a conditional one still stores what is dirty.
+        /// </summary>
+        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional)
         {
-            if (_recording) return;
+            if (_recording)
+            {
+                RecordEvent(new SyncEvent(SyncEventKind.Flush, FlushMask(sync), unconditional));
+                return;
+            }
+            var dirty = NextFlushDirtySet();
             foreach (var gpr in _writtenGprs)
-                if (sync.FlushesGpr(gpr))
+                if (sync.FlushesGpr(gpr) && IsDirty(dirty, gpr))
                     sb.Append(pad).Append("ctx->gpr[").Append(gpr).Append("] = ").Append(GprLocal(gpr)).AppendLine(";");
             foreach (var fpr in _writtenFprs)
-                if (sync.FlushesFpr(fpr))
+                if (sync.FlushesFpr(fpr) && IsDirty(dirty, 32 + fpr))
                     sb.Append(pad).Append("ctx->fpr[").Append(fpr).Append("] = ").Append(FprLocal(fpr)).AppendLine(";");
-            if (_writesCr && sync.FlushesCr) sb.Append(pad).AppendLine($"ctx->cr = {CrLocal};");
-            if (_writesCtr && sync.FlushesCtr) sb.Append(pad).AppendLine($"ctx->ctr = {CtrLocal};");
-            if (_writesXer && sync.FlushesXer) sb.Append(pad).AppendLine($"ctx->xer = {XerLocal};");
+            if (_writesCr && sync.FlushesCr && IsDirty(dirty, CrKey))
+            {
+                if (sync.FlushCrBits == uint.MaxValue) sb.Append(pad).AppendLine($"ctx->cr = {CrLocal};");
+                else
+                    sb.Append(pad).AppendLine(
+                        $"ctx->cr = (ctx->cr & 0x{~sync.FlushCrBits:X8}u) | ({CrLocal} & 0x{sync.FlushCrBits:X8}u);");
+            }
+            if (_writesCtr && sync.FlushesCtr && IsDirty(dirty, CtrKey)) sb.Append(pad).AppendLine($"ctx->ctr = {CtrLocal};");
+            if (_writesXer && sync.FlushesXer && IsDirty(dirty, XerKey)) sb.Append(pad).AppendLine($"ctx->xer = {XerLocal};");
+        }
+
+        private static bool IsDirty(UInt128 dirty, int key) => ((dirty >> key) & UInt128.One) != UInt128.Zero;
+
+        private static UInt128 FlushMask(ResidencyBoundarySync sync) =>
+            (UInt128)sync.FlushGprMask | ((UInt128)sync.FlushFprMask << 32) |
+            // A partial CR flush (FlushCrBits) leaves the local different from CpuContext: not clean.
+            (sync.FlushesCr && sync.FlushCrBits == uint.MaxValue ? UInt128.One << CrKey : UInt128.Zero) |
+            (sync.FlushesCtr ? UInt128.One << CtrKey : UInt128.Zero) |
+            (sync.FlushesXer ? UInt128.One << XerKey : UInt128.Zero);
+
+        private static UInt128 ReloadMask(ResidencyBoundarySync sync) =>
+            (UInt128)sync.ReloadGprMask | ((UInt128)sync.ReloadFprMask << 32) |
+            // A merged CR reload leaves the local different from CpuContext: not clean.
+            (sync.ReloadsCr && sync.ReloadKeepCrBits == 0 ? UInt128.One << CrKey : UInt128.Zero) |
+            (sync.ReloadsCtr ? UInt128.One << CtrKey : UInt128.Zero) |
+            (sync.ReloadsXer ? UInt128.One << XerKey : UInt128.Zero);
+
+        /// <summary>Starts one emission of the body: flushes are numbered from zero again.</summary>
+        public void BeginEmission()
+        {
+            _block = null;
+            _flushOrdinal = 0;
+            if (!_recording) return;
+            _blockOrder.Clear();
+            _blockEvents.Clear();
+            _eventOutsideBlock = false;
+        }
+
+        public void BeginBlock(string label)
+        {
+            _block = label;
+            if (_recording && !_blockEvents.ContainsKey(label))
+            {
+                _blockOrder.Add(label);
+                _blockEvents.Add(label, new List<SyncEvent>());
+            }
+        }
+
+        /// <summary>
+        /// Ends the per-block part of an emission. Anything emitted after this (the shared LR-continuation
+        /// dispatch) is reached outside the block CFG, so an event there disables the plan; the real pass also
+        /// checks it emitted exactly the flushes the plan was solved for.
+        /// </summary>
+        public void EndBlocks()
+        {
+            _block = null;
+            if (!_recording && _flushPlan is not null && _flushOrdinal != _flushPlan.DirtyAtFlush.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Register residency emitted {_flushOrdinal} flushes but its plan has {_flushPlan.DirtyAtFlush.Length}.");
+            }
+        }
+
+        private void RecordWrite(int key) => RecordEvent(new SyncEvent(SyncEventKind.Write, UInt128.One << key, true));
+
+        private void RecordEvent(SyncEvent syncEvent)
+        {
+            if (_block is null || !_blockEvents.TryGetValue(_block, out var events))
+            {
+                _eventOutsideBlock = true;
+                return;
+            }
+            events.Add(syncEvent);
+        }
+
+        private UInt128 WrittenMask()
+        {
+            var mask = UInt128.Zero;
+            foreach (var gpr in _writtenGprs) mask |= UInt128.One << gpr;
+            foreach (var fpr in _writtenFprs) mask |= UInt128.One << (32 + fpr);
+            if (_writesCr) mask |= UInt128.One << CrKey;
+            if (_writesCtr) mask |= UInt128.One << CtrKey;
+            if (_writesXer) mask |= UInt128.One << XerKey;
+            return mask;
+        }
+
+        private UInt128 NextFlushDirtySet()
+        {
+            if (_flushPlan is null) return UInt128.MaxValue;
+            var ordinal = _flushOrdinal++;
+            if (ordinal >= _flushPlan.DirtyAtFlush.Length ||
+                !string.Equals(_flushPlan.BlockAtFlush[ordinal], _block, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Register residency flush #{ordinal} in block {_block ?? "<none>"} does not match the recorded emission.");
+            }
+            return _flushPlan.DirtyAtFlush[ordinal];
+        }
+
+        /// <summary>
+        /// Solves which locals can differ from CpuContext at every flush the recording pass saw. A forward
+        /// may-analysis over <paramref name="successors"/>: the entry loads make every local equal CpuContext,
+        /// a write makes it dirty, and an unconditional flush or reload makes the synced locals clean again.
+        /// Blocks without a predecessor other than the entry start fully dirty, in case the emitter reaches them
+        /// some way the CFG does not show. Leaves <paramref name="target"/> without a plan (every flush stores the
+        /// whole write set, the old behaviour) when the recording saw an event outside a block or a CFG edge to a
+        /// block it did not emit.
+        /// </summary>
+        public void SolveFlushPlan(RegisterResidency target, Func<string, IReadOnlyList<string>> successors, string entryLabel,
+            UInt128 entryDirty = default)
+        {
+            if (!_recording) throw new InvalidOperationException("Only a recording residency can solve a flush plan.");
+            if (_eventOutsideBlock) return;
+            var count = _blockOrder.Count;
+            var index = new Dictionary<string, int>(count, StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < count; ++i) index[_blockOrder[i]] = i;
+            var predecessors = new List<int>[count];
+            for (var i = 0; i < count; ++i) predecessors[i] = new List<int>();
+            for (var i = 0; i < count; ++i)
+                foreach (var successor in successors(_blockOrder[i]))
+                {
+                    if (!index.TryGetValue(successor, out var to)) return;  // an edge to an unemitted block: no plan
+                    predecessors[to].Add(i);
+                }
+
+            var all = WrittenMask();
+            var entry = index.TryGetValue(entryLabel, out var entryIndex) ? entryIndex : -1;
+            if (entry < 0) return;
+            var dirtyIn = new UInt128[count];
+            var dirtyOut = new UInt128[count];
+            var storedUnion = UInt128.Zero;
+            UInt128 Transfer(int block, UInt128 dirty, List<(UInt128 Dirty, string Block)>? flushes)
+            {
+                foreach (var syncEvent in _blockEvents[_blockOrder[block]])
+                {
+                    switch (syncEvent.Kind)
+                    {
+                        case SyncEventKind.Write:
+                            dirty |= syncEvent.Mask;
+                            break;
+                        case SyncEventKind.Flush:
+                            if (flushes is not null) storedUnion |= dirty & syncEvent.Mask;
+                            flushes?.Add((dirty, _blockOrder[block]));
+                            if (syncEvent.Unconditional) dirty &= ~syncEvent.Mask;
+                            break;
+                        case SyncEventKind.Reload:
+                            if (syncEvent.Unconditional) dirty &= ~syncEvent.Mask;
+                            break;
+                    }
+                }
+                return dirty;
+            }
+
+            for (var i = 0; i < count; ++i)
+                dirtyIn[i] = i != entry && predecessors[i].Count == 0 ? all : UInt128.Zero;
+            // A register-passing body starts with its arguments only in locals.
+            dirtyIn[entry] |= entryDirty & all;
+            bool changed;
+            do
+            {
+                changed = false;
+                for (var i = 0; i < count; ++i)
+                {
+                    var incoming = dirtyIn[i];
+                    foreach (var predecessor in predecessors[i]) incoming |= dirtyOut[predecessor];
+                    var outgoing = Transfer(i, incoming, null);
+                    if (incoming != dirtyIn[i] || outgoing != dirtyOut[i])
+                    {
+                        dirtyIn[i] = incoming;
+                        dirtyOut[i] = outgoing;
+                        changed = true;
+                    }
+                }
+            } while (changed);
+
+            // Flush ordinals follow emission order, which is block order then event order.
+            var plan = new List<(UInt128 Dirty, string Block)>();
+            for (var i = 0; i < count; ++i) Transfer(i, dirtyIn[i], plan);
+            target._flushPlan = new FlushPlan(
+                plan.Select(static item => item.Dirty).ToArray(),
+                plan.Select(static item => item.Block).ToArray(),
+                storedUnion & all);
         }
 
         /// <summary>
@@ -204,16 +484,30 @@ public sealed partial class CxxLinearCodeGenerator
         public void AppendReload(StringBuilder sb, string pad) => AppendReload(sb, pad, ResidencyBoundarySync.Full);
 
         /// <summary>Contract-narrowed reload.</summary>
-        public void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+        public void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync) =>
+            AppendReload(sb, pad, sync, unconditional: false);
+
+        /// <summary><paramref name="unconditional"/> as for <see cref="AppendFlush(StringBuilder, string, ResidencyBoundarySync, bool)"/>.</summary>
+        public void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional)
         {
-            if (_recording) return;
+            if (_recording)
+            {
+                RecordEvent(new SyncEvent(SyncEventKind.Reload, ReloadMask(sync), unconditional));
+                return;
+            }
             foreach (var gpr in _gprs)
                 if (sync.ReloadsGpr(gpr))
                     sb.Append(pad).Append(GprLocal(gpr)).Append(" = ctx->gpr[").Append(gpr).AppendLine("];");
             foreach (var fpr in _fprs)
                 if (sync.ReloadsFpr(fpr))
                     sb.Append(pad).Append(FprLocal(fpr)).Append(" = ctx->fpr[").Append(fpr).AppendLine("];");
-            if (_cr && sync.ReloadsCr) sb.Append(pad).AppendLine($"{CrLocal} = ctx->cr;");
+            if (_cr && sync.ReloadsCr && sync.ReloadKeepCrBits != 0)
+            {
+                // MKW_EABI_REGS: the callee preserves these CR fields in this local; CpuContext's copy may be stale.
+                sb.Append(pad).AppendLine(
+                    $"{CrLocal} = ({CrLocal} & 0x{sync.ReloadKeepCrBits:X8}u) | (ctx->cr & 0x{~sync.ReloadKeepCrBits:X8}u);");
+            }
+            else if (_cr && sync.ReloadsCr) sb.Append(pad).AppendLine($"{CrLocal} = ctx->cr;");
             if (_ctr && sync.ReloadsCtr) sb.Append(pad).AppendLine($"{CtrLocal} = ctx->ctr;");
             if (_xer && sync.ReloadsXer) sb.Append(pad).AppendLine($"{XerLocal} = ctx->xer;");
         }
@@ -234,12 +528,103 @@ public sealed partial class CxxLinearCodeGenerator
         bool ReloadsCr,
         bool ReloadsCtr,
         bool FlushesXer = false,
-        bool ReloadsXer = false)
+        bool ReloadsXer = false,
+        uint ReloadKeepCrBits = 0,
+        uint FlushCrBits = uint.MaxValue)
     {
+        /// <summary>
+        /// MKW_EABI_REGS + MKW_EABI_CR_PARTIAL=1 (GuestEabi.PartialCrFlush; otherwise every bit): the CR bits an EABI-conformant callee (or an indirect target, assumed conformant) reads: cr1
+        /// only, the varargs FP-argument flag (GuestEabi.Mask keeps no other CR input). A flush with these bits publishes
+        /// just them, so a compare whose CR field only a branch reads need not be materialized for the call.
+        /// </summary>
+        public static uint EabiVarargCrBits => GuestEabi.PartialCrFlush ? 0x0F000000u : uint.MaxValue;
         public static ResidencyBoundarySync Full { get; } = new(
             uint.MaxValue, uint.MaxValue, true, true,
             uint.MaxValue, uint.MaxValue, true, true,
             FlushesXer: true, ReloadsXer: true);
+
+        /// <summary>
+        /// MKW_EABI_REGS: an indirect call. The target reads its arguments (r3-r10, f1-f8, cr1 for varargs) and the
+        /// stack/SDA pointers, and returns r3/r4/f1/f2; everything else this body holds survives in its locals.
+        /// </summary>
+        public static ResidencyBoundarySync EabiUnknownCall { get; } = new(
+            FlushGprMask: GuestEabi.InputGprMask,
+            FlushFprMask: GuestEabi.ArgumentFprMask,
+            FlushesCr: true,
+            FlushesCtr: true,
+            ReloadGprMask: GuestEabi.OutputGprMask,
+            ReloadFprMask: GuestEabi.OutputFprMask,
+            ReloadsCr: false,
+            ReloadsCtr: false,
+            FlushesXer: true,
+            ReloadsXer: false,
+            FlushCrBits: EabiVarargCrBits);
+
+        /// <summary>
+        /// MKW_EABI_REGS: the return of a conformant body. Callers see only r3/r4/f1/f2, and r1 must be back at
+        /// its entry value in CpuContext because an earlier flush in this body stored this frame's stack pointer.
+        /// </summary>
+        public static ResidencyBoundarySync EabiReturn { get; } = new(
+            FlushGprMask: GuestEabi.OutputGprMask | (1u << 1),
+            FlushFprMask: GuestEabi.OutputFprMask,
+            FlushesCr: false,
+            FlushesCtr: false,
+            ReloadGprMask: 0,
+            ReloadFprMask: 0,
+            ReloadsCr: false,
+            ReloadsCtr: false);
+
+        /// <summary>
+        /// MKW_EABI_REGS: the CpuContext side of a register-passing call. The callee starts from CpuContext's r1 (its
+        /// own context calls flush only what they wrote), XER (interrupt handlers serviced mid-call read SO from it,
+        /// as for <see cref="StateFreeResidentOuter"/>) and, for a varargs callee, CR.
+        /// </summary>
+        public static ResidencyBoundarySync EabiVariantOuter(bool flushesCr, bool flushesCtr) => new(
+            FlushGprMask: 1u << 1,
+            FlushFprMask: 0u,
+            FlushesCr: flushesCr,
+            FlushesCtr: flushesCtr,
+            ReloadGprMask: 0u,
+            ReloadFprMask: 0u,
+            ReloadsCr: false,
+            ReloadsCtr: false,
+            FlushesXer: true,
+            ReloadsXer: false,
+            FlushCrBits: EabiVarargCrBits);  // register-passing entries exist for conformant functions only
+
+        /// <summary>MKW_EABI_REGS: the return of a register-passing body: results go back as values, r1 to CpuContext.</summary>
+        public static ResidencyBoundarySync EabiVariantReturn { get; } = new(
+            FlushGprMask: 1u << 1,
+            FlushFprMask: 0u,
+            FlushesCr: false,
+            FlushesCtr: false,
+            ReloadGprMask: 0u,
+            ReloadFprMask: 0u,
+            ReloadsCr: false,
+            ReloadsCtr: false);
+
+        /// <summary>
+        /// MKW_EABI_REGS: never reload what the callee preserves. CpuContext's copies of r14-r31, f14-f31 and
+        /// cr2-cr4 are stale in this mode (a conformant callee works on its own copies and never writes them back),
+        /// so a reload would clobber the caller's live value. <paramref name="callee"/> null: an indirect target,
+        /// assumed conformant. A violator's contract already omits the nonvolatiles it provably restores.
+        /// </summary>
+        public ResidencyBoundarySync WithEabiPreservation(GuestAbiContract? callee)
+        {
+            if (!GuestEabi.Enabled) return this;
+            var conformant = callee is null || callee.EabiConformant;
+            var keepGpr = conformant ? GuestEabi.PreservedGprMask : GuestEabi.PreservedGprMask & ~callee!.GprPossibleWriteMask;
+            var keepFpr = conformant ? GuestEabi.NonvolatileFprMask : GuestEabi.NonvolatileFprMask & ~callee!.FprPossibleWriteMask;
+            var keepCr = conformant || (callee!.CrPossibleWriteMask & GuestEabi.NonvolatileCrFields) == 0
+                ? GuestEabi.NonvolatileCrBits
+                : 0u;
+            return this with
+            {
+                ReloadGprMask = ReloadGprMask & ~keepGpr,
+                ReloadFprMask = ReloadFprMask & ~keepFpr,
+                ReloadKeepCrBits = ReloadsCr ? keepCr : 0u
+            };
+        }
 
         /// <summary>
         /// Fast arm of a state-free call site (explicit-state ABI, locals carry args/results) still flushes r1 and XER unconditionally, since a guest gather-pipe store can trigger GX HLE mid-call servicing a VI retrace or OS alarm whose handlers read them architecturally.
@@ -323,7 +708,9 @@ public sealed partial class CxxLinearCodeGenerator
                 // Flushed unconditionally for the same reason as r1: interrupt handlers read XER.SO out
                 // of the architectural copy. Reload stays contract-driven so a handler can't clobber it.
                 FlushesXer: true,
-                ReloadsXer: contract.MayWriteXer);
+                ReloadsXer: contract.MayWriteXer,
+                // MKW_EABI_REGS: a conformant callee's CR input is cr1 at most (GuestEabi.Mask).
+                FlushCrBits: contract.EabiConformant ? EabiVarargCrBits : uint.MaxValue);
         }
     }
 
@@ -333,6 +720,116 @@ public sealed partial class CxxLinearCodeGenerator
     [ThreadStatic]
     private static RegisterResidency? _activeResidency;
 
+    /// <summary>MKW_EABI_REGS: the body being emitted belongs to an EABI-conformant function.</summary>
+    [ThreadStatic]
+    private static bool _eabiConformantBody;
+
+    /// <summary>
+    /// The flush before a return. A conformant body publishes only r1 and the EABI results; its callers keep
+    /// everything else in their own locals. Other bodies publish every written local.
+    /// </summary>
+    private static void AppendReturnFlush(StringBuilder sb, string pad)
+    {
+        if (_eabiVariantBody is not null) AppendFlush(sb, pad, ResidencyBoundarySync.EabiVariantReturn);
+        else if (_eabiConformantBody) AppendFlush(sb, pad, ResidencyBoundarySync.EabiReturn);
+        else AppendFlush(sb, pad);
+    }
+
+    /// <summary>MKW_EABI_REGS: the register-passing entry being emitted, if any (see <see cref="GuestEabiVariant"/>).</summary>
+    [ThreadStatic]
+    private static GuestEabiVariant? _eabiVariantBody;
+
+    /// <summary>MKW_EABI_REGS: every register-passing entry, for this body's direct call sites.</summary>
+    [ThreadStatic]
+    private static IReadOnlyDictionary<uint, GuestEabiVariant>? _eabiVariants;
+
+    /// <summary>
+    /// The statement that leaves the body: <c>return;</c>, or in a register-passing entry its results, from the
+    /// locals or (after a tail dispatch that left them in CpuContext) from <paramref name="fromContext"/>.
+    /// Order: r3, r4, f1, f2, matching <see cref="EmitEabiVariantCall"/>.
+    /// </summary>
+    private static string ReturnStatement(bool fromContext = false)
+    {
+        var variant = _eabiVariantBody;
+        if (variant is null || variant.OutputCount == 0) return "return;";
+        var locals = !fromContext && _activeResidency is not null;
+        var values = new List<string>(2);
+        for (var gpr = 3; gpr <= 4; ++gpr)
+            if ((variant.OutputGprMask & (1u << gpr)) != 0)
+                values.Add(locals ? $"static_cast<uint64_t>({RegisterResidency.GprLocal(gpr)})" : $"static_cast<uint64_t>(ctx->gpr[{gpr}])");
+        for (var fpr = 1; fpr <= 2; ++fpr)
+            if ((variant.OutputFprMask & (1u << fpr)) != 0)
+                values.Add(locals ? $"{RegisterResidency.FprLocal(fpr)}.raw" : $"ctx->fpr[{fpr}].raw");
+        return values.Count switch
+        {
+            1 => $"return {values[0]};",
+            2 => $"return MkwEabiPair{{{values[0]}, {values[1]}}};",
+            _ => $"return MkwEabiQuad{{{{{string.Join(", ", values)}}}}};"
+        };
+    }
+
+    private static string EabiVariantReturnType(GuestEabiVariant variant) =>
+        variant.OutputCount switch { 0 => "void", 1 => "uint64_t", 2 => "MkwEabiPair", _ => "MkwEabiQuad" };
+
+    private static string EabiVariantPrototype(GuestEabiVariant variant, bool includeNames)
+    {
+        var parameters = new List<string> { includeNames ? "CpuContext* MKW_RESTRICT ctx" : "CpuContext*" };
+        for (var gpr = 0; gpr < 32; ++gpr)
+            if ((variant.InputGprMask & (1u << gpr)) != 0) parameters.Add(includeNames ? $"uint32_t eabi_r{gpr}" : "uint32_t");
+        for (var fpr = 0; fpr < 32; ++fpr)
+            if ((variant.InputFprMask & (1u << fpr)) != 0) parameters.Add(includeNames ? $"PPC_FPR eabi_f{fpr}" : "PPC_FPR");
+        return $"extern \"C\" MKW_PPC_NO_INLINE {EabiVariantReturnType(variant)} {variant.Symbol}({string.Join(", ", parameters)})";
+    }
+
+    /// <summary>
+    /// A direct call through a register-passing entry: the arguments are this body's locals, the results land in
+    /// its locals, and nothing is reloaded (the callee preserves everything else per the EABI). CpuContext gets
+    /// only what <see cref="ResidencyBoundarySync.EabiVariantOuter"/> publishes.
+    /// </summary>
+    private static void EmitEabiVariantCall(
+        StringBuilder sb, string pad, int bufferBaseLength, GuestEabiVariant variant, GuestAbiContract? callee)
+    {
+        var residency = _activeResidency ?? throw new InvalidOperationException(
+            $"Register-passing call to 0x{variant.Address:X8} without an active residency.");
+        AppendFlush(sb, pad, ResidencyBoundarySync.EabiVariantOuter(
+            (callee?.CrReadBeforeWriteMask ?? 0) != 0, callee?.ReadsCtrBeforeWrite ?? false), unconditional: true);
+        var arguments = new List<string> { "ctx" };
+        for (var gpr = 0; gpr < 32; ++gpr)
+            if ((variant.InputGprMask & (1u << gpr)) != 0) arguments.Add(residency.Gpr(gpr, written: false));
+        for (var fpr = 0; fpr < 32; ++fpr)
+            if ((variant.InputFprMask & (1u << fpr)) != 0) arguments.Add(residency.FprStorage(fpr, written: false));
+        var call = $"{variant.Symbol}({string.Join(", ", arguments)})";
+        if (variant.OutputCount == 0)
+        {
+            sb.AppendLine($"{pad}{call};");
+            return;
+        }
+        var result = $"eabi_result_{variant.Address:X8}_{bufferBaseLength + sb.Length:X}";
+        sb.AppendLine($"{pad}const auto {result} = {call};");
+        var index = 0;
+        string Next() => variant.OutputCount switch
+        {
+            1 => result,
+            2 => index++ == 0 ? $"{result}.first" : $"{result}.second",
+            _ => $"{result}.v[{index++}]"
+        };
+        for (var gpr = 3; gpr <= 4; ++gpr)
+            if ((variant.OutputGprMask & (1u << gpr)) != 0)
+                sb.AppendLine($"{pad}{residency.Gpr(gpr, written: true)} = static_cast<uint32_t>({Next()});");
+        for (var fpr = 1; fpr <= 2; ++fpr)
+            if ((variant.OutputFprMask & (1u << fpr)) != 0)
+                sb.AppendLine($"{pad}{residency.FprStorage(fpr, written: true)}.raw = {Next()};");
+    }
+
+    /// <summary>
+    /// Flush only the locals written since the last sync (<see cref="RegisterResidency.SolveFlushPlan"/>).
+    /// MKW_RESIDENCY_DIRTY_FLUSH=0 restores storing the whole write set at every flush, for A/B comparison.
+    /// </summary>
+    private static readonly bool ResidencyDirtyFlushEnabled =
+        Environment.GetEnvironmentVariable("MKW_RESIDENCY_DIRTY_FLUSH") != "0";
+
+    /// <summary>MKW_LEAN_RANGES=0: the earlier range-lowering thresholds (see the call in EmitWithFacts).</summary>
+    private static readonly bool LeanRanges = Environment.GetEnvironmentVariable("MKW_LEAN_RANGES") != "0";
     private static void AppendFlush(StringBuilder sb, string pad)
     {
         if (_activeResidency is { } residency) residency.AppendFlush(sb, pad);
@@ -343,14 +840,14 @@ public sealed partial class CxxLinearCodeGenerator
         if (_activeResidency is { } residency) residency.AppendReload(sb, pad);
     }
 
-    private static void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+    private static void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional = false)
     {
-        if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, sync);
+        if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, sync, unconditional);
     }
 
-    private static void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync)
+    private static void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional = false)
     {
-        if (_activeResidency is { } residency) residency.AppendReload(sb, pad, sync);
+        if (_activeResidency is { } residency) residency.AppendReload(sb, pad, sync, unconditional);
     }
 
     /// <summary>
@@ -361,14 +858,17 @@ public sealed partial class CxxLinearCodeGenerator
         IReadOnlyDictionary<uint, GuestAbiContract> guestAbiContracts,
         IReadOnlySet<uint> modOverridableCallTargets)
     {
-        if (_activeResidency is null ||
-            modOverridableCallTargets.Contains(target) ||
-            !guestAbiContracts.TryGetValue(target, out var contract))
+        guestAbiContracts.TryGetValue(target, out var known);
+        if (_activeResidency is null || modOverridableCallTargets.Contains(target))
         {
-            return ResidencyBoundarySync.Full;
+            return ResidencyBoundarySync.Full.WithEabiPreservation(known);
+        }
+        if (known is not { } contract)
+        {
+            return ResidencyBoundarySync.Full.WithEabiPreservation(null);
         }
 
-        return ResidencyBoundarySync.FromCalleeContract(contract);
+        return ResidencyBoundarySync.FromCalleeContract(contract).WithEabiPreservation(contract);
     }
 
     /// <summary>

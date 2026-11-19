@@ -48,6 +48,8 @@ var functionMap = project?.Translation.FunctionMapPath is { } functionMapPath
 if (functionMap is not null)
 {
     GuestSaveRestoreThunks.Current = GuestSaveRestoreThunks.FromFunctionMap(functionMap);
+    GuestSaveRestoreThunks.FrameAnalysis =
+        GuestSaveRestoreThunks.FromCodeWarriorRuntimeNames(functionMap, GuestSaveRestoreThunks.Current);
 }
 var root = project?.WorkspaceRoot ?? Directory.GetCurrentDirectory();
 var dolFile = new Lazy<DolFile>(LoadDol);
@@ -168,7 +170,8 @@ int RunEmitBuildShards(string[] argsTail)
             nativeSourcePath,
             // Brawl translates main.dol with all 126 .rel modules (~100k functions): far more shards than 72.
             BaseShardCount: int.Parse(OptionValue(argsTail, "--base-shards") ?? "72", CultureInfo.InvariantCulture),
-            NativeIndex: nativeIndex));
+            NativeIndex: nativeIndex,
+            CodeVariantsDirectory: OptionValue(argsTail, "--code-variants") is { } variants ? Path.GetFullPath(variants) : null));
         Console.WriteLine("[translator] emitted stable translated build graph");
         Console.WriteLine($"  base functions: {result.BaseFunctionCount:N0}");
         Console.WriteLine($"  shared base functions: {result.SharedBaseFunctionCount:N0}");
@@ -243,6 +246,10 @@ int RunTranslateRecursive(string[] argsTail)
     }
     // Mod support (guest code guards) needs every call to enter through func_<addr>, never a state-free variant.
     var disableStateFreeAbi = HasFlag(argsTail, "--no-state-free-abi");
+    // Translations of functions as a mod's fixed code patches leave them (CodeVariants.cs), after the base emission.
+    var codeVariantSpecPath = OptionValue(argsTail, "--code-variants");
+    var codeVariantOutDir = OptionValue(argsTail, "--code-variants-out") ??
+        Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outDir))!, "code_variants");
     if (!emitFunctionFiles && string.IsNullOrWhiteSpace(productionSourceBundlePath))
         throw new ArgumentException("--no-function-files requires --production-source-bundle.");
     BaseTranslationOutputMetadata? previousOutputMetadata = null;
@@ -768,7 +775,82 @@ int RunTranslateRecursive(string[] argsTail)
             // Calls to a registered native observe the native implementation's
             // contract, not the excluded PPC body that happens to share its address.
             foreach (var pair in nativeGuestEffects.Contracts)
-                guestAbiContracts[pair.Key] = pair.Value;
+                guestAbiContracts[pair.Key] = GuestEabi.Enabled ? GuestEabi.ClassifyNative(pair.Key, pair.Value).Contract : pair.Value;
+
+            if (GuestEabi.Enabled)
+            {
+                // Which functions keep their exact contract, and why (first failing rule).
+                var violations = interproceduralGuestAbi.EabiViolations;
+                var nativeViolations = interproceduralGuestAbi.EabiNativeViolations;
+                var directlyCalledForEabiStats = localGuestAbiContracts.Values
+                    .SelectMany(static contract => contract.DirectCallTargets).ToHashSet();
+                var translatedViolations = violations.Where(pair => !nativeGuestEffects.Contracts.ContainsKey(pair.Key)).ToArray();
+                var directViolators = translatedViolations.Count(pair => directlyCalledForEabiStats.Contains(pair.Key));
+                Console.WriteLine(
+                    $"[translator] EABI mode: {guestAbiContracts.Count(pair => pair.Value.EabiConformant):N0} conformant contracts, " +
+                    $"{translatedViolations.Length:N0} translated violators ({directViolators:N0} directly called), " +
+                    $"{nativeViolations.Count:N0} native violators");
+                foreach (var group in translatedViolations
+                             .GroupBy(pair => System.Text.RegularExpressions.Regex.Replace(pair.Value, @"[rf]\d+(,[rf]\d+)*", "R"))
+                             .OrderByDescending(group => group.Count()))
+                {
+                    Console.WriteLine($"[translator]   {group.Count(),6:N0} {group.Key}: " + string.Join(" ",
+                        group.OrderBy(pair => pair.Key).Take(12).Select(pair => $"{baseWork[pair.Key].Name}({pair.Value})")));
+                }
+                foreach (var pair in nativeViolations.OrderBy(pair => pair.Key))
+                    Console.WriteLine($"[translator]   native 0x{pair.Key:X8}: {pair.Value}");
+                // Roots: violators none of whose direct callees fails the same rule (the rest inherit it).
+                string Rule(string reason) => System.Text.RegularExpressions.Regex.Replace(reason, @"[rf]\d+(,[rf]\d+)*", "R");
+                var roots = translatedViolations
+                    .Where(pair => !localGuestAbiContracts[pair.Key].DirectCallTargets.Any(target =>
+                        violations.TryGetValue(target, out var calleeReason) && Rule(calleeReason) == Rule(pair.Value)))
+                    .ToArray();
+                // Runtime helpers the effect catalog does not know: modelled as complete boundaries (every register).
+                var completeHelpers = canonicalGuestFunctions.Values
+                    .SelectMany(static function => function.Blocks.SelectMany(static block => block.Instructions))
+                    .OfType<IrCall>()
+                    .Where(static call => !GuestTargetParser.TryParseAddress(call.Target, out _) &&
+                        (GuestHelperEffectCatalog.Analyze(call).BoundaryFlags & GuestCallBoundaryFlags.RequiresCompleteContext) != 0)
+                    .GroupBy(static call => call.Target)
+                    .OrderByDescending(static group => group.Count())
+                    .Take(20)
+                    .Select(static group => $"{group.Key} {group.Count():N0}");
+                Console.WriteLine("[translator] complete-boundary helper calls: " + string.Join(", ", completeHelpers));
+                Console.WriteLine($"[translator] EABI violation roots: {roots.Length:N0}");
+                foreach (var group in roots.GroupBy(pair => Rule(pair.Value)).OrderByDescending(group => group.Count()))
+                    Console.WriteLine($"[translator]   {group.Count(),6:N0} {group.Key}: " + string.Join(" ",
+                        group.OrderBy(pair => pair.Key).Take(40).Select(pair => $"{pair.Key:X8}({pair.Value})")));
+                // Where each failing property comes from: the direct callees whose published contract carries it
+                // (whatever rule they fail first), or "own" when none does.
+                Func<GuestAbiContract, bool>? Property(string rule) => rule switch
+                {
+                    _ when rule.StartsWith("writes R/R") => c => (c.GprPossibleWriteMask & 0x2004u) != 0,
+                    _ when rule.StartsWith("reads CTR") => c => c.EabiReadsCtr,
+                    _ when rule.StartsWith("reads scratch GPR") => c => (c.EabiGprReadMask & 0x1801u) != 0,
+                    _ when rule.StartsWith("reads scratch FPR") => c => (c.EabiFprReadMask & 0x3E01u) != 0,
+                    _ when rule.StartsWith("writes cR") => c => (c.CrPossibleWriteMask & 0x1C) != 0,
+                    _ when rule.StartsWith("reads caller") => c => (c.EabiGprReadMask & 0xFFFFC000u) != 0 ||
+                                                                   (c.EabiFprReadMask & 0xFFFFC000u) != 0,
+                    _ => null
+                };
+                var sources = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var pair in translatedViolations)
+                {
+                    if (Property(Rule(pair.Value)) is not { } has) continue;
+                    var carriers = localGuestAbiContracts[pair.Key].DirectCallTargets
+                        .Where(target => guestAbiContracts.TryGetValue(target, out var c) && has(c)).ToArray();
+                    if (carriers.Length != 0) continue;
+                    var key = Rule(pair.Value);
+                    sources[key] = sources.GetValueOrDefault(key) + 1;
+                    if (sources[key] <= 6)
+                        Console.WriteLine($"[translator]   own source of '{key}': {pair.Key:X8} {baseWork[pair.Key].Name}");
+                }
+                Console.WriteLine("[translator] own sources per rule: " + string.Join(", ", sources.Select(pair => $"{pair.Key} {pair.Value}")));
+                var eabiViolationsPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outDir))!, "eabi_violations.txt");
+                File.WriteAllLines(eabiViolationsPath, translatedViolations.OrderBy(pair => pair.Key)
+                    .Select(pair => $"0x{pair.Key:X8} {pair.Value}")
+                    .Concat(nativeViolations.OrderBy(pair => pair.Key).Select(pair => $"0x{pair.Key:X8} native: {pair.Value}")));
+            }
 
             // Determine the state that is actually consumed after each direct
             // call. Public CpuContext wrappers retain the complete architectural
@@ -833,6 +915,11 @@ int RunTranslateRecursive(string[] argsTail)
                 BitOperations.PopCount((uint)contract.GqrPossibleWriteMask) +
                 BitOperations.PopCount((uint)contract.HidPossibleWriteMask);
 
+            // The same input budget the emitter applies (CxxLinearCodeGenerator.StateFreeMaxInputs): Windows x64 passes
+            // four arguments in registers, SysV x86-64 six (plus eight FP), AArch64 eight (plus eight FP).
+            var stateFreeMaxInputs =
+                int.TryParse(Environment.GetEnvironmentVariable("MKW_STATE_FREE_MAX_INPUTS"), out var maxInputs) && maxInputs > 0
+                    ? maxInputs : 4;
             GuestAbiContract PlannedStateFreeContract(uint address)
             {
                 var publicContract = guestAbiContracts[address];
@@ -865,6 +952,42 @@ int RunTranslateRecursive(string[] argsTail)
             var componentByAddress = components
                 .SelectMany(static (component, index) => component.Select(address => (address, index)))
                 .ToDictionary(static pair => pair.address, static pair => pair.index);
+            {
+                // Which state-free eligibility rule rejects how many directly called functions (first failing
+                // rule per function), to aim the register-ABI work at the rule that matters.
+                int excluded = 0, fenced = 0, needsContext = 0, tooManyInputs = 0, tooManyOutputs = 0, eligible = 0;
+                var inputHistogram = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var address in directlyCalledGuestFunctions)
+                {
+                    if (!localGuestAbiContracts.ContainsKey(address) || !canonicalGuestFunctions.ContainsKey(address)) continue;
+                    if (residentTranslationExclusions.Contains(address)) ++excluded;
+                    else if (localGuestAbiContracts[address].HasFullSynchronizationFence) ++fenced;
+                    else if (!GuestStateLivenessAnalyzer.CanDeconstructWithoutContext(canonicalGuestFunctions[address])) ++needsContext;
+                    else if (StateFreeInputValueCount(PlannedStateFreeContract(address)) > stateFreeMaxInputs)
+                    {
+                        ++tooManyInputs;
+                        var planned = PlannedStateFreeContract(address);
+                        var gprIn = GuestStateLivenessAnalyzer.RequiredStateFreeGprInputs(planned, planned.GprPossibleWriteMask);
+                        for (var r = 0; r < 32; ++r) if ((gprIn & (1u << r)) != 0) inputHistogram[$"r{r}"] = inputHistogram.GetValueOrDefault($"r{r}") + 1;
+                        if ((planned.FprReadBeforeWriteMask | planned.FprPossibleWriteMask) != 0) inputHistogram["fpr"] = inputHistogram.GetValueOrDefault("fpr") + 1;
+                        if (planned.CrReadBeforeWriteMask != 0 || planned.CrPossibleWriteMask != 0) inputHistogram["cr"] = inputHistogram.GetValueOrDefault("cr") + 1;
+                        if (planned.ReadsLrBeforeWrite || planned.MayWriteLr) inputHistogram["lr"] = inputHistogram.GetValueOrDefault("lr") + 1;
+                        if (planned.ReadsCtrBeforeWrite || planned.MayWriteCtr) inputHistogram["ctr"] = inputHistogram.GetValueOrDefault("ctr") + 1;
+                        if (planned.ReadsXerBeforeWrite || planned.MayWriteXer) inputHistogram["xer"] = inputHistogram.GetValueOrDefault("xer") + 1;
+                        if ((planned.GqrReadBeforeWriteMask | planned.GqrPossibleWriteMask) != 0) inputHistogram["gqr"] = inputHistogram.GetValueOrDefault("gqr") + 1;
+                    }
+                    else if (StateFreeOutputValueCount(PlannedStateFreeContract(address)) > 2) ++tooManyOutputs;
+                    else ++eligible;
+                }
+                Console.WriteLine(
+                    $"[translator] state-free rejections of {directlyCalledGuestFunctions.Count:N0} directly called: " +
+                    $"excluded {excluded:N0}, full-sync fence {fenced:N0}, needs context (indirect/jump table) " +
+                    $"{needsContext:N0}, inputs>4 {tooManyInputs:N0}, outputs>2 {tooManyOutputs:N0}, " +
+                    $"locally eligible {eligible:N0} (before the closed-component rule)");
+                Console.WriteLine("[translator] inputs>4 rejects, functions per input: " + string.Join(", ",
+                    inputHistogram.OrderByDescending(static pair => pair.Value)
+                        .Select(static pair => $"{pair.Key} {pair.Value:N0}")));
+            }
             var eligibleComponents = components
                 .Select((component, index) => new
                 {
@@ -874,7 +997,7 @@ int RunTranslateRecursive(string[] argsTail)
                         !localGuestAbiContracts[address].HasFullSynchronizationFence &&
                         GuestStateLivenessAnalyzer.CanDeconstructWithoutContext(canonicalGuestFunctions[address]) &&
                         (!directlyCalledGuestFunctions.Contains(address) ||
-                         (StateFreeInputValueCount(PlannedStateFreeContract(address)) <= 4 &&
+                         (StateFreeInputValueCount(PlannedStateFreeContract(address)) <= stateFreeMaxInputs &&
                           StateFreeOutputValueCount(PlannedStateFreeContract(address)) <= 2)))
                 })
                 .Where(static item => item.eligible)
@@ -895,7 +1018,8 @@ int RunTranslateRecursive(string[] argsTail)
                     removedComponent = true;
                 }
             } while (removedComponent);
-            var stateFreeAbiFunctions = disableStateFreeAbi
+            // MKW_EABI_REGS replaces the state-free ABI (its clones assume exact contracts and no CpuContext).
+            var stateFreeAbiFunctions = disableStateFreeAbi || GuestEabi.Enabled
                 ? new HashSet<uint>()
                 : eligibleComponents
                     .SelectMany(index => components[index])
@@ -904,6 +1028,67 @@ int RunTranslateRecursive(string[] argsTail)
             Console.WriteLine(
                 $"[translator] Automatic state-free region ABI: {stateFreeAbiFunctions.Count:N0} directly called function(s) " +
                 $"across {eligibleComponents.Count:N0} closed component(s).");
+
+            // MKW_EABI_REGS register-passing entries: every directly called conformant translated function whose
+            // direct callers read at most two of its results (r3, r4, f1, f2; the union over all call sites from the
+            // liveness above). Inputs: the argument registers it reads, plus results it may leave unwritten, plus
+            // FPR results (a scalar write keeps the incoming PS1).
+            var eabiVariants = new Dictionary<uint, GuestEabiVariant>();
+            if (GuestEabi.VariantsEnabled)
+            {
+                // Functions a native replaces inside their wrapper (MKW_NATIVE_BODY bodies such as PSMTXConcat, native
+                // hooks such as g3d's DrawResMdlDirectly): an entry runs the translated code directly and would skip the
+                // native (PSMTXConcat's 258 entry call sites did), so they keep the wrapper call.
+                var wrapperNatives = TranslatedBuildShardEmitter.WrapperNativeAddresses(
+                    RequireProject().Runtime.NativeRegistrationRoot);
+                var tooManyResults = 0;
+                var overBudget = 0;
+                static int EabiBudget(string name, int fallback) =>
+                    int.TryParse(Environment.GetEnvironmentVariable(name), out var value) ? value : fallback;
+                var resultShapes = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var address in directlyCalledGuestFunctions.OrderBy(static address => address))
+                {
+                    if (!guestAbiContracts.TryGetValue(address, out var contract) || !contract.EabiConformant ||
+                        nativeGuestEffects.Contracts.ContainsKey(address) || wrapperNatives.Contains(address) ||
+                        residentTranslationExclusions.Contains(address) ||
+                        !canonicalGuestFunctions.ContainsKey(address))
+                        continue;
+                    var demanded = demandedStateFreeOutputs.GetValueOrDefault(address);
+                    var outGpr = contract.GprPossibleWriteMask & demanded.Gpr & GuestEabi.OutputGprMask;
+                    var outFpr = contract.FprPossibleWriteMask & demanded.Fpr & GuestEabi.OutputFprMask;
+                    var variant = new GuestEabiVariant(
+                        address,
+                        $"func_{address:X8}_eabi",
+                        (contract.GprReadBeforeWriteMask & (GuestEabi.ArgumentGprMask | GuestEabi.ScratchGprMask | (1u << 1))) |
+                            (outGpr & ~contract.GprDefiniteWriteMask),
+                        (contract.FprReadBeforeWriteMask & (GuestEabi.ArgumentFprMask | GuestEabi.ScratchFprMask)) | outFpr,
+                        outGpr,
+                        outFpr);
+                    var shape = (variant.OutputGprMask & 8u) != 0 ? "r3" : "";
+                    if ((variant.OutputGprMask & 16u) != 0) shape += "+r4";
+                    if ((variant.OutputFprMask & 2u) != 0) shape += "+f1";
+                    if ((variant.OutputFprMask & 4u) != 0) shape += "+f2";
+                    resultShapes[shape] = resultShapes.GetValueOrDefault(shape) + 1;
+                    if (variant.OutputCount > 2) ++tooManyResults;  // returned in memory (MkwEabiQuad)
+                    // The host register budget (SysV x86-64: six integer arguments, one of them ctx, eight FP, two
+                    // integer results); larger signatures pass through memory and cost more than CpuContext.
+                    if (BitOperations.PopCount(variant.InputGprMask) > EabiBudget("MKW_EABI_MAX_GPR_ARGS", 5) ||
+                        BitOperations.PopCount(variant.InputFprMask) > EabiBudget("MKW_EABI_MAX_FPR_ARGS", 8) ||
+                        variant.OutputCount > EabiBudget("MKW_EABI_MAX_RESULTS", 2))
+                    {
+                        ++overBudget;
+                        continue;
+                    }
+                    eabiVariants[address] = variant;
+                }
+                Console.WriteLine(
+                    $"[translator] EABI register-passing entries: {eabiVariants.Count:N0} of {directlyCalledGuestFunctions.Count:N0} " +
+                    $"directly called ({tooManyResults:N0} with three or four results read; {overBudget:N0} over the host " +
+                    "register budget left as CpuContext calls); results read: " +
+                    string.Join(", ", resultShapes.OrderByDescending(static pair => pair.Value).Select(static pair => $"{pair.Key} {pair.Value:N0}")));
+                var handWritten = GuestEabi.CheckHandWrittenPrototypes(RequireProject().Runtime.NativeRegistrationRoot, eabiVariants);
+                Console.WriteLine($"[translator] EABI entries: {handWritten:N0} hand-written runtime declaration(s) match their entries");
+            }
 
             // The two suffixes are appended to the same sanitized stem rather than
             // derived from each other: rewriting "_resident" into "_statefree"
@@ -957,7 +1142,8 @@ int RunTranslateRecursive(string[] argsTail)
                         StateFreeCallSymbols: stateFreeCallSymbols,
                         StateFreeCallSiteVariants: stateFreeCallSiteVariantsByCaller.GetValueOrDefault(address),
                          StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
-                         ModOverridableCallTargets: modOverridableCallTargets),
+                         ModOverridableCallTargets: modOverridableCallTargets,
+                         EabiVariants: eabiVariants),
                     residentPolicy,
                     address);
             }
@@ -1246,6 +1432,15 @@ int RunTranslateRecursive(string[] argsTail)
                         if (outputMetadata is not null)
                         {
                             var metadata = BaseTranslationFunctionMetadata.FromTranslation(outDir, path, emitted);
+                            // Canonical lowering no longer has the decoded instructions; discovery's coalesced
+                            // [start, end) ranges give the exact guest instruction count (the expansion gate's divisor).
+                            if (translatedFlowCoverage.TryGetValue(address, out var coverage) && metadata.Build is { } build)
+                            {
+                                var guestInstructions = 0;
+                                for (var k = 0; k + 1 < coverage.Length; k += 2)
+                                    guestInstructions += (int)((coverage[k + 1] - coverage[k]) / 4);
+                                metadata = metadata with { Build = build with { GuestInstructions = guestInstructions } };
+                            }
                             if (interiorEntryPoints.Contains(address))
                             {
                                 metadata = metadata with { InteriorToOtherTranslation = true };
@@ -1292,6 +1487,53 @@ int RunTranslateRecursive(string[] argsTail)
             }
             bundleWriter?.Complete();
             LogPhase("emission wave + bundle write");
+            if (codeVariantSpecPath is not null)
+            {
+                var variantProviders = new List<IGuestFunctionAbiProvider>();
+                if (declaredNativeAbi.Value is { } variantNativeAbi)
+                    variantProviders.Add(variantNativeAbi);
+                variantProviders.Add(inferredGuestAbi.Value);
+                CodeVariants.Translate(
+                    CodeVariants.ReadSpec(codeVariantSpecPath),
+                    image.Value,
+                    new CompositeGuestFunctionAbiProvider(variantProviders.ToArray()),
+                    knownBaseFunctionEntryPoints,
+                    guestAbiContracts,
+                    allowUnsupportedInstructions,
+                    codeVariantOutDir,
+                    maxThreads);
+                LogPhase("code variants");
+            }
+            // The float ABI translated callers assume of each translated function (EmitNormalizeGuestCallFloatArguments /
+            // EmitNormalizeGuestCallFloatReturn ask the same providers), for the interpreter's calls into translated code:
+            // the shard emitter's guest float ABI table. Read after every emission: a lookup that misses the cache runs
+            // the inference from that function instead of from a caller, which can conclude differently and would
+            // change what later callers emit.
+            if (outputMetadataPath is not null)
+            {
+                var floatAbiProviders = new List<IGuestFunctionAbiProvider>();
+                if (declaredNativeAbi.Value is { } floatAbiNative) floatAbiProviders.Add(floatAbiNative);
+                floatAbiProviders.Add(inferredGuestAbi.Value);
+                var floatAbiProvider = new CompositeGuestFunctionAbiProvider(floatAbiProviders.ToArray());
+                var floatAbiLines = new StringBuilder("# address scalar-float-argument-mask(bit n = fn, f1-f13) paired-scalar-return\n");
+                foreach (var floatAbiAddress in emissionAddresses)
+                {
+                    if (!floatAbiProvider.TryGetGuestFunctionAbi($"0x{floatAbiAddress:X8}", out var floatAbi)) continue;
+                    var floatAbiMask = 0u;
+                    for (var floatAbiFpr = 1; floatAbiFpr <= 13; floatAbiFpr++)
+                    {
+                        if (floatAbi.HasScalarFloatArgument($"f{floatAbiFpr}")) floatAbiMask |= 1u << floatAbiFpr;
+                    }
+                    if (floatAbiMask != 0 || floatAbi.ReturnsPairedScalarFloat)
+                    {
+                        floatAbiLines.Append($"{floatAbiAddress:X8} {floatAbiMask:X4} {(floatAbi.ReturnsPairedScalarFloat ? 1 : 0)}\n");
+                    }
+                }
+                FileOutput.WriteTextIfChanged(
+                    Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outputMetadataPath))!,
+                        TranslatedBuildShardEmitter.GuestFloatAbiFileName),
+                    floatAbiLines.ToString());
+            }
             if (outputMetadata is not null)
             {
                 var bundleReference = productionSourceBundlePath is null
@@ -1366,6 +1608,12 @@ int RunTranslateRecursive(string[] argsTail)
     var endTime2 = DateTime.Now;
     var totalDuration2 = endTime2 - startTime;
     Console.WriteLine($"[translator] Translation completed at {endTime2:HH:mm:ss}, total time: {totalDuration2.TotalSeconds:F2} seconds");
+    if (CxxLinearCodeGenerator.FlagDiagEnabled)
+    {
+        Console.WriteLine($"[translator] flag diag: {CxxLinearCodeGenerator.FlagDiagBranches} single-bit CR branches; " +
+            $"fused {CxxLinearCodeGenerator.FlagDiagFused}, live only via return {CxxLinearCodeGenerator.FlagDiagLiveOnlyViaReturn}, " +
+            $"live via calls/fences {CxxLinearCodeGenerator.FlagDiagLiveViaCall}, other {CxxLinearCodeGenerator.FlagDiagOther}");
+    }
 
     return 0;
 }
@@ -2037,7 +2285,9 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--no-function-files"),
         new("--no-state-free-abi"),
         new("--data-in-text", "path"),
-        new("--prune-stale")
+        new("--prune-stale"),
+        new("--code-variants", "spec"),
+        new("--code-variants-out", "path")
     }),
     "emit-build-shards" => (null, new CommandOption[]
     {
@@ -2045,7 +2295,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--base-functions-dir", "path"),
         new("--native-source-dir", "path"),
         new("--out", "generated/build_shards"),
-        new("--base-shards", "72")
+        new("--base-shards", "72"),
+        new("--code-variants", "path")
     }),
     _ => null
 };
@@ -2143,6 +2394,24 @@ ProgramImage LoadImage()
         $"(entry 0x{dol.EntryPoint:X8}).");
 
     var relImage = relFile.Value?.BuildImage(loadedProject.Inputs.Rel!.LoadAddress);
+    // Code a constant-address store must not reach check-free (lean memory skips the store policy there): main.dol's
+    // own text sections (index 0/1, .init and .text; later text sections are added for translation, as in
+    // ProgramImageBuilder) and the REL's executable sections where it loads.
+    var guardedCode = dol.Sections
+        .Where(static s => s.Kind == SectionKind.Text && s.Index < 2 && s.Size != 0)
+        .Select(static s => s.Range)
+        .ToList();
+    if (relFile.Value is { } guardedRel)
+    {
+        var guardedRelBase = loadedProject.Inputs.Rel!.LoadAddress;
+        guardedCode.AddRange(guardedRel.Sections
+            .Where(static s => s.Executable && s.Size != 0)
+            .Select(s => AddressRange.FromStartAndSize(guardedRelBase + s.FileOffset, s.Size)));
+    }
+    CxxLinearCodeGenerator.RegisterGuardedCode(guardedCode);
+    Console.WriteLine(
+        $"[translator] constant-address stores stay checked in {guardedCode.Count} code range(s) " +
+        $"({guardedCode.Aggregate(0UL, static (sum, r) => sum + r.Length) / 1024} KiB) and every lean MMIO alias.");
     return new ProgramImageBuilder().Build(dol, relImage, loadedProject.Memory.Base, loadedProject.Memory.Size);
 }
 

@@ -51,6 +51,13 @@ public sealed class PpcInstruction
 
     public bool IsUnconditionalBranch => BranchTargets.Count > 0 && !IsConditionalBranch && !IsCall && !IsReturn;
 
+    // Conditional branch-and-link to an immediate target (beql, bnel, ...): a call taken only when the condition holds.
+    // The game never uses these; Project+'s hook bodies do. bltl and bcl keep their own (local jump) handling.
+    public static readonly HashSet<string> ConditionalCallMnemonics =
+        new(StringComparer.OrdinalIgnoreCase) { "beql", "bnel", "bgtl", "blel", "bgel", "bsol", "bnsl" };
+
+    public bool IsConditionalCall => IsCall && IsConditionalBranch && ConditionalCallMnemonics.Contains(Mnemonic);
+
     public override string ToString() => $"0x{Address:X8}: {Mnemonic} {OperandText}".Trim();
 
     public static PpcInstruction Synthetic(
@@ -78,7 +85,8 @@ public sealed class PpcInstruction
         var ret = lower is "bctr" or "rfi" ||
               (lower.StartsWith("b", StringComparison.Ordinal) && lower.EndsWith("lr", StringComparison.Ordinal) &&
                !lower.Contains("lrl", StringComparison.Ordinal));
-        var call = lower is "bl" or "bcl" or "blrl" || lower.Contains("bctrl") || lower.Contains("bclrl");
+        var call = lower is "bl" or "bcl" or "blrl" || lower.Contains("bctrl") || lower.Contains("bclrl") ||
+                   ConditionalCallMnemonics.Contains(lower);
         var cond = lower.StartsWith("bc") || lower.StartsWith("bge") || lower.StartsWith("ble") || lower.StartsWith("beq") ||
                    lower.StartsWith("bne") || lower.StartsWith("bgt") || lower.StartsWith("blt") || lower.StartsWith("bd");
         return (ret, call, cond);

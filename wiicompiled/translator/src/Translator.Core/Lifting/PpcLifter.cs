@@ -724,6 +724,10 @@ public sealed partial class PpcLifter
             case "nand." when operands.Count == 3:
                 return BinWithCrFlag(operands[0], IrValue.Register(operands[1]), IrValue.Register(operands[2]), "nand", true);
 
+            // The game never uses nor.; Project+'s hook bodies, translated when baked, do.
+            case "nor." when operands.Count == 3:
+                return BinWithCrFlag(operands[0], IrValue.Register(operands[1]), IrValue.Register(operands[2]), "nor", true);
+
             case "eqv" when operands.Count == 3:
             case "eqv." when operands.Count == 3:
                 return BinWithCrFlag(Reg(0), IrValue.Register(Reg(1)), IrValue.Register(Reg(2)), "eqv", mnemonic.EndsWith('.'));
@@ -1901,6 +1905,29 @@ public sealed partial class PpcLifter
                     return instructions;
                 }
 
+            // PpcDisassembler's rewrite of "bl over data, mflr" in a code variant's inline regions: lr gets the next
+            // address, control goes to the mflr; never emitted for the game's own code.
+            case "bl_jump":
+                return new IrInstruction[]
+                {
+                    new IrAssign("lr", IrValue.Imm((int)ins.EndAddress)),
+                    new IrJump(TargetLabel(ins, validAddresses))
+                };
+
+            // PpcDisassembler's rewrite of "bl T" with a "blrl" at T in a code variant's inline regions: the blrl comes
+            // straight back with lr = T + 4. The bl's own displacement gives T; control goes on to the next instruction.
+            case "bl_blrl":
+                {
+                    var displacement = (int)(ins.Word & 0x03FFFFFCu);
+                    if ((displacement & 0x02000000) != 0) displacement -= 0x04000000;
+                    var blrlAddress = unchecked((uint)((int)ins.Address + displacement));
+                    return new IrInstruction[]
+                    {
+                        new IrAssign("lr", IrValue.Imm((int)(blrlAddress + 4))),
+                        new IrJump(TargetLabel(ins, validAddresses))
+                    };
+                }
+
             case "b":
                 {
                     var targetAddr = ins.BranchTargets.FirstOrDefault();
@@ -1956,6 +1983,27 @@ public sealed partial class PpcLifter
                         new IrBranch("blt", TargetLabel(ins, validAddresses, preferFallthrough: false),
                             $"0x{ins.EndAddress:X8}", crField)
                     };
+                }
+
+            case "beql":
+            case "bnel":
+            case "bgtl":
+            case "blel":
+            case "bgel":
+            case "bsol":
+            case "bnsl":
+                {
+                    // A conditional call (Project+'s hook bodies): FunctionTranslator's call_direct_ block calls the
+                    // target with lr at the next instruction and continues there, as call_ctr_ does for bctrl.
+                    var crField = "cr0";
+                    if (ops.Count > 0 && ops[0] is PpcConditionRegisterOperand crOp)
+                    {
+                        crField = NormalizeRegister(crOp.Name);
+                    }
+
+                    var fallthrough = $"0x{ins.EndAddress:X8}";
+                    var targetLabel = $"call_direct_{ins.BranchTargets.First():X8}_{ins.EndAddress:X8}";
+                    return new[] { new IrBranch(mnemonic[..^1], targetLabel, fallthrough, crField) };
                 }
 
             case "bcl":

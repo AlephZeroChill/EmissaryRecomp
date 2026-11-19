@@ -95,7 +95,7 @@ public class ScalarPairedBoundaryCodeGenTests
                 IrValue.Register("r3"), IrValue.Register("f1")
             }),
             new IrCall("f2", "PPC_PsNeg", new[] { IrValue.Register("f1") }));
-        var call = code.IndexOf("InvokeIndirectCpu(ctr, ctx);", StringComparison.Ordinal);
+        var call = code.IndexOf("MKW_INDIRECT_CALL(ctr, ctx);", StringComparison.Ordinal);
 
         Assert.True(call >= 0, code);
         Assert.DoesNotContain(
@@ -121,7 +121,7 @@ public class ScalarPairedBoundaryCodeGenTests
                 IrValue.Register("r3")
             }),
             new IrCall("f3", "PPC_PsNeg", new[] { IrValue.Register("f2") }));
-        var call = code.IndexOf("InvokeIndirectCpu(ctr, ctx);", StringComparison.Ordinal);
+        var call = code.IndexOf("MKW_INDIRECT_CALL(ctr, ctx);", StringComparison.Ordinal);
 
         Assert.True(call >= 0, code);
         Assert.Contains(
@@ -144,7 +144,7 @@ public class ScalarPairedBoundaryCodeGenTests
             }),
             new IrSetCrField(0, IrValue.Register("f1"), IrValue.Register("f14"), false),
             new IrCall("f2", "PPC_PsNeg", new[] { IrValue.Register("f1") }));
-        var call = code.IndexOf("InvokeIndirectCpu(ctr, ctx);", StringComparison.Ordinal);
+        var call = code.IndexOf("MKW_INDIRECT_CALL(ctr, ctx);", StringComparison.Ordinal);
 
         Assert.True(call >= 0, code);
         Assert.Contains(

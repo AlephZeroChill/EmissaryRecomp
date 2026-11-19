@@ -43,7 +43,7 @@ public sealed partial class CxxLinearCodeGenerator
             if (!TryGetGenericGqrPsqSite(call, out var index, out var addressArgument)) continue;
             // The stack forms resolve the host pointer through the frame cache
             // and have no GQR-value overload in the runtime.
-            if (stackFacts.TryResolve(addressArgument, out _)) continue;
+            if (stackFacts.TryResolve(call, addressArgument, out _)) continue;
             indices.Add(index);
         }
 

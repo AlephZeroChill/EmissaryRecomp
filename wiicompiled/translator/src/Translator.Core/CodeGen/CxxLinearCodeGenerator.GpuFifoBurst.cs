@@ -69,7 +69,7 @@ public sealed partial class CxxLinearCodeGenerator
         IReadOnlyDictionary<string, uint> knownConstants,
         out GpuFifoStoreInfo info)
     {
-        if (!TryGetKnownEffectiveAddress(store.Address, knownConstants, out var address) ||
+        if (!TryGetKnownEffectiveAddress(store, store.Address, knownConstants, out var address) ||
             !IsGpuFifoAddress(address))
         {
             info = default;

@@ -14,7 +14,9 @@ public sealed record TranslatedBuildShardOptions(
     string NativeSourceDirectory,
     int BaseShardCount = 72,
     int RegistrationShardCount = 16,
-    RuntimeNativeIndex? NativeIndex = null);
+    RuntimeNativeIndex? NativeIndex = null,
+    // translate-recursive --code-variants-out: translations of functions as a mod's fixed patches leave them.
+    string? CodeVariantsDirectory = null);
 
 /// <summary>
 /// Per-shard compile-cost spread for one partition. Frozen membership does not
@@ -130,6 +132,7 @@ public static partial class TranslatedBuildShardEmitter
             baseSourceBundle = TranslationSourceBundle.Read(bundlePath);
         }
         var nativeOverrides = ReadNativeOverrides(options.NativeSourceDirectory, options.NativeIndex);
+        var nativeBodies = ReadNativeBodies(options.NativeSourceDirectory);
         var baseRecords = ReadBaseFunctions(metadata, options.BaseFunctionsDirectory, baseSourceBundle);
         foreach (var record in baseRecords)
         {
@@ -175,13 +178,15 @@ public static partial class TranslatedBuildShardEmitter
             outputRoot, activeBase, options.BaseShardCount);
         var baseCommonShards = WriteFunctionShards(
             outputRoot, "base_common", activeBase, options.BaseShardCount, baseTraits,
-            "Brawl translated functions", weightedSequential: true, guardIndex,
+            "Brawl translated functions", weightedSequential: true, guardIndex, nativeBodies,
             frozenBoundaries: baseCommonBoundaries?.Table);
         shards.AddRange(baseCommonShards);
         var baseRegistration = WriteRegistrationShards(
             outputRoot, "base", activeBase, baseTraits, options.RegistrationShardCount).ToList();
         baseRegistration.Add(WriteIndirectDispatchTable(outputRoot, "base", baseTraits));
         baseRegistration.Add(WriteGuestCodeGuardTable(outputRoot, guardIndex, activeBase));
+        baseRegistration.Add(WriteCodeVariantTable(outputRoot, options.CodeVariantsDirectory, baseTraits));
+        baseRegistration.Add(WriteGuestFloatAbiTable(outputRoot, options.BaseMetadataPath, activeBase));
         var cmakeManifestPath = Path.Combine(outputRoot, "shards.cmake");
         WriteCMakeManifest(cmakeManifestPath, outputRoot, activeBase.Length, shards, baseRegistration);
         PruneStaleShardSources(outputRoot, shards, baseRegistration);
@@ -354,6 +359,42 @@ public static partial class TranslatedBuildShardEmitter
         return new NativeOverrideSets(winners, exclusions, rawTranslatedOverrides);
     }
 
+    /// <summary>
+    /// Translated functions a native replaces inside their wrapper func_X: <c>MKW_NATIVE_BODY</c> bodies and native hook
+    /// slots (<see cref="NativeHookSlot"/>). A call that bypasses the wrapper (an MKW_EABI_REGS register-passing entry
+    /// runs the translated code directly) would bypass the native too, so the translator gives these no such entry.
+    /// </summary>
+    public static IReadOnlySet<uint> WrapperNativeAddresses(string nativeSourceDirectory)
+    {
+        var addresses = new HashSet<uint>(ReadNativeBodies(nativeSourceDirectory).Keys);
+        addresses.UnionWith(NativeHookAddresses);
+        return addresses;
+    }
+
+    /// <summary>
+    /// <c>MKW_NATIVE_BODY(0x…, symbol)</c> markers (abi_bridge.h): a hand-written body for a translated function.
+    /// Its wrapper func_X tail-calls the native instead of func_X_body, after the guest code guard, so every caller
+    /// (static, direct, indirect, interpreter) reaches it at the cost of the translated call; func_X_body stays
+    /// emitted as the native's fallback and as its differential-test reference.
+    /// </summary>
+    private static IReadOnlyDictionary<uint, string> ReadNativeBodies(string directory)
+    {
+        var bodies = new Dictionary<uint, string>();
+        foreach (var source in NativeSourceParsing.ReadDirectory(directory))
+        {
+            foreach (Match match in GeneratedMarkers.NativeBodyPattern().Matches(source.Content))
+            {
+                var address = ParseHexUInt32(match.Groups["address"].Value);
+                var symbol = match.Groups["symbol"].Value;
+                if (bodies.TryGetValue(address, out var existing) && existing != symbol)
+                    throw new InvalidDataException(
+                        $"Two native bodies for 0x{address:X8}: {existing} and {symbol} ({source.RelativePath}).");
+                bodies[address] = symbol;
+            }
+        }
+        return bodies;
+    }
+
     private static string BuildTraitsHeader(
         IReadOnlyDictionary<uint, Trait> traits,
         string label)
@@ -382,6 +423,7 @@ public static partial class TranslatedBuildShardEmitter
         string traitsLabel,
         bool weightedSequential,
         IReadOnlyDictionary<uint, int> guardIndex,
+        IReadOnlyDictionary<uint, string> nativeBodies,
         ShardBoundaryTable? frozenBoundaries = null)
     {
         if (functions.Count == 0) return Array.Empty<ShardInfo>();
@@ -414,7 +456,14 @@ public static partial class TranslatedBuildShardEmitter
                 .ToDictionary(address => address, address => traits[address]);
             var traitIdentity = string.Join("\n", dependencyTraits.OrderBy(static pair => pair.Key).Select(pair =>
                 $"{pair.Key:X8}:{pair.Value.Available}:{pair.Value.PreservesNonvolatileFprs}:{pair.Value.NonvolatileFprWriteMask:X8}:{pair.Value.WinnerSymbol}"));
-            var identity = string.Join("\n", group.Select(function => $"{function.Address:X8}:{function.SourceFingerprint}")) + "\n" + traitIdentity;
+            // A native body or hook changes the wrapper's text, so it is part of the identity; shards without one keep
+            // theirs.
+            var identity = string.Join("\n", group.Select(function =>
+                (nativeBodies.TryGetValue(function.Address, out var native)
+                    ? $"{function.Address:X8}:{function.SourceFingerprint}:native={native}"
+                    : $"{function.Address:X8}:{function.SourceFingerprint}") +
+                (NativeHookSlot(function.Address) is var hookSlot and >= 0 ? $":hook={hookSlot}" : ""))) + "\n" +
+                traitIdentity;
             var hash = ChecksumUtilities.Sha256Hex(Encoding.UTF8.GetBytes($"{partition}\n{identity}"));
             // Membership, not the transient scheduling position, is the shard
             // identity.  This lets an unchanged shard retain its source/object
@@ -438,7 +487,7 @@ public static partial class TranslatedBuildShardEmitter
                 var functionSource = function.SourceText ?? File.ReadAllText(function.SourcePath);
                 functionSource = RegistrationMarkerRegex().Replace(functionSource, string.Empty);
                 functionSource = LowerStableDirectCalls(functionSource, traits);
-                functionSource = InsertGuestCodeGuard(functionSource, guardIndex);
+                functionSource = InsertGuestCodeGuard(functionSource, guardIndex, nativeBodies);
                 // Diagnostics only; the named file no longer exists on disk (sources live in the
                 // bundle), so only the bare file name is kept, not the emitting machine's path.
                 source.Append($"#line 1 \"{Escape(Path.GetFileName(function.SourcePath))}\"{Environment.NewLine}");
@@ -467,21 +516,73 @@ public static partial class TranslatedBuildShardEmitter
     /// Opens every public translated entry with <c>MKW_GUEST_CODE_GUARD</c> (abi_bridge.h): one byte load, and a
     /// function whose guest code a mod patched at run time (Gecko codes, Syriinge hooks) runs in the interpreter.
     /// </summary>
-    private static string InsertGuestCodeGuard(string source, IReadOnlyDictionary<uint, int> guardIndex) =>
+    private static string InsertGuestCodeGuard(
+        string source, IReadOnlyDictionary<uint, int> guardIndex, IReadOnlyDictionary<uint, string> nativeBodies) =>
+        GuardStateFreeCalls(InsertGuestCodeGuardAtEntries(source, guardIndex, nativeBodies), guardIndex);
+
+    /// <summary>
+    /// A state-free call enters its callee's state-free body, which has no <c>MKW_GUEST_CODE_GUARD</c>: its fast arm
+    /// is taken only while no member of the callee's region is patched, so a mod's patch still reaches the interpreter
+    /// through the fallback arm (<c>InvokeDirectCpu</c>, which enters <c>func_&lt;addr&gt;</c> and its guard).
+    /// </summary>
+    private static string GuardStateFreeCalls(string source, IReadOnlyDictionary<uint, int> guardIndex) =>
+        StateFreeRegionMemberRegex().Replace(source, match =>
+        {
+            var address = ParseHexUInt32(match.Groups["address"].Value);
+            return guardIndex.TryGetValue(address, out var index)
+                ? $"{match.Value} && !g_mkwGuestCodePatched[{index}u]"
+                : match.Value;
+        });
+
+    [GeneratedRegex(@"IsBaseTranslatedCpuTargetActive<0x(?<address>[0-9A-F]{8})u>\(\)", RegexOptions.CultureInvariant)]
+    private static partial Regex StateFreeRegionMemberRegex();
+
+    /// <summary>
+    /// A guarded entry becomes a wrapper and a body: <c>func_X</c> is the guard and a tail call of
+    /// <c>func_X_body</c>, which holds the translated code (extern "C", so the expansion gate counts it as func_X's).
+    /// The guard inside the body made Clang emit it after the prologue, and its patched arm then repeated the whole
+    /// epilogue in every function; as a wrapper it is a compare, a conditional tail jump and a two-instruction arm.
+    /// A function with a native body (<see cref="ReadNativeBodies"/>) gets the same wrapper tail-calling the native.
+    /// </summary>
+    private static string InsertGuestCodeGuardAtEntries(
+        string source, IReadOnlyDictionary<uint, int> guardIndex, IReadOnlyDictionary<uint, string> nativeBodies) =>
         GuardedEntryRegex().Replace(source, match =>
         {
             var address = ParseHexUInt32(match.Groups["address"].Value);
-            var entry = guardIndex.TryGetValue(address, out var index)
-                ? $"{match.Value}\n    MKW_GUEST_CODE_GUARD({index}u, 0x{address:X8}u);"
-                : match.Value;
-            return address switch
+            var hook = address switch
             {
-                0x809435F0u => entry + "\n    BrawlRollback::SeedCrossplayStage();",
+                0x809435F0u => "\n    BrawlRollback::SeedCrossplayStage();",
                 // Before the stage file loader can cache the local substage.
-                0x80949BC0u => entry + "\n    BrawlOnline::Stage();",
-                _ => entry
+                0x80949BC0u => "\n    BrawlOnline::Stage();",
+                _ => ""
             };
+            if (!guardIndex.TryGetValue(address, out var index))
+                return match.Value + hook;
+            var name = $"func_{address:X8}";
+            var target = nativeBodies.TryGetValue(address, out var native) ? native : $"{name}_body";
+            var nativeDeclaration = native is null ? "" : $"extern \"C\" void {native}(CpuContext* ctx);\n";
+            // A native hook with guest fallback (MKW_NATIVE_HOOK, abi_bridge.h): after the guard, so a mod's patch of
+            // the function still wins; a hook that declines the call runs the translated body.
+            var slot = NativeHookSlot(address);
+            var nativeHook = slot >= 0 ? $"    MKW_NATIVE_HOOK({slot});\n" : "";
+            // The wrapper is noinline too: inlined into a caller in the same shard, it put the guard and its patched
+            // arm back at every call site.
+            return $"extern \"C\" [[gnu::noinline]] void {name}_body(CpuContext* MKW_RESTRICT ctx);\n" +
+                   nativeDeclaration +
+                   $"extern \"C\" [[gnu::noinline]] void {name}(CpuContext* MKW_RESTRICT ctx)\n{{\n" +
+                   $"    MKW_GUEST_CODE_GUARD({index}u, 0x{address:X8}u);\n" + nativeHook +
+                   $"    [[clang::musttail]] return {target}(ctx);\n}}\n" +
+                   $"extern \"C\" void {name}_body(CpuContext* MKW_RESTRICT ctx)\n{{" + hook;
         });
+
+    /// <summary>
+    /// The runtime's native hook slot (<c>MKW_NATIVE_HOOK</c>, abi_bridge.h) a translated function's wrapper calls after
+    /// its guard, running func_X_body when the hook declines the call; -1: none.
+    /// </summary>
+    private static int NativeHookSlot(uint address) => Array.IndexOf(NativeHookAddresses, address);
+
+    // By slot: 0 nw4r::g3d::DrawResMdlDirectly (runtime/src/hle/g3d_native.cpp).
+    private static readonly uint[] NativeHookAddresses = { 0x801A64B0u };
 
     [GeneratedRegex(@"extern ""C"" void func_(?<address>[0-9A-F]{8})\(CpuContext\* MKW_RESTRICT ctx\)\s*\{", RegexOptions.CultureInvariant)]
     private static partial Regex GuardedEntryRegex();
@@ -511,7 +612,8 @@ public static partial class TranslatedBuildShardEmitter
         source.AppendLine("// Translator-owned guest code guard table (see MKW_GUEST_CODE_GUARD in abi_bridge.h); do not edit.");
         source.AppendLine("#include <cstdint>");
         source.AppendLine($"extern \"C\" const uint32_t g_mkwGuardedFunctionCount = {addresses.Length}u;");
-        source.AppendLine($"extern \"C\" uint8_t g_mkwGuestCodePatched[{Math.Max(1, addresses.Length)}] = {{}};");
+        // Hidden, as abi_bridge.h declares it: each guard is then one rip-relative compare.
+        source.AppendLine($"extern \"C\" __attribute__((visibility(\"hidden\"))) uint8_t g_mkwGuestCodePatched[{Math.Max(1, addresses.Length)}] = {{}};");
         source.AppendLine("extern \"C\" const uint32_t g_mkwGuardedFunctionStarts[] = {");
         for (var i = 0; i < addresses.Length; i += 8)
         {
@@ -530,6 +632,150 @@ public static partial class TranslatedBuildShardEmitter
         var directory = Path.Combine(outputRoot, "base_dispatch");
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, $"guest_code_guard_{hash[..16]}.cpp");
+        WriteIfChanged(path, source.ToString());
+        return path;
+    }
+
+    /// <summary>
+    /// The float ABI translated callers assume of each translated function (the f1-f13 it reads as scalar floats,
+    /// whether it returns a paired scalar in f1), for the interpreter's calls into translated code (ppc_interpreter.cpp),
+    /// which convert paired-form registers the same way. From translate-recursive's <see cref="GuestFloatAbiFileName"/>
+    /// beside the base metadata (written after every function's emission, so reading the facts never changed the ABI
+    /// cache emission used). Only the functions this build compiles, with a fact; sorted by address for a binary search
+    /// (guest_float_abi.h). Always written, empty without the file, so every build links the same symbols.
+    /// </summary>
+    private static string WriteGuestFloatAbiTable(
+        string outputRoot, string baseMetadataPath, IReadOnlyList<FunctionRecord> functions)
+    {
+        var compiled = functions.Select(static function => function.Address).ToHashSet();
+        var factsPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(baseMetadataPath))!, GuestFloatAbiFileName);
+        var rows = (File.Exists(factsPath) ? File.ReadAllLines(factsPath) : Array.Empty<string>())
+            .Where(static line => line.Length != 0 && line[0] != '#')
+            .Select(static line => line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            .Select(static fields => (Address: ParseHexUInt32(fields[0]), Arguments: ParseHexUInt32(fields[1]),
+                PairedReturn: fields[2] == "1"))
+            .Where(row => compiled.Contains(row.Address))
+            .OrderBy(static row => row.Address)
+            .ToArray();
+        var source = new StringBuilder();
+        source.AppendLine("// Translator-owned guest float ABI table (see guest_float_abi.h); do not edit.");
+        source.AppendLine("#include \"guest_float_abi.h\"");
+        source.AppendLine($"extern \"C\" const uint32_t g_mkwGuestFloatAbiCount = {rows.Length}u;");
+        source.AppendLine("extern \"C\" const MkwGuestFloatAbi g_mkwGuestFloatAbi[] = {");
+        foreach (var row in rows)
+        {
+            source.AppendLine($"    {{0x{row.Address:X8}u, 0x{row.Arguments:X4}u, {(row.PairedReturn ? 1 : 0)}u}},");
+        }
+        if (rows.Length == 0) source.AppendLine("    {0u, 0u, 0u},");
+        source.AppendLine("};");
+        var hash = ChecksumUtilities.Sha256Hex(Encoding.UTF8.GetBytes(source.ToString()));
+        var directory = Path.Combine(outputRoot, "base_dispatch");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"guest_float_abi_{hash[..16]}.cpp");
+        WriteIfChanged(path, source.ToString());
+        return path;
+    }
+
+    /// <summary>
+    /// The code variants (translate-recursive --code-variants, Translator.Cli/CodeVariants.cs) and their table for
+    /// guest_code_patch.cpp: per variant its function's address, its entry and the guest words it was translated from
+    /// (runs of (start, word count, first word index)). Always written, empty without variants, so every build links
+    /// the same symbols. Variants are not registered at any address: only the runtime's patched-code path calls them.
+    /// </summary>
+    private static string WriteCodeVariantTable(
+        string outputRoot, string? variantsDirectory, IReadOnlyDictionary<uint, Trait> traits)
+    {
+        var variants = new List<(uint Address, string Symbol, List<(uint Start, List<uint> Words)> Guards)>();
+        var regions = new List<uint>();
+        var manifest = variantsDirectory is null ? null : Path.Combine(variantsDirectory, "variants.txt");
+        if (manifest is not null && File.Exists(manifest))
+        {
+            foreach (var line in File.ReadLines(manifest))
+            {
+                if (line.Length == 0 || line[0] == '#') continue;
+                var f = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (f[0] == "D")
+                {
+                    regions.Add(ParseHexUInt32(f[1]));
+                    regions.Add(ParseHexUInt32(f[2]));
+                }
+                else if (f[0] == "V")
+                {
+                    variants.Add((ParseHexUInt32(f[1]), f[2], new List<(uint, List<uint>)>()));
+                }
+                else if (f[0] == "G" && variants.Count != 0)
+                {
+                    var count = int.Parse(f[2], CultureInfo.InvariantCulture);
+                    variants[^1].Guards.Add((ParseHexUInt32(f[1]), f.Skip(3).Take(count).Select(ParseHexUInt32).ToList()));
+                }
+            }
+        }
+
+        var bodies = variants.Select(variant => File.ReadAllText(Path.Combine(variantsDirectory!, variant.Symbol + ".cpp")))
+            .Select(body => RegistrationMarkerRegex().Replace(body, string.Empty))
+            .ToArray();
+        var calleeTraits = bodies
+            .SelectMany(static body => DirectCallRegex().Matches(body).Select(match => ParseHexUInt32(match.Groups["address"].Value)))
+            .Distinct()
+            .Where(traits.ContainsKey)
+            .ToDictionary(static address => address, address => traits[address]);
+        var source = new StringBuilder();
+        source.AppendLine("// Translator-owned code variant table (translate-recursive --code-variants, guest_code_patch.cpp); do not edit.");
+        source.AppendLine("#include <cstdint>");
+        source.AppendLine("#include \"abi_bridge.h\"");
+        source.AppendLine("#include \"brawl_rollback.h\"");
+        source.AppendLine("#include \"guest_code_patch.h\"");
+        if (variants.Count != 0)
+        {
+            foreach (var traitLine in BuildTraitsHeader(calleeTraits, "code variant callees").Split('\n'))
+            {
+                var trimmed = traitLine.TrimEnd('\r');
+                if (trimmed.Length != 0 && trimmed != "#pragma once") source.AppendLine(trimmed);
+            }
+            source.AppendLine("#define MKW_STATIC_TRANSLATED_CALL(Target, Entry, Context) do { Entry(Context); if constexpr ((Target) == 0x80029438u) BrawlRollback::AnchorPads(); } while (false)");
+            for (var i = 0; i < variants.Count; i++)
+            {
+                source.AppendLine($"#line 1 \"{variants[i].Symbol}.cpp\"");
+                source.Append(LowerStableDirectCalls(bodies[i], calleeTraits));
+                if (!bodies[i].EndsWith('\n')) source.AppendLine();
+            }
+            source.AppendLine("#undef MKW_STATIC_TRANSLATED_CALL");
+        }
+
+        source.AppendLine($"extern \"C\" const uint32_t g_mkwCodeVariantCount = {variants.Count}u;");
+        source.AppendLine("extern \"C\" const MkwCodeVariant g_mkwCodeVariants[] = {");
+        var guards = new List<uint>();
+        var words = new List<uint>();
+        foreach (var (address, symbol, variantGuards) in variants)
+        {
+            source.AppendLine($"    {{0x{address:X8}u, {symbol}, {guards.Count / 3}u, {variantGuards.Count}u}},");
+            foreach (var (start, guardWords) in variantGuards)
+            {
+                guards.Add(start);
+                guards.Add((uint)guardWords.Count);
+                guards.Add((uint)words.Count);
+                words.AddRange(guardWords);
+            }
+        }
+        if (variants.Count == 0) source.AppendLine("    {0u, nullptr, 0u, 0u},");
+        source.AppendLine("};");
+        void AppendWords(string name, List<uint> values)
+        {
+            source.AppendLine($"extern \"C\" const uint32_t {name}[] = {{");
+            for (var i = 0; i < values.Count; i += 8)
+                source.AppendLine("    " + string.Join(" ", values.Skip(i).Take(8).Select(static v => $"0x{v:X8}u,")));
+            if (values.Count == 0) source.AppendLine("    0u,");
+            source.AppendLine("};");
+        }
+        AppendWords("g_mkwCodeVariantGuards", guards);
+        AppendWords("g_mkwCodeVariantWords", words);
+        if (variants.Count == 0) regions.Clear();
+        source.AppendLine($"extern \"C\" const uint32_t g_mkwCodeVariantRegionCount = {regions.Count / 2}u;");
+        AppendWords("g_mkwCodeVariantRegions", regions);
+        var hash = ChecksumUtilities.Sha256Hex(Encoding.UTF8.GetBytes(source.ToString()));
+        var directory = Path.Combine(outputRoot, "base_dispatch");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"code_variants_{hash[..16]}.cpp");
         WriteIfChanged(path, source.ToString());
         return path;
     }
@@ -966,6 +1212,12 @@ public static partial class TranslatedBuildShardEmitter
     private static uint ParseHexUInt32(string value) => GuestTargetParser.ParseHexAddress(value);
 
     private static Regex BaseRegistrationRegex() => GeneratedMarkers.BaseRegistrationPattern();
+
+    /// <summary>
+    /// translate-recursive writes it beside the base metadata: per translated function with a fact, "ADDRESS MASK PAIRED"
+    /// (hex address, hex mask with bit n = fn read as a scalar float, 1 when f1 comes back paired).
+    /// </summary>
+    public const string GuestFloatAbiFileName = "guest_float_abi.txt";
 
 
     private static Regex RegistrationMarkerRegex() => GeneratedMarkers.RegistrationLinePattern();

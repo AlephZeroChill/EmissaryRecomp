@@ -71,14 +71,56 @@ public sealed partial class CxxLinearCodeGenerator
     /// <summary>
     /// A translate-time-constant effective address whose complete span sits
     /// outside the MMIO policy window, and which therefore provably takes the
-    /// plain-store arm of every <c>FlatWrite*</c> helper.
+    /// plain-store arm of every <c>FlatWrite*</c> helper. Lean memory
+    /// (MKW_LEAN_MEMORY) also needs the span outside the guest code the runtime
+    /// guards and outside every alias of the MMIO window: there the check-free
+    /// helper skips the store policy byte, which is what sends a store to the
+    /// code write trap and to the MMIO handlers.
     /// </summary>
     private static bool IsProvenRamStore(uint address, int sizeBytes)
     {
         if (sizeBytes <= 0 || sizeBytes > 8) return false;
         var last = unchecked(address + (uint)(sizeBytes - 1));
         if (last < address) return false; // wraps past the end of the address space
-        return !FlatWriteNeedsPolicy(address) && !FlatWriteNeedsPolicy(last);
+        return !FlatWriteNeedsPolicy(address) && !FlatWriteNeedsPolicy(last) &&
+               !IsLeanMmioAlias(address) && !IsLeanMmioAlias(last) &&
+               !OverlapsGuardedCode(address, last);
+    }
+
+    /// <summary>
+    /// Lean memory folds every view onto <c>addr &amp; 0x3FFFFFFF</c>, so the MMIO window (+0x0C000000..+0x0DFFFFFF)
+    /// is reached from 0x0C/0x0D, 0x4C/0x4D, 0x8C/0x8D and 0xCC/0xCD alike.
+    /// </summary>
+    private static bool IsLeanMmioAlias(uint address) =>
+        (address & 0x3FFFFFFFu) is >= 0x0C000000u and < 0x0E000000u;
+
+    /// <summary>
+    /// Guest code that a constant-address store must not reach check-free: main.dol's own text sections and the
+    /// REL's executable sections (Brawl's module homes), in their cached and uncached views. Filled by
+    /// <see cref="RegisterGuardedCode"/> when the CLI loads the program image, before any translation.
+    /// </summary>
+    private static Loading.AddressRange[] _guardedCode = Array.Empty<Loading.AddressRange>();
+
+    public static void RegisterGuardedCode(IEnumerable<Loading.AddressRange> ranges)
+    {
+        var all = new List<Loading.AddressRange>(_guardedCode);
+        foreach (var range in ranges)
+        {
+            if (range.End <= range.Start) continue;
+            all.Add(range);
+            if ((range.Start >> 28) is 0x8u or 0x9u && (range.End - 1) >> 28 == range.Start >> 28)
+                all.Add(new Loading.AddressRange(range.Start + 0x40000000u, range.End + 0x40000000u)); // uncached view
+        }
+        _guardedCode = all.ToArray();
+    }
+
+    private static bool OverlapsGuardedCode(uint first, uint last)
+    {
+        foreach (var range in _guardedCode)
+        {
+            if (first < range.End && last >= range.Start) return true;
+        }
+        return false;
     }
 
     private static string GuestLoadHelper(int sizeBytes, bool isFloat) =>

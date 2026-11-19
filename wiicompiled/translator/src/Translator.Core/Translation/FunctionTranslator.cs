@@ -70,7 +70,15 @@ public sealed record TranslationOptions(
     /// acyclic and every exit is a plain return. Emergency opt-out; the
     /// straight-line shape keeps working with this off.
     /// </summary>
-    bool LeafInliningAllowMultiBlockCallees = true)
+    bool LeafInliningAllowMultiBlockCallees = true,
+    /// <summary>MKW_EABI_REGS: register-passing entries by address (callees use them; the owner emits one).</summary>
+    IReadOnlyDictionary<uint, GuestEabiVariant>? EabiVariants = null,
+    /// <summary>
+    /// Code variants (translate-recursive --code-variants): guest code outside the function's own address range that
+    /// its branches may enter and that is decoded as part of the function, such as a Gecko code list's C2 hook bodies
+    /// (the hooked function branches into the list and the body branches back). Null everywhere else.
+    /// </summary>
+    IReadOnlyList<AddressRange>? InlineCodeRegions = null)
 {
     public static TranslationOptions Default { get; } = new();
 }
@@ -259,7 +267,8 @@ public sealed class FunctionTranslator
                 options.MaxInstructions,
                 options.MaxBytes,
                 options.KnownFunctionEntryPoints,
-                boundaryProbes);
+                boundaryProbes,
+                options.InlineCodeRegions);
         }
         disSw.Stop();
         if (metrics is not null)
@@ -632,7 +641,7 @@ public sealed class FunctionTranslator
         if (options.GenerateCxx)
         {
             var codeGenSw = Stopwatch.StartNew();
-            emission = EmitCxx(entryPoint, ssa, signature, types, options);
+            emission = EmitCxx(entryPoint, ssa, signature, types, options, VariantOwnCode(options, instructions));
             codeGenSw.Stop();
             metrics.CodeGen = codeGenSw.Elapsed;
         }
@@ -716,12 +725,36 @@ public sealed class FunctionTranslator
              emission);
     }
 
+    /// <summary>
+    /// A code variant's own code (InlineCodeRegions set): its decoded instructions as address ranges, consecutive
+    /// runs joined across gaps under 1 KiB (blocks it did not decode, such as switch cases a missed table left out).
+    /// The emitter checks an indirect jump's target against them (runtime CheckVariantIndirectJump). Null elsewhere.
+    /// </summary>
+    private static uint[]? VariantOwnCode(TranslationOptions options, IReadOnlyList<PpcInstruction> instructions)
+    {
+        if (options.InlineCodeRegions is null || instructions.Count == 0) return null;
+        const uint MaxJoinedGap = 0x400;
+        var ranges = new List<uint>();
+        foreach (var ins in instructions.OrderBy(static i => i.Address))
+        {
+            if (ranges.Count > 0 && (ins.Address <= ranges[^1] || ins.Address - ranges[^1] < MaxJoinedGap))
+            {
+                ranges[^1] = Math.Max(ranges[^1], ins.EndAddress);
+                continue;
+            }
+            ranges.Add(ins.Address);
+            ranges.Add(ins.EndAddress);
+        }
+        return ranges.ToArray();
+    }
+
     private CxxEmissionResult EmitCxx(
         uint entryPoint,
         SsaResult ssa,
         FunctionAbiClassification signature,
         RepresentationEnvironment types,
-        TranslationOptions options)
+        TranslationOptions options,
+        uint[]? variantOwnCode = null)
     {
         return new CxxLinearCodeGenerator(_guestAbiProvider).EmitWithFacts(
             entryPoint,
@@ -746,7 +779,9 @@ public sealed class FunctionTranslator
             gqrCalleeWriteMasks: options.GqrCalleeWriteMasks,
             gqrConstantsRequireRuntimeGuard: options.GqrConstantsRequireRuntimeGuard,
             enableLeafAbiSpillElision: options.EnableLeafAbiSpillElision,
-            modOverridableCallTargets: options.ModOverridableCallTargets);
+            modOverridableCallTargets: options.ModOverridableCallTargets,
+            eabiVariants: options.EabiVariants,
+            variantOwnCode: variantOwnCode);
     }
 
     private static IrTracePpc CreateTrace(PpcInstruction instruction)
@@ -844,6 +879,7 @@ public sealed class FunctionTranslator
         const string IndirectCtrPrefix = "indirect_ctr_";
         const string CallCtrPrefix = "call_ctr_";
         const string CallLrPrefix = "call_lr_";
+        const string CallDirectPrefix = "call_direct_";
         const string LinkBranchPrefix = "link_branch_";
 
         if (label.StartsWith(IndirectCtrPrefix, StringComparison.OrdinalIgnoreCase))
@@ -862,6 +898,19 @@ public sealed class FunctionTranslator
             {
                 new IrAssign("lr", IrValue.Imm((int)fallthrough)),
                 new IrIndirectCall(string.Empty, IrValue.Register("ctr"), args),
+                new IrJump($"0x{fallthrough:X8}")
+            });
+            return true;
+        }
+
+        // call_direct_{target}_{fallthrough}: a conditional call to an immediate target (beql, bnel, ...).
+        if (TryParseCallLabel(label, CallDirectPrefix, out var directTarget, out fallthrough))
+        {
+            var args = BuildAbiCallArgs();
+            block = new IrBasicBlock(label, new IrInstruction[]
+            {
+                new IrAssign("lr", IrValue.Imm((int)fallthrough)),
+                new IrCall(string.Empty, $"0x{directTarget:X8}", args),
                 new IrJump($"0x{fallthrough:X8}")
             });
             return true;

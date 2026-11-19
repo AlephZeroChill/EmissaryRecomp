@@ -37,7 +37,7 @@ public sealed partial class CxxLinearCodeGenerator
                     IsFloatRegister(sourceRegister) &&
                     convertedFprs.TryGetValue(GetRegisterBaseName(sourceRegister), out var converted) &&
                     converted &&
-                    stackFacts.TryResolve(store.Address, out var storeOffset) &&
+                    stackFacts.TryResolve(store, store.Address, out var storeOffset) &&
                     TryFindFctiwLowWordLoad(block.Instructions, index, stackFacts, storeOffset, claimedLoads, out var loadIndex))
                 {
                     var temp = $"fctiwzword{nextTemp++}";
@@ -201,11 +201,11 @@ public sealed partial class CxxLinearCodeGenerator
     {
         switch (instruction)
         {
-            case IrStore store when stackFacts.TryResolve(store.Address, out var storeOffset):
+            case IrStore store when stackFacts.TryResolve(store, store.Address, out var storeOffset):
                 access = new StackAccessInfo(storeOffset, store.SizeBytes, true);
                 return true;
 
-            case IrLoad load when stackFacts.TryResolve(load.Address, out var loadOffset):
+            case IrLoad load when stackFacts.TryResolve(load, load.Address, out var loadOffset):
                 access = new StackAccessInfo(loadOffset, load.SizeBytes, false);
                 return true;
 

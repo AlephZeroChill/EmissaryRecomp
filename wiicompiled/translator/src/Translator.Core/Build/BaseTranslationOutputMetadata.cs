@@ -134,7 +134,8 @@ public sealed record BaseTranslationFunctionMetadata(
             registration.NonvolatileFprWriteMask,
             directCalls,
             string.IsNullOrWhiteSpace(abiComment) ? null : abiComment,
-            translation.Ssa.Function.Blocks.Sum(block => block.Instructions.Count));
+            translation.Ssa.Function.Blocks.Sum(block => block.Instructions.Count),
+            translation.Instructions.Count);
 
         return new BaseTranslationFunctionMetadata(
             relativePath,
@@ -155,7 +156,10 @@ public sealed record BaseTranslationFunctionBuildMetadata(
     uint NonvolatileFprWriteMask,
     IReadOnlyList<uint> DirectCallDependencies,
     string? GuestAbiComment,
-    int EstimatedIrInstructions);
+    int EstimatedIrInstructions,
+    // PowerPC instructions the function translates (its own body; inlined leaves count where they are inlined).
+    // The build's expansion gate (runtime/cmake/expansion_gate.py) divides emitted host instructions by this.
+    int GuestInstructions = 0);
 
 public static class BaseTranslationOutputMetadataFile
 {

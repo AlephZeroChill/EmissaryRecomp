@@ -24,12 +24,18 @@ internal sealed class StackAddressFacts
     public static StackAddressFacts Build(IrFunction function)
     {
         var temporaryOffsets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        // A value read where some path carried it across a guest call that may change its register is not what the
+        // register holds there (CallClobberedValues): nothing derived from such a read is a stack address.
+        CallClobberedValues.Analyze(function);
         foreach (var block in function.Blocks)
         {
             foreach (var instruction in block.Instructions)
             {
                 switch (instruction)
                 {
+                    case IrAssign or IrBinary when CallClobberedValues.HasStaleUse(instruction):
+                        break;
+
                     // SSA form makes an architectural register destination as stable as a compiler
                     // temporary (e.g. PPC prologues copying r1 to r11 for the save area).
                     case IrAssign assign when
@@ -46,6 +52,31 @@ internal sealed class StackAddressFacts
         }
 
         return new StackAddressFacts(temporaryOffsets);
+    }
+
+    /// <summary>
+    /// <see cref="TryResolve(IrAddress, out int)"/> for the address <paramref name="at"/> reads: not where its base is
+    /// read across a guest call that may have changed it (CallClobberedValues).
+    /// </summary>
+    public bool TryResolve(IrInstruction at, IrAddress address, out int offset)
+    {
+        if (CallClobberedValues.IsStaleUse(at, address.Base))
+        {
+            offset = 0;
+            return false;
+        }
+        return TryResolve(address, out offset);
+    }
+
+    /// <summary><see cref="TryResolve(IrValue, out int)"/> for a register <paramref name="at"/> reads (as above).</summary>
+    public bool TryResolve(IrInstruction at, IrValue value, out int offset)
+    {
+        if (value.Kind == "register" && CallClobberedValues.IsStaleUse(at, value.RegisterName))
+        {
+            offset = 0;
+            return false;
+        }
+        return TryResolve(value, out offset);
     }
 
     public bool TryResolve(IrAddress address, out int offset)

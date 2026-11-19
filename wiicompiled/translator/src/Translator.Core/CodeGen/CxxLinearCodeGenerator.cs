@@ -54,6 +54,39 @@ public sealed partial class CxxLinearCodeGenerator
         _emittedDirectCallTargets?.Add(target);
 
     /// <summary>
+    /// Set by each <c>EmitWithFacts</c> call: a code variant's own code (start/end pairs) and entry, for the check
+    /// before its indirect jumps' dispatch (<see cref="EmitVariantIndirectJumpCheck"/>); null outside code variants.
+    /// </summary>
+    [ThreadStatic]
+    private static uint[]? _variantOwnCode;
+
+    [ThreadStatic]
+    private static uint _variantEntry;
+
+    /// <summary>
+    /// Code variants: before an indirect jump leaves the frame through the dispatcher (a bctr without recognized
+    /// targets, a jump table's unlisted case), stop with a report if the target lies in the variant's own code and is
+    /// no entry of anything (runtime CheckVariantIndirectJump): a missed jump target, which the dispatcher would run in
+    /// the interpreter from the middle of the function. Expects the locals flushed (the report reads lr and r1).
+    /// </summary>
+    private static void EmitVariantIndirectJumpCheck(StringBuilder sb, string pad, string targetExpr, string blockLabel)
+    {
+        if (_variantOwnCode is not { Length: > 0 } ownCode) return;
+        var block = 0u;
+        var hex = blockLabel.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? blockLabel[2..]
+            : blockLabel.StartsWith("indirect_ctr_", StringComparison.OrdinalIgnoreCase) ? blockLabel["indirect_ctr_".Length..]
+            : null;
+        if (hex is not null)
+        {
+            uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out block);
+        }
+        sb.Append($"{pad}{{ static constexpr uint32_t kMkwVariantOwnCode[] = {{");
+        sb.Append(string.Join(", ", ownCode.Select(static a => $"0x{a:X8}u")));
+        sb.AppendLine($"}}; CheckVariantIndirectJump(static_cast<uint32_t>({targetExpr}), ctx, 0x{_variantEntry:X8}u, " +
+                      $"0x{block:X8}u, kMkwVariantOwnCode, {ownCode.Length / 2}u); }}");
+    }
+
+    /// <summary>
     /// Guest addresses appearing as an emitted <c>loc_XXXXXXXX</c> label (definition or goto
     /// target) in the body currently being emitted; replaces scanning emitted text to find a
     /// translated function's interior resume points.
@@ -100,12 +133,20 @@ public sealed partial class CxxLinearCodeGenerator
         bool gqrConstantsRequireRuntimeGuard = false,
         bool enableLeafAbiSpillElision = false,
         IReadOnlySet<uint>? modOverridableCallTargets = null,
-        bool enableGpuFifoBurstCoalescing = true)
+        bool enableGpuFifoBurstCoalescing = true,
+        IReadOnlyDictionary<uint, GuestEabiVariant>? eabiVariants = null,
+        uint[]? variantOwnCode = null)
     {
+        _variantOwnCode = variantOwnCode;
+        _variantEntry = entryPoint;
+        eabiVariants ??= new Dictionary<uint, GuestEabiVariant>();
         modOverridableCallTargets ??= new HashSet<uint>();
         nonReturningCallTargets ??= new HashSet<uint>();
         lrContinuationCallTargets ??= new HashSet<uint>();
         guestAbiContracts ??= new Dictionary<uint, GuestAbiContract>();
+        // The fact tables built below (constants, stack addresses) drop values a call may change: the callee's
+        // contract says which registers (the same mask the emitter reloads after the call).
+        CallClobberedValues.UseCallContracts(guestAbiContracts, modOverridableCallTargets);
         stateFreeAbiContracts ??= new Dictionary<uint, GuestAbiContract>();
         stateFreeCallSymbols ??= new Dictionary<uint, string>();
         stateFreeCallSiteVariants ??= new Dictionary<GuestStateFreeCallSiteKey, GuestStateFreeCallVariant>();
@@ -125,6 +166,15 @@ public sealed partial class CxxLinearCodeGenerator
             ElideFctiwStackLowWordLoads(
                 ElideOverwrittenPsqStackLoads(leafStackFunction),
                 types));
+        // MKW_EABI_REGS: a conformant body's nonvolatile frame saves carry CpuContext's stale copies and its restores
+        // are never published, so they become a host local (GuestEabi.ElideFrameSaves has the exactness argument).
+        if (GuestEabi.FrameSaveElision && !emitStateFreeLeafVariant &&
+            guestAbiContracts.TryGetValue(entryPoint, out var frameSaveContract) && frameSaveContract.EabiConformant)
+        {
+            func = GuestEabi.ElideFrameSaves(func,
+                (name, gpr) => types.Unify(name, gpr ? ValueRepresentation.UInt32 : ValueRepresentation.Float64),
+                out _);
+        }
         var isGuestCallFree = FunctionEligibleForLeafRegisterCache(func);
         var hasProvenKernelEntry = isGuestCallFree && gqrEntryConstants is { Count: > 0 };
         func = GqrConstantPropagation.Specialize(
@@ -133,9 +183,16 @@ public sealed partial class CxxLinearCodeGenerator
         // Call-free proven kernels amortize very small ranges. Ordinary functions
         // use the epoch-safe scalar form and a higher threshold to avoid adding
         // pointer locals for incidental field pairs.
-        func = GuestMemoryRangeLowering.Lower(
-            func, minimumAccesses: hasProvenKernelEntry ? 2 : 8, ignoreDisabledPcTraces: true,
-            scalarOnly: !hasProvenKernelEntry);
+        // MKW_LEAN_RANGES (default on): the lean runtime resolves a range once (a read range is base + masked start,
+        // a write range one policy byte and one dirty mark) and each access is then one byte-swapped load or store, so
+        // two accesses through one base in one straight-line segment already pay for it; cross-edge ranges stay off
+        // (memory_access.h, kLeanRangePolicyOffset). MKW_LEAN_RANGES=0: the earlier thresholds.
+        func = LeanRanges
+            ? GuestMemoryRangeLowering.Lower(
+                func, minimumAccesses: 2, ignoreDisabledPcTraces: true, scalarOnly: false, liveInRanges: false)
+            : GuestMemoryRangeLowering.Lower(
+                func, minimumAccesses: hasProvenKernelEntry ? 2 : 8, ignoreDisabledPcTraces: true,
+                scalarOnly: !hasProvenKernelEntry);
         var architecturalFunc = func;
         var guestAbiContract = GuestAbiContractAnalyzer.Analyze(architecturalFunc, guestAbiContracts);
         var cfg = IrCfg.Build(func);
@@ -212,6 +269,11 @@ public sealed partial class CxxLinearCodeGenerator
             sb.AppendLine($"extern \"C\" {StateFreeReturnType(variant.Target, variant.Contract)} {StateFreeCallingConvention(variant.Contract)}{variant.Symbol}({StateFreeParameterList(variant.Contract, includeNames: false)});");
         }
         if (guestAbiContract.DirectCallTargets.Any(stateFreeCallSymbols.ContainsKey)) sb.AppendLine();
+        // MKW_EABI_REGS register-passing entries this body calls (its own too: a recursive call uses it).
+        var ownEabiVariant = eabiVariants.GetValueOrDefault(entryPoint);
+        foreach (var variant in guestAbiContract.DirectCallTargets.Append(entryPoint).Distinct()
+                     .Where(eabiVariants.ContainsKey).Select(target => eabiVariants[target]))
+            sb.AppendLine($"{EabiVariantPrototype(variant, includeNames: false)};");
         // Collect and declare only non-register local variables (temporaries)
         var locals = CollectNonRegisterLocals(func);
         var orderedLocals = locals.OrderBy(x => x, StringComparer.Ordinal).ToArray();
@@ -266,14 +328,30 @@ public sealed partial class CxxLinearCodeGenerator
         // invocations with the same residency produce identical text.
         var emittedDirectCallTargets = new SortedSet<uint>();
         var emittedLocalLabelAddresses = new SortedSet<uint>();
-        string EmitFunctionBody(RegisterResidency? residency, int bufferBaseLength, bool discardResult = false)
+        var eabiConformantBody = GuestEabi.Enabled &&
+                                 guestAbiContracts.TryGetValue(entryPoint, out var ownEabiContract) &&
+                                 ownEabiContract.EabiConformant;
+        var singleFprValues = SingleCOperands ? ComputeSingleFprValues(func) : null;
+        string EmitFunctionBody(RegisterResidency? residency, int bufferBaseLength, bool discardResult = false,
+            GuestEabiVariant? variantBody = null)
         {
+            var previousVariantBody = _eabiVariantBody;
+            var previousVariants = _eabiVariants;
+            _eabiVariantBody = variantBody;
+            _eabiVariants = eabiVariants;
             var previousResidency = _activeResidency;
             var previousDirectCallTargets = _emittedDirectCallTargets;
             var previousLocalLabels = _emittedLocalLabelAddresses;
             var previousFifoBurstSlot = _activeGpuFifoBurstSlot;
             var previousHoistedGqrIndices = _hoistedGqrIndices;
+            var previousEabiConformantBody = _eabiConformantBody;
+            _eabiConformantBody = eabiConformantBody;
+            var previousSingleFprValues = _singleFprValues;
+            _singleFprValues = singleFprValues;
+            var previousSegmentPsqStores = _segmentPsqStores;
+            _segmentPsqStores = LeanRanges && !emitStateFreeLeafVariant;
             _activeResidency = residency;
+            residency?.BeginEmission();
             _emittedDirectCallTargets = emittedDirectCallTargets;
             _emittedLocalLabelAddresses = emittedLocalLabelAddresses;
             _activeGpuFifoBurstSlot = null;
@@ -317,7 +395,8 @@ public sealed partial class CxxLinearCodeGenerator
                 if (residency is not null)
                 {
                     var beforeEntryLoads = body.Length;
-                    residency.AppendEntryLoads(body);
+                    if (variantBody is not null) residency.AppendVariantEntryLoads(body, variantBody);
+                    else residency.AppendEntryLoads(body);
                     if (body.Length != beforeEntryLoads)
                     {
                         body.AppendLine();
@@ -333,6 +412,7 @@ public sealed partial class CxxLinearCodeGenerator
                     var localConstants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
                     var label = labelNames[block.Label];
                     RecordEmittedLocalLabel(label);
+                    residency?.BeginBlock(block.Label);
                     body.AppendLine($"{label}:");
                     body.AppendLine("{");
                     var localPaired = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
@@ -411,12 +491,12 @@ public sealed partial class CxxLinearCodeGenerator
                         case IrUndefined undef:
                             EmitInstruction(block.Label, -1, undef, body, bufferBaseLength, 1, cfg, labelNames, types, signature, localPaired, _guestAbiProvider, knownConstants, localConstants, linkedAddressRemap, nonReturningCallTargets, lrContinuationCallTargets, stackFacts, inlineGuestThunkStackBase: false, localFallthroughLr: null, guestAbiContracts, stateFreeAbiContracts, stateFreeCallSymbols, stateFreeCallSiteVariants, modOverridableCallTargets, shareLrContinuationDispatch);
                             AppendFlush(body, "    ");
-                            body.AppendLine("    return;");
+                            body.AppendLine($"    {ReturnStatement(fromContext: true)}");
                             break;
 
                         case IrReturn ret:
-                            AppendFlush(body, "    ");
-                            body.AppendLine("    return;");
+                            AppendReturnFlush(body, "    ");
+                            body.AppendLine($"    {ReturnStatement()}");
                             break;
 
                         case IrJump jump:
@@ -464,8 +544,9 @@ public sealed partial class CxxLinearCodeGenerator
                             // dispatcher: publish the locals and never write
                             // them back afterwards.
                             AppendFlush(body, "        ");
-                            body.AppendLine($"        InvokeIndirectJump({selectorExpr}, ctx);");
-                            body.AppendLine("        return;");
+                            EmitVariantIndirectJumpCheck(body, "        ", selectorExpr, block.Label);
+                            body.AppendLine($"        MKW_INDIRECT_JUMP({selectorExpr}, ctx);");
+                            body.AppendLine($"        {ReturnStatement(fromContext: true)}");
                             body.AppendLine("    }");
                             break;
 
@@ -484,9 +565,9 @@ public sealed partial class CxxLinearCodeGenerator
                                 // unreachable and must not write them back.
                                 if (term is not IrIndirectJump)
                                 {
-                                    AppendFlush(body, "    ");
+                                    AppendReturnFlush(body, "    ");
                                 }
-                                body.AppendLine("    return;");
+                                body.AppendLine($"    {ReturnStatement(fromContext: term is IrIndirectJump)}");
                             }
                             break;
                     }
@@ -494,18 +575,19 @@ public sealed partial class CxxLinearCodeGenerator
                     body.AppendLine("}");
                     body.AppendLine();
                 }
+                residency?.EndBlocks();
 
                 if (shareLrContinuationDispatch)
                 {
                     // Every call site has already reloaded the callee's state.
                     // Keep the complete local target set, but emit it only once.
-                    body.AppendLine("    return;");
+                    body.AppendLine($"    {ReturnStatement()}");
                     body.AppendLine("[[maybe_unused]] lr_continuation_dispatch:");
                     EmitLocalLrContinuationDispatch(body, "    ", labelNames);
                     body.AppendLine("    if (TranslatedFunctionRegistry::FindByAddressPtr(ctx->lr) != nullptr) {");
                     body.AppendLine("        InvokeIndirectCpu(ctx->lr, ctx);");
                     body.AppendLine("    }");
-                    body.AppendLine("    return;");
+                    body.AppendLine($"    {ReturnStatement(fromContext: true)}");
                 }
                 body.Append('}');
                 // The residency discovery pass only exists for its side effects
@@ -522,6 +604,11 @@ public sealed partial class CxxLinearCodeGenerator
                 _emittedLocalLabelAddresses = previousLocalLabels;
                 _activeGpuFifoBurstSlot = previousFifoBurstSlot;
                 _hoistedGqrIndices = previousHoistedGqrIndices;
+                _eabiConformantBody = previousEabiConformantBody;
+                _singleFprValues = previousSingleFprValues;
+                _segmentPsqStores = previousSegmentPsqStores;
+                _eabiVariantBody = previousVariantBody;
+                _eabiVariants = previousVariants;
             }
         }
 
@@ -533,9 +620,22 @@ public sealed partial class CxxLinearCodeGenerator
             FunctionDefinitionSignature(implementationName).Length +
             Environment.NewLine.Length;
         RegisterResidency? residency = null;
+        RegisterResidency? variantResidency = null;
         {
             var recorder = RegisterResidency.CreateRecorder();
             EmitFunctionBody(recorder, bodyBufferBaseLength, discardResult: true);
+            if (ownEabiVariant is not null)
+            {
+                recorder.RequireLocals(
+                    ownEabiVariant.InputGprMask | ownEabiVariant.OutputGprMask,
+                    ownEabiVariant.InputFprMask | ownEabiVariant.OutputFprMask);
+                // The register-passing body replays the same emission (same flushes in the same order), but its
+                // arguments start out only in locals.
+                variantResidency = recorder.Snapshot();
+                if (continuationCallCount == 0 && ResidencyDirtyFlushEnabled)
+                    recorder.SolveFlushPlan(variantResidency, cfg.Successors, func.EntryLabel,
+                        variantResidency.VariantEntryDirty(ownEabiVariant));
+            }
             var discovered = recorder.Snapshot();
             if (!discovered.IsEmpty)
             {
@@ -545,12 +645,42 @@ public sealed partial class CxxLinearCodeGenerator
                     orderedLocals
                         .Concat(guestRangeResolves.Select(static resolve => resolve.Destination))
                         .Concat(gqrEntryGuards.Select(static guard => GqrEntryGuardName(guard.Index, guard.Value))));
+                // LR-continuation call sites jump to instruction labels and a shared dispatch outside the block
+                // CFG, so those bodies keep storing the whole write set at every flush.
+                if (continuationCallCount == 0 && ResidencyDirtyFlushEnabled)
+                {
+                    recorder.SolveFlushPlan(discovered, cfg.Successors, func.EntryLabel);
+                }
                 residency = discovered;
             }
+        }
+        // MKW_EABI_REGS, conformant bodies: the nonvolatile FPRs a call may change in CpuContext are the ones some flush
+        // of this body stores (a conformant return publishes none, and nothing else in a residency-owned body writes
+        // ctx->fpr[14..31]), not every one the body writes in its locals. The trait mask sizes the caller's
+        // PpcNonvolatileFprGuard (abi_bridge.h), so a body whose flushes never store one needs no guard at all.
+        if (eabiConformantBody && residencyOwnsPrimaryBody && residency?.PossiblyStoredByFlushes is { } storedByFlushes &&
+            (ownEabiVariant is null || variantResidency?.PossiblyStoredByFlushes is not null))
+        {
+            var stored = storedByFlushes | (variantResidency?.PossiblyStoredByFlushes ?? UInt128.Zero);
+            nonvolatileFprWriteMask = (uint)(stored >> 32) & 0xFFFFC000u;
+            preservesNonvolatileFprs = nonvolatileFprWriteMask == 0;
         }
 
         sb.AppendLine(FunctionDefinitionSignature(implementationName));
         sb.AppendLine(EmitFunctionBody(residencyOwnsPrimaryBody ? residency : null, bodyBufferBaseLength));
+
+        if (ownEabiVariant is not null)
+        {
+            if (variantResidency is null || !residencyOwnsPrimaryBody)
+                throw new InvalidOperationException($"Register-passing entry for 0x{entryPoint:X8} has no residency.");
+            // MKW_EABI_REGS: the same body as a register-passing entry (direct callers; the CpuContext entry above
+            // stays for indirect calls, natives and the interpreter).
+            var prototype = EabiVariantPrototype(ownEabiVariant, includeNames: true);
+            sb.AppendLine();
+            var variantBufferBaseLength = sb.Length + prototype.Length + Environment.NewLine.Length;
+            sb.AppendLine(prototype);
+            sb.AppendLine(EmitFunctionBody(variantResidency, variantBufferBaseLength, variantBody: ownEabiVariant));
+        }
 
         var aliasName = $"func_{entryPoint:X8}";
         if (!emitModRegistration && !cxxName.Equals(aliasName, StringComparison.OrdinalIgnoreCase))
@@ -715,6 +845,10 @@ public sealed partial class CxxLinearCodeGenerator
     internal static Dictionary<string, uint> BuildKnownUIntConstants(IrFunction func)
     {
         var constants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        // A value read where some path carried it across a guest call that may change its register is not what the
+        // register holds there (CallClobberedValues): nothing computed from such a read is a constant. The readers of
+        // this map check their own address base the same way (TryGetKnownEffectiveAddress).
+        CallClobberedValues.Analyze(func);
 
         foreach (var block in func.Blocks)
         {
@@ -722,6 +856,9 @@ public sealed partial class CxxLinearCodeGenerator
             {
                 switch (instruction)
                 {
+                    case IrAssign or IrBinary when CallClobberedValues.HasStaleUse(instruction):
+                        break;
+
                     case IrAssign assign when TryGetUIntConstant(assign.Value, constants, out var value):
                         constants[assign.Destination] = value;
                         break;

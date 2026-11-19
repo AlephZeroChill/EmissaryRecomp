@@ -8,7 +8,14 @@ namespace Translator.Core.Analysis;
 
 public sealed record GuestAbiInterproceduralResult(
     IReadOnlyDictionary<uint, GuestAbiContract> Contracts,
-    IReadOnlyList<IReadOnlyList<uint>> StronglyConnectedComponents);
+    IReadOnlyList<IReadOnlyList<uint>> StronglyConnectedComponents)
+{
+    /// <summary>MKW_EABI_REGS: why each non-conformant translated function violates the EABI.</summary>
+    public IReadOnlyDictionary<uint, string> EabiViolations { get; init; } = new Dictionary<uint, string>();
+
+    /// <summary>MKW_EABI_REGS: why each non-conformant registered native violates the EABI.</summary>
+    public IReadOnlyDictionary<uint, string> EabiNativeViolations { get; init; } = new Dictionary<uint, string>();
+}
 
 /// <summary>
 /// Computes architectural effects in guest execution order, so a callee read is suppressed once
@@ -22,6 +29,20 @@ public static class GuestAbiInterproceduralAnalyzer
     {
         externalContracts ??= new Dictionary<uint, GuestAbiContract>();
         var addresses = functions.Keys.OrderBy(static address => address).ToArray();
+        // MKW_EABI_REGS: each round's exact contract is classified; conformant functions publish their EABI view.
+        var eabiReasons = new string?[addresses.Length];
+        var eabiNativeReasons = new Dictionary<uint, string>();
+        if (GuestEabi.Enabled)
+        {
+            var classifiedExternal = new Dictionary<uint, GuestAbiContract>(externalContracts.Count);
+            foreach (var (address, contract) in externalContracts)
+            {
+                var (classified, reason) = GuestEabi.ClassifyNative(address, contract);
+                classifiedExternal[address] = classified;
+                if (reason is not null) eabiNativeReasons[address] = reason;
+            }
+            externalContracts = classifiedExternal;
+        }
 
         // GuestAbiContractAnalyzer.Analyze is pure and the round's contract snapshot is frozen, so
         // per-function analyses within a round can run on any thread. Determinism comes from
@@ -36,11 +57,22 @@ public static class GuestAbiInterproceduralAnalyzer
         // Mirror of `contracts` keyed by ordinal.  The fixpoint compares against
         // it from the parallel phase, where the dictionary must stay untouched.
         var current = new GuestAbiContract[addresses.Length];
+        GuestAbiContract AnalyzeOne(int index, IReadOnlyDictionary<uint, GuestAbiContract>? callees)
+        {
+            var precise = GuestAbiContractAnalyzer.Analyze(bodies[index], callees);
+            if (!GuestEabi.Enabled) return precise;
+            // Violator status is sticky: a violator's contract keeps its larger definite writes, which can make a
+            // caller in the same recursive cycle conformant again, so without this the rounds never settle.
+            var classification = GuestEabi.Classify(bodies[index], precise, callees, eabiReasons[index]);
+            eabiReasons[index] = classification.Reason;
+            return classification.Contract;
+        }
+
         Parallel.For(
             0,
             addresses.Length,
             parallelOptions,
-            index => current[index] = GuestAbiContractAnalyzer.Analyze(bodies[index]));
+            index => current[index] = AnalyzeOne(index, null));
 
         var contracts = new Dictionary<uint, GuestAbiContract>(addresses.Length);
         for (var index = 0; index < addresses.Length; ++index) contracts.Add(addresses[index], current[index]);
@@ -75,7 +107,11 @@ public static class GuestAbiInterproceduralAnalyzer
         }
 
         var visible = new Dictionary<uint, GuestAbiContract>(externalContracts);
-        foreach (var (address, contract) in contracts) visible[address] = contract;
+        // MKW_EABI_REGS: a registered native is what runs at its address, so callers see its contract, not that of
+        // the replaced PPC body (OS routines reading MSR would otherwise mark every caller non-conformant).
+        var nativeWins = GuestEabi.Enabled ? new HashSet<uint>(externalContracts.Keys) : new HashSet<uint>();
+        foreach (var (address, contract) in contracts)
+            if (!nativeWins.Contains(address)) visible[address] = contract;
 
         var pending = new bool[addresses.Length];
         var nextRound = new bool[addresses.Length];
@@ -84,6 +120,8 @@ public static class GuestAbiInterproceduralAnalyzer
         // slot each one writes its result into.  Both are reused every round.
         var worklist = new int[addresses.Length];
         var roundResults = new GuestAbiContract?[addresses.Length];
+        var changeCounts = new int[addresses.Length];
+        var round = 0;
         while (true)
         {
             var worklistCount = 0;
@@ -95,33 +133,53 @@ public static class GuestAbiInterproceduralAnalyzer
             Parallel.For(0, worklistCount, parallelOptions, position =>
             {
                 var ordinal = worklist[position];
-                var next = GuestAbiContractAnalyzer.Analyze(bodies[ordinal], visible);
+                var next = AnalyzeOne(ordinal, visible);
                 roundResults[position] = Equivalent(current[ordinal], next) ? null : next;
             });
 
             Array.Clear(nextRound);
             var updated = false;
+            var updatedCount = 0;
+            ++round;
             for (var position = 0; position < worklistCount; ++position)
             {
                 var contract = roundResults[position];
                 if (contract is null) continue;
-                updated = true;
                 var ordinal = worklist[position];
+                if (GuestEabi.Enabled && ++changeCounts[ordinal] > 8)
+                {
+                    // MKW_EABI_REGS: a contract that keeps changing (classification interacts with recursion) is
+                    // joined with its previous value from now on: a monotone, conservative step that must settle.
+                    contract = GuestEabi.Join(current[ordinal], contract);
+                    if (Equivalent(current[ordinal], contract)) continue;
+                    if (!contract.EabiConformant) eabiReasons[ordinal] ??= "unstable contract (joined)";
+                }
+                updated = true;
+                ++updatedCount;
                 var address = addresses[ordinal];
                 current[ordinal] = contract;
                 contracts[address] = contract;
-                visible[address] = contract;
+                if (!nativeWins.Contains(address)) visible[address] = contract;
                 var callerList = callers[ordinal];
                 if (callerList is null) continue;
                 foreach (var caller in callerList) nextRound[caller] = true;
             }
 
+            if (GuestEabi.Enabled && round > 10)
+                Console.WriteLine($"[translator] EABI contract round {round}: {updatedCount:N0} changed of {worklistCount:N0}");
             if (!updated) break;
 
             (pending, nextRound) = (nextRound, pending);
         }
 
-        return new GuestAbiInterproceduralResult(contracts, BuildComponents(functions, contracts));
+        var violations = new Dictionary<uint, string>();
+        for (var index = 0; index < addresses.Length; ++index)
+            if (eabiReasons[index] is { } reason) violations[addresses[index]] = reason;
+        return new GuestAbiInterproceduralResult(contracts, BuildComponents(functions, contracts))
+        {
+            EabiViolations = violations,
+            EabiNativeViolations = eabiNativeReasons
+        };
     }
 
     /// <summary>
@@ -178,6 +236,8 @@ public static class GuestAbiInterproceduralAnalyzer
         left.DefinitelyWritesFpscr == right.DefinitelyWritesFpscr &&
         left.GqrDefiniteWriteMask == right.GqrDefiniteWriteMask &&
         left.HidDefiniteWriteMask == right.HidDefiniteWriteMask &&
+        left.EabiCrReadBeforeWriteMask == right.EabiCrReadBeforeWriteMask &&
+        left.EabiConformant == right.EabiConformant &&
         left.BoundaryFlags == right.BoundaryFlags &&
         SameTargets(left.DirectCallTargets, right.DirectCallTargets);
 

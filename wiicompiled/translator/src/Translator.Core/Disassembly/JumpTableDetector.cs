@@ -10,6 +10,7 @@ internal static class JumpTableDetector
 {
     private const int MaxBacktrackInstructions = 8192;  // SPM: loop-hoisted table bases (lis far above the switch)
     private const int MaxEntryCount = 512;
+    private const int MaxTracedPredecessors = 512;  // followControlFlow: a loop's back edge can lead the trace in circles
 
     public static bool TryRecognize(
         IReadOnlyList<PpcInstruction> ordered,
@@ -18,7 +19,8 @@ internal static class JumpTableDetector
         uint functionStart,
         uint functionEnd,
         ProgramImage image,
-        out IReadOnlyList<uint> targets)
+        out IReadOnlyList<uint> targets,
+        bool followControlFlow = false)
     {
         targets = Array.Empty<uint>();
         if (!indexByAddress.TryGetValue(bctrAddress, out var bctrIndex))
@@ -70,8 +72,35 @@ internal static class JumpTableDetector
         }
         entriesAreRelative = HasRelativeEntryAdd(ordered, loadIndex, mtctrIndex, targetRegister, baseReg.Name);
 
-        if (!TryFindUpperBound(ordered, loadIndex, indexReg.Name, out var upperBound) || upperBound < 0 || upperBound >= MaxEntryCount)
+        // Code variants (followControlFlow): the bound compare on the index register, first in address order, then along
+        // the control flow (through a mod's hook body); no bound, no table, and the variant stays interpreted. Never the
+        // any-register fallback: when Project+ puts its hook branch on a switch's bounds compare (the hook adds cases),
+        // the address-order trace rightly stops at an older write of the index register, and the fallback took an
+        // unrelated compare above it (0x80917190: "cmpwi r0, 0" for the hooked "cmplwi r4, 50", one case). The cases
+        // past such a bound left the variant through MKW_INDIRECT_JUMP into its own middle, in the interpreter.
+        // Base translation: address order with the fallback (a loop's counter register), as before.
+        static bool Valid(bool found, int bound) => found && bound >= 0 && bound < MaxEntryCount;
+        string via;
+        int upperBound;
+        if (!followControlFlow)
         {
+            via = "address order";
+            if (!Valid(TryFindUpperBound(ordered, loadIndex, indexReg.Name, false, false, out upperBound), upperBound))
+            {
+                return false;
+            }
+        }
+        else if (Valid(TryFindUpperBound(ordered, loadIndex, indexReg.Name, false, true, out upperBound), upperBound))
+        {
+            via = "address order";
+        }
+        else if (Valid(TryFindUpperBound(ordered, loadIndex, indexReg.Name, true, true, out upperBound), upperBound))
+        {
+            via = "control flow";
+        }
+        else
+        {
+            LogTable($"variant fn {functionStart:X8} bctr {bctrAddress:X8} table {tableBase:X8} no bound: not recognized");
             return false;
         }
 
@@ -108,8 +137,39 @@ internal static class JumpTableDetector
             return false; // Not a real switch.
         }
 
+        if (LogWriter is not null)
+        {
+            // run: consecutive table words from the base that would pass the same entry check, an upper estimate of
+            // the table's length (a neighbouring table or code-like data extends it) to compare the bound against.
+            var run = 0;
+            while (run < MaxEntryCount && TryReadWord(image, unchecked(tableBase + (uint)(run * 4)), out var word))
+            {
+                var target = entriesAreRelative ? unchecked(tableBase + word) : word;
+                if (!indexByAddress.ContainsKey(target) && (target < functionStart || target >= functionEnd || (target & 3) != 0))
+                {
+                    break;
+                }
+                run++;
+            }
+            LogTable($"{(followControlFlow ? "variant" : "base")} fn {functionStart:X8} bctr {bctrAddress:X8} table {tableBase:X8} " +
+                     $"entries {entryCount} distinct {dedupList.Count} via {via} run {run}");
+        }
+
         targets = dedupList;
         return true;
+    }
+
+    // TRANSLATOR_JUMP_TABLE_LOG=<file>: one line per recognized table (and per code-variant switch left unrecognized),
+    // for checking recognized sizes against the tables. Off by default; no effect on the translation.
+    private static readonly System.IO.StreamWriter? LogWriter =
+        Environment.GetEnvironmentVariable("TRANSLATOR_JUMP_TABLE_LOG") is { Length: > 0 } logPath
+            ? new System.IO.StreamWriter(logPath, append: false) { AutoFlush = true }
+            : null;
+
+    private static void LogTable(string line)
+    {
+        if (LogWriter is null) return;
+        lock (LogWriter) LogWriter.WriteLine(line);
     }
 
     private static int FindPrevious(IReadOnlyList<PpcInstruction> ordered, int startIndex, string mnemonic, int limit)
@@ -424,17 +484,31 @@ internal static class JumpTableDetector
         return false;
     }
 
-    private static bool TryFindUpperBound(IReadOnlyList<PpcInstruction> ordered, int startIndex, string register, out int upperBound)
+    private static bool TryFindUpperBound(IReadOnlyList<PpcInstruction> ordered, int startIndex, string register,
+        bool followControlFlow, bool codeVariant, out int upperBound)
     {
         // Preferred: the bound compare on the case index that feeds lwzx. Trace the index register
         // backwards through the scale-by-four that turns the case number into a byte offset (CodeWarrior
         // emits "cmplwi rI, N; bgt default; slwi rX, rI, 2; lwzx rT, rBase, rX"), and stop at any other
         // write to the tracked register: a compare found beyond it tests an older, unrelated value (NSMBW's
         // TagProcessor_c::preProcess reuses r0, whose earlier "cmplwi r0, 0" turned a 20-case table into one).
+        // followControlFlow (code variants): the trace steps to each instruction's predecessor instead of the word
+        // before it, so it can pass through a mod's hook body: Project+ moves 0x8078249C's "cmplwi r4, 76" into a C2
+        // body that branches back to the bgt, and the word before that bgt is the hook's branch, which execution
+        // never falls through. On straight-line code both traces visit the same instructions.
         var tracked = register;
-        for (var i = startIndex - 1; i >= 0 && startIndex - i <= MaxBacktrackInstructions; i--)
+        var steps = 0;
+        for (var i = followControlFlow ? Predecessor(ordered, startIndex) : startIndex - 1;
+             i >= 0 && (followControlFlow ? ++steps <= MaxTracedPredecessors : startIndex - i <= MaxBacktrackInstructions);
+             i = followControlFlow ? Predecessor(ordered, i) : i - 1)
         {
             var ins = ordered[i];
+            // Code variants: the address-order trace also ends where execution cannot fall through into the word after
+            // (an unconditional b, blr, bctr): a mod's hook branch there means what lies above it did not run before.
+            if (codeVariant && !followControlFlow && !FallsThrough(ins))
+            {
+                break;
+            }
             if (ins.Operands.Count < 2 || ins.Operands[0] is not PpcRegisterOperand reg ||
                 !string.Equals(reg.Name, tracked, StringComparison.OrdinalIgnoreCase))
             {
@@ -465,7 +539,8 @@ internal static class JumpTableDetector
 
         // Fallback: some loops compare a logical counter (e.g. r18) distinct from the byte-offset
         // register (e.g. r30) that feeds lwzx, so the bound check may not target the index register.
-        for (var i = startIndex - 1; i >= 0 && startIndex - i <= MaxBacktrackInstructions; i--)
+        // (Not for code variants: they accept only a compare on the index register itself.)
+        for (var i = startIndex - 1; !codeVariant && i >= 0 && startIndex - i <= MaxBacktrackInstructions; i--)
         {
             var ins = ordered[i];
             if (ins.Operands.Count < 2 || ins.Operands[1] is not PpcImmediateOperand imm)
@@ -490,6 +565,37 @@ internal static class JumpTableDetector
         upperBound = 0;
         return false;
     }
+
+    // The instruction executed just before ordered[index]: the word before it when execution falls through from
+    // there, else the one branch that reaches it; -1 when there is no such single instruction.
+    private static int Predecessor(IReadOnlyList<PpcInstruction> ordered, int index)
+    {
+        var address = ordered[index].Address;
+        if (index > 0 && ordered[index - 1].EndAddress == address && FallsThrough(ordered[index - 1]))
+        {
+            return index - 1;
+        }
+        var found = -1;
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var ins = ordered[i];
+            if (ins.IsCall || ins.IsReturn || !ins.BranchTargets.Contains(address))
+            {
+                continue;
+            }
+            if (found >= 0)
+            {
+                return -1;
+            }
+            found = i;
+        }
+        return found;
+    }
+
+    private static bool FallsThrough(PpcInstruction ins) =>
+        ins.IsConditionalBranch || ins.IsConditionalCall ||
+        !(ins.IsUnconditionalBranch || ins.IsReturn ||
+          string.Equals(ins.Mnemonic, "bctr", StringComparison.OrdinalIgnoreCase));
 
     private static bool TryReadWord(ProgramImage image, uint address, out uint value)
     {
