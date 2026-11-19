@@ -72,12 +72,21 @@ def main():
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--native-arg', action='append', default=[],
                         help='extra argument for the native CMake configure; repeatable')
+    parser.add_argument('--brawl-online', default='off', metavar='off|lock|PATH',
+                        help="Brawl Online's online core, linked in-process: off (the standalone game), lock (fetched at "
+                             'brawl_online.lock, Brawl Online releases) or a brawlonline.net checkout')
+    parser.add_argument('--brawl-online-dir', type=Path, default=ROOT / 'build/brawl-online',
+                        help='where --brawl-online=lock fetches the core (shared by build directories)')
+    parser.add_argument('--release-version', default='',
+                        help='the release this build is (v0.7.0), built in and logged; default: none (a dev build)')
     parser.add_argument('--code-variants', type=Path,
                         help="a mod's code-variant spec (projects/brawl/tools/gen_variant_spec.py): its patched "
                              'functions are translated as it patches them, beside the unmodified translation')
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error('--jobs must be positive')
+    if args.release_version and not re.fullmatch(r'v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?', args.release_version):
+        parser.error('--release-version must look like v1.2.3 or v1.2.3-rc.1')
     game, build = args.game.resolve(), args.build_dir.resolve()
     if build == ROOT or ROOT.is_relative_to(build):
         parser.error('build directory must not contain the source checkout')
@@ -91,6 +100,28 @@ def main():
             import fcntl
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         build_game(args, game, build)
+
+
+def brawl_online_args(args):
+    """The native configure's Brawl Online options (runtime/cmake/PublicProducts.cmake). Always all of them: the CMake
+    cache keeps a value from the last configure, so `off` has to clear BRAWL_ONLINE_ROOT."""
+    choice = args.brawl_online
+    if choice == 'off':
+        return ['-DBRAWL_ONLINE_ROOT=', '-DBRAWL_ONLINE_APP_VERSION=']
+    app_version = ''
+    if choice == 'lock':
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import fetch_brawl_online
+        lock = fetch_brawl_online.read_lock()
+        app_version = lock.get('appVersion', '')
+        print(f"Brawl Online core: {lock['repo']} {lock['commit']} (appVersion {app_version or 'not stamped'})",
+              flush=True)
+        core = fetch_brawl_online.fetch(args.brawl_online_dir.resolve(), lock['repo'], lock['commit'], app_version)
+    else:
+        core = Path(choice).resolve()
+        if not (core / 'core/standalone/CMakeLists.txt').is_file():
+            raise RuntimeError(f'--brawl-online={choice}: not a brawlonline.net checkout (no core/standalone)')
+    return [f'-DBRAWL_ONLINE_ROOT={core.as_posix()}', f'-DBRAWL_ONLINE_APP_VERSION={app_version}']
 
 
 def build_game(args, game, build):
@@ -213,7 +244,8 @@ def build_game(args, game, build):
     compilers_stamp.write_text(compilers)
     run(args.cmake, '-S', wc / 'runtime', '-B', build / 'native', '-G', 'Ninja',
         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={Path(shutil.which("clang")).as_posix()}',
-        f'-DCMAKE_CXX_COMPILER={Path(shutil.which("clang++")).as_posix()}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}', *args.native_arg)
+        f'-DCMAKE_CXX_COMPILER={Path(shutil.which("clang++")).as_posix()}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}',
+        *brawl_online_args(args), f'-DMKW_RELEASE_VERSION={args.release_version}', *args.native_arg)
     run(args.cmake, '--build', build / 'native', '--target', 'WiiCompiled', '--parallel', args.jobs)
     # Portable like Play\: settings, saves and logs go to native/UserData, whose config points the game at the disc.
     (build / 'native/portable.txt').write_text('Settings, saves and logs stay in the UserData folder next to this file.\n')
