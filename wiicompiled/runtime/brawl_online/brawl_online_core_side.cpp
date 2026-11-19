@@ -218,6 +218,8 @@ public:
     }
     void StopGame() override { B::StopGame(); }
     bool HarnessActive() const override { return BrawlOnlineBridge::CoreHarnessActive(); }
+    // The shape the picture is shown at: the game draws for it (GameBridge::PutAspect; 0 = as the game draws).
+    float DrawAspectRatio() const override { return B::DrawAspect(); }
     void QueueHostJob(std::function<void()> job) override { std::thread(std::move(job)).detach(); }
 };
 

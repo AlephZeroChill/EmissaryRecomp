@@ -1,3 +1,4 @@
+#include "brawl_online_core.h"
 #include "det_clock.h"
 #include "display_settings.h"
 
@@ -34,6 +35,14 @@ int32_t EffectiveAspect(int32_t aspect) {
     return g_bootWidescreen ? aspect : kAspect4x3;
 }
 
+// Brawl Online's core draws any screen shape itself (PictureAspect): the game's picture is shown at the shape the
+// player picked, stretched to it, and aurora's own widening stays off (the plugin rescales GX's projection instead,
+// the same on Dolphin and here, so both draw the same pictures and the cameras stay the match's).
+bool CoreDrawsShape() {
+    static const bool on = BrawlOnlineCore::Enabled();
+    return on;
+}
+
 bool SurfaceWiderThan169() {
     return g_surfaceWidth != 0 && g_surfaceHeight != 0 &&
            static_cast<float>(g_surfaceWidth) / static_cast<float>(g_surfaceHeight) > kRatio16x9;
@@ -47,7 +56,7 @@ float RenderLines(float renderScale, int32_t aspect) {
         return LinesForScale(renderScale);
     }
     const float w = static_cast<float>(g_surfaceWidth), h = static_cast<float>(g_surfaceHeight);
-    const bool fillsSurface = aspect == kAspectFill && SurfaceWiderThan169();
+    const bool fillsSurface = aspect == kAspectFill && (SurfaceWiderThan169() || CoreDrawsShape());
     const float pictureAspect = aspect == kAspect4x3 ? 4.0f / 3.0f : aspect == kAspectCinematic ? kRatioCinematic : kRatio16x9;
     return fillsSurface ? h : std::min(h, w / pictureAspect);
 }
@@ -61,7 +70,7 @@ void ApplyRenderer(const Settings& settings) {
         // A 2.39:1 picture, letterboxed on narrower screens; the game draws the wider view into it.
         VIUnlockAspectRatio();
         AuroraSetViewportFixedAspect(kRatioCinematic);
-    } else if (aspect == kAspect16x9 || !SurfaceWiderThan169()) {
+    } else if (aspect == kAspect16x9 || (!SurfaceWiderThan169() && !CoreDrawsShape())) {
         // 16:9, or Fill on a surface no wider than 16:9 (the picture is never squashed).
         VIUnlockAspectRatio();
         AuroraSetViewportPolicy(AURORA_VIEWPORT_16_9);
@@ -81,9 +90,10 @@ void ApplyRenderer(const Settings& settings) {
 void ApplyGameCanvas(int32_t aspect) {
     // 3D: cameras set up for 16:9 are widened to the screen (aurora's projection), the same view
     // height with more to the sides, instead of being stretched across it.
-    const bool widened = aspect == kAspectFill && SurfaceWiderThan169();
+    const bool widened = aspect == kAspectFill && SurfaceWiderThan169() && !CoreDrawsShape();
     AuroraSetWidePerspectiveAspect(
-        aspect == kAspectCinematic ? kRatioCinematic
+        CoreDrawsShape() ? 0.0f
+        : aspect == kAspectCinematic ? kRatioCinematic
         : widened ? static_cast<float>(g_surfaceWidth) / static_cast<float>(g_surfaceHeight) : 0.0f);
 
 }
@@ -97,7 +107,7 @@ float LinesForScale(float renderScale) {
 // Deterministic mode (network play) keeps every device on the same 16:9 canvas: how wide the game
 // draws decides which enemies it wakes, so Fill's screen-dependent width would desync the session.
 Settings Lockstep(Settings settings) {
-    if (DetClock::Enabled()) {
+    if (DetClock::Enabled() && !CoreDrawsShape()) {
         settings.aspect = kAspect16x9;
     }
     return settings;
@@ -161,6 +171,18 @@ Settings Latest() {
 bool GameWidescreen() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_bootWidescreen;
+}
+
+float PictureAspect() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    switch (EffectiveAspect(g_current.aspect)) {
+    case kAspect4x3: return 4.0f / 3.0f;
+    case kAspectCinematic: return kRatioCinematic;
+    case kAspectFill:
+        return g_surfaceWidth && g_surfaceHeight ? static_cast<float>(g_surfaceWidth) / static_cast<float>(g_surfaceHeight)
+                                                 : 0.0f;
+    default: return kRatio16x9;
+    }
 }
 
 bool SurfaceWide() {

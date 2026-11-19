@@ -1694,6 +1694,11 @@ void UpdateBootShaderState() {
         if (std::getenv("NSMBW_INPUT_SCRIPT") != nullptr || std::filesystem::exists("input_script.txt")) {
             NotifyStrapInputAccepted();
         }
+#if MKW_BRAWL_ONLINE_CORE
+        // Brawl Online's build goes on by itself, as Dolphin does: the launcher started it to play, and a press here
+        // would be one more step before the online menus. The card (and its credits) shows while the game boots.
+        NotifyStrapInputAccepted();
+#endif
     }
 }
 

@@ -50,6 +50,8 @@ Pad LocalPad(int chan);
 
 void ScreenMessage(const char* text, uint32_t ms, uint32_t argb);
 void StopGame();
+// The width over height the game's picture is shown at (DisplaySettings::PictureAspect; 0 = not known yet).
+float DrawAspect();
 
 // ---- The core, for the runtime (core side) -----------------------------------------------------
 // What the loop does after the core's loop-top hook.

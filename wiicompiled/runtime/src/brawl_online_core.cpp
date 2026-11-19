@@ -9,6 +9,7 @@
 #include "brawl_snapshot_store.h"
 #include "brawl_write_watch.h"
 #include "det_clock.h"
+#include "display_settings.h"
 #include "frame_input.h"
 #include "memory.h"
 #include "settings_overlay.h"
@@ -165,6 +166,7 @@ Pad LocalPad(int chan) {
 }
 
 void ScreenMessage(const char* text, uint32_t, uint32_t) { std::fprintf(stderr, "[brawl-online] %s\n", text); }
+float DrawAspect() { return DisplaySettings::PictureAspect(); }
 void StopGame() {
     std::fputs("[brawl-online] the core stops the game\n", stderr);
     std::exit(0);

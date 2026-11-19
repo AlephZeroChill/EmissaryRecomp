@@ -44,6 +44,9 @@ Settings Latest();
 bool GameWidescreen();
 // The window (or screen) is wider than 16:9, so Fill shows more of the game than 16:9 does.
 bool SurfaceWide();
+// The width over height the picture is shown at (Brawl Online's core: the game draws for it, the plugin rescaling
+// GX's projection; docs/game-code.md "Any screen shape" in brawlonline.net). 0 until the surface is known in Fill.
+float PictureAspect();
 // Render height for a scale (480 lines per 1x).
 float LinesForScale(float renderScale);
 
