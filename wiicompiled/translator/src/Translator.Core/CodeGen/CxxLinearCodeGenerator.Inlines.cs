@@ -94,7 +94,7 @@ public sealed partial class CxxLinearCodeGenerator
                 knownW is 0 or 1 && knownI is >= 0 and < 8)
             {
                 var address = GetArg(0);
-                var stack = stackFacts.TryResolve(call.Arguments[0], out _);
+                var stack = stackFacts.TryResolve(call, call.Arguments[0], out _);
                 // The guard's else-arm is the generic helper, so it takes the
                 // hoisted GQR local exactly like an unguarded generic site.
                 var hoistedFallback = !stack && IsGqrHoisted(knownI);
@@ -165,7 +165,12 @@ public sealed partial class CxxLinearCodeGenerator
                     arguments[i] = WrapForScalar(scalarSpec.ArgumentOrder[i]);
                 }
 
-                var expression = $"{scalarSpec.Helper}({string.Join(", ", arguments)})";
+                var helper = scalarSpec.Helper;
+                // fmuls with a single-precision C skips C's 25-bit rounding (CxxLinearCodeGenerator.SingleFpr.cs).
+                if (helper is "PpcFmulsInline" or "PpcFmulsNoNiInline" && call.Arguments.Count == 2 &&
+                    IsSingleFprOperand(call.Arguments[1], localPaired))
+                    helper = helper == "PpcFmulsInline" ? "PpcFmulsSingleCInline" : "PpcFmulsSingleCNoNiInline";
+                var expression = $"{helper}({string.Join(", ", arguments)})";
                 if (scalarSpec.Kind == ScalarInlineKind.RoundedHelper)
                     expression = $"static_cast<double>({(scalarSpec.NoNiVariant
                         ? $"static_cast<float>({expression})"
@@ -315,7 +320,7 @@ public sealed partial class CxxLinearCodeGenerator
                     loadI is >= 0 and < 8)
                 {
                     var addr = GetArg(0);
-                    var stackLoad = stackFacts.TryResolve(call.Arguments[0], out _);
+                    var stackLoad = stackFacts.TryResolve(call, call.Arguments[0], out _);
                     EmitPairedResult(!stackLoad && IsGqrHoisted(loadI)
                         ? $"PPC_PsqLGqrInline<{loadW}u, {loadI}u>(ctx, {HoistedGqrName(loadI)}, {addr})"
                         : $"{(stackLoad ? "PPC_PsqLStackInline" : "PPC_PsqLInline")}<{loadW}u, {loadI}u>(ctx, {addr})");
@@ -331,7 +336,7 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     var addr = GetArg(0);
                     var value = WrapForPaired(1);
-                    var stackStore = stackFacts.TryResolve(call.Arguments[0], out _);
+                    var stackStore = stackFacts.TryResolve(call, call.Arguments[0], out _);
                     sb.AppendLine(!stackStore && IsGqrHoisted(storeI)
                         ? $"{pad}PPC_PsqStGqrInline<{storeW}u, {storeI}u>(ctx, {HoistedGqrName(storeI)}, {addr}, {value});"
                         : $"{pad}{(stackStore ? "PPC_PsqStStackInline" : "PPC_PsqStInline")}<{storeW}u, {storeI}u>(ctx, {addr}, {value});");

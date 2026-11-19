@@ -56,6 +56,24 @@ public sealed class GuestSaveRestoreThunks
             ResolveRange(map, "_rest_fpr_"));
 
     /// <summary>
+    /// MKW_EABI_REGS frame analysis only (codegen keeps <see cref="Current"/>): the same families when the map names
+    /// just CodeWarrior's runtime routines (__save_gpr, __restore_gpr, __save_fpr, __restore_fpr), whose entry for
+    /// register N is 4*(N-14) bytes past the routine (Brawl's map has no numbered labels).
+    /// </summary>
+    public static GuestSaveRestoreThunks FrameAnalysis { get; set; } = None;
+
+    public static GuestSaveRestoreThunks FromCodeWarriorRuntimeNames(FunctionMap map, GuestSaveRestoreThunks numbered)
+    {
+        GuestSaveRestoreThunkRange? Routine(GuestSaveRestoreThunkRange? known, string name) =>
+            known ?? (map.TryGetAddress(name, out var address) ? new GuestSaveRestoreThunkRange(address, 14, 31) : null);
+        return new GuestSaveRestoreThunks(
+            Routine(numbered.SaveGpr, "__save_gpr"),
+            Routine(numbered.RestGpr, "__restore_gpr"),
+            Routine(numbered.SaveFpr, "__save_fpr"),
+            Routine(numbered.RestFpr, "__restore_fpr"));
+    }
+
+    /// <summary>
     /// Recovers (base, first, last register) from the family's named entries, validating that the
     /// run is exactly four bytes per register step since only the family's extremes are guaranteed named.
     /// </summary>

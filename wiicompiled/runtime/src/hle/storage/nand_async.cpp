@@ -4,6 +4,7 @@
 // Shared state and helpers live in nand_internal.h.
 
 #include "nand_internal.h"
+#include "guest_thread_guard.h"
 
 // Guest callback dispatch: host NAND work completes synchronously, so an "async" call just
 // queues its guest completion callback here and an HLE pump dispatches it later.
@@ -15,7 +16,9 @@ struct PendingNandCallback {
     uint32_t callerLr = 0;  // the guest call that queued it, for the "not found" diagnostic
 };
 
-static std::mutex g_pendingNandCallbackMutex;
+// Queued by the NAND, IOS, SD and WPAD HLE and drained by the alarm pump, all on the guest CPU's thread
+// (guest_thread_guard.h); the drain runs ~16 times a frame.
+static GuestThreadGuard g_pendingNandCallbackGuard{"g_pendingNandCallbackGuard"};
 static std::deque<PendingNandCallback> g_pendingNandCallbacks;
 
 static void DispatchNandCallback(CpuContext* cpu, uint32_t callbackPtr, int32_t result, uint32_t commandBlock,
@@ -55,7 +58,7 @@ static void InvokeNandCallback(uint32_t callbackPtr, int32_t result, uint32_t co
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_pendingNandCallbackMutex);
+    std::lock_guard<GuestThreadGuard> lock(g_pendingNandCallbackGuard);
     const CpuContext* caller = TryGetCpuContext();
     g_pendingNandCallbacks.push_back({callbackPtr, result, commandBlock, caller ? caller->lr : 0u});
 }
@@ -90,7 +93,7 @@ bool NandProcessPendingCallbacks(CpuContext* cpu, int maxToProcess) {
     while (processed < maxCallbacksThisPump) {
         PendingNandCallback cb{};
         {
-            std::lock_guard<std::mutex> lock(g_pendingNandCallbackMutex);
+            std::lock_guard<GuestThreadGuard> lock(g_pendingNandCallbackGuard);
             if (g_pendingNandCallbacks.empty()) {
                 break;
             }
@@ -304,19 +307,6 @@ bool DiscardStaleSafeTemp(const std::filesystem::path& tempPath) {
     }
     LogNandError("nand-shadow", "FAILED to remove stale scratch file '%s'",
             HostPathText(tempPath).c_str());
-    return false;
-}
-
-// True when any live handle already refers to `hostPath`, either directly or as the
-// commit target of a shadow. Used to keep shadow writes from hiding data behind a second
-// handle on the same file.
-bool IsHostPathOpen(const std::filesystem::path& hostPath) {
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    for (const auto& entry : g_fileHandles) {
-        if (entry.second.path == hostPath || entry.second.safeCommitPath == hostPath) {
-            return true;
-        }
-    }
     return false;
 }
 

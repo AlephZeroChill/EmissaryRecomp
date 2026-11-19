@@ -2,7 +2,7 @@
 #include "staging_capacity.hpp"
 
 #include "../internal.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../gpu/gpu.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -15,7 +15,6 @@
 #include <aurora/gfx.h>
 #include <aurora/math.hpp>
 #include <dolphin/gx/GXEnum.h>
-#include <webgpu/webgpu_cpp.h>
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
@@ -235,14 +234,12 @@ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 extern AuroraStats g_stats;
 extern uint32_t g_drawCallCount;
 extern uint32_t g_mergedDrawCallCount;
-extern wgpu::Buffer g_vertexBuffer;
-extern wgpu::Buffer g_uniformBuffer;
-extern wgpu::Buffer g_indexBuffer;
-extern wgpu::Buffer g_storageBuffer;
-extern wgpu::BindGroupLayout g_staticBindGroupLayout;
-extern wgpu::BindGroup g_staticBindGroup;
-extern wgpu::BindGroupLayout g_uniformBindGroupLayout;
-extern wgpu::BindGroup g_uniformBindGroup;
+// GPU copies of the frame's pushed vertex, index and storage data. Uniform data never goes to a GPU
+// buffer: draws push their range of the CPU uniform arena (PassContext::uniforms) with
+// SDL_PushGPU*UniformData.
+extern gpu::Buffer g_vertexBuffer;
+extern gpu::Buffer g_indexBuffer;
+extern gpu::Buffer g_storageBuffer;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
@@ -266,7 +263,35 @@ struct ClipRect {
   bool operator!=(const ClipRect& rhs) const { return !(*this == rhs); }
 };
 
-using webgpu::Viewport;
+using gpu::Viewport;
+
+// What a draw needs to encode itself into a render pass.
+struct PassContext {
+  SDL_GPUCommandBuffer* cmd = nullptr;
+  SDL_GPURenderPass* pass = nullptr;
+  // Base of the CPU uniform arena the frame's Ranges index into.
+  const uint8_t* uniforms = nullptr;
+  uint32_t targetWidth = 0;
+  uint32_t targetHeight = 0;
+
+  [[nodiscard]] const void* uniform(const Range& range) const noexcept { return uniforms + range.offset; }
+  // Pushes `range` of the uniform arena to uniform slot `slot` of both graphics stages.
+  void push_uniform(uint32_t slot, const Range& range) const noexcept {
+    SDL_PushGPUVertexUniformData(cmd, slot, uniform(range), range.size);
+    SDL_PushGPUFragmentUniformData(cmd, slot, uniform(range), range.size);
+  }
+};
+
+// A draw's fragment textures: one texture + sampler per slot, in slot order. Holds references so the
+// GPU objects outlive every draw that recorded them.
+inline constexpr uint32_t MaxBoundTextures = 8;
+using TextureBindingsRaw = std::array<SDL_GPUTextureSamplerBinding, MaxBoundTextures>;
+struct TextureBindings {
+  std::array<gpu::Texture, MaxBoundTextures> textures;
+  std::array<gpu::Sampler, MaxBoundTextures> samplers;
+  TextureBindingsRaw raw{};
+  uint32_t count = 0;
+};
 
 struct TextureRef;
 using TextureHandle = std::shared_ptr<TextureRef>;
@@ -282,8 +307,11 @@ void shutdown();
 bool begin_frame();
 bool resume_frame();
 void abort_frame() noexcept;
-void end_frame(const wgpu::CommandEncoder& cmd);
-void end_batch(const wgpu::CommandEncoder& cmd);
+void end_frame(gpu::Encoder& cmd);
+// Milliseconds the last end_frame/end_batch spent unmapping the staging buffer, recording its upload copies, and
+// mapping the next one (the frame worker's slow-frame log reports them).
+inline double g_lastStagingUnmapMs = 0, g_lastStagingCopyMs = 0, g_lastStagingMapMs = 0;
+void end_batch(gpu::Encoder& cmd);
 uint32_t current_frame() noexcept;
 
 // One frame's recorded render passes, detached from the guest-visible
@@ -313,11 +341,11 @@ void seal_frame(SealedFrame& out) noexcept;
 
 // Encode a sealed frame. Never touches the producer-visible recording state,
 // so this may run concurrently with the producer's FIFO drains.
-void render(SealedFrame& frame, wgpu::CommandEncoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true);
+void render(SealedFrame& frame, gpu::Encoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true);
 
 // Encode the frame that is still being recorded. Only for the synchronous
 // EFB-readback split path, which runs on the producer thread.
-void render(wgpu::CommandEncoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true);
+void render(gpu::Encoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true);
 
 // Sweep bind groups that have not been used for a while. Mutates the cache the producer inserts
 // into, so it may only run with the producer excluded, inside the seal prologue.
@@ -358,12 +386,17 @@ template <typename T>
 static Range push_indices(ArrayRef<T> data) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
 }
+// push_indices of `count` indices src[i] + offset, written straight into the index staging (same range).
+Range push_offset_indices(const uint16_t* src, size_t count, uint16_t offset);
 Range push_uniform(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
 Range push_storage(const uint8_t* data, size_t length);
+// Diagnostics (AURORA_DRAW_DUMP): the bytes of `range` in the current staging buffer `buffer` (0 vertices, 1 uniforms,
+// 2 indices, 3 storage), or null if out of range.
+const uint8_t* staged_bytes(int buffer, const Range& range) noexcept;
 template <typename T>
 static Range push_storage(ArrayRef<T> data) {
   return push_storage(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
@@ -390,13 +423,19 @@ template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
 // `currentPipeline` is the caller's per-pass dedupe slot; as a file-static, two concurrent encoders
 // skipped each other's SetPipeline. `requireReady` refuses the skip-unready shortcut for bakes.
-bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass, PipelineRef& currentPipeline,
-                   bool requireReady = false);
+bool bind_pipeline(PipelineRef ref, const PassContext& ctx, PipelineRef& currentPipeline, bool requireReady = false);
 
-BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor);
-wgpu::BindGroup& find_bind_group(BindGroupRef id);
+// Interns a set of texture bindings for the frame; the returned pointer stays valid while the frame that
+// recorded it is encoded (entries retire like the bind groups they replace).
+using TextureBindingsRef = HashType;
+TextureBindingsRef texture_bindings_ref(TextureBindings&& bindings);
+const TextureBindings& find_texture_bindings(TextureBindingsRef id);
+// The interned bindings whose raw handles are raw[0, count), if any (refreshed for this frame, as texture_bindings_ref
+// does), with the id texture_bindings_ref gives them: a caller that finds them takes no texture or sampler reference.
+std::pair<TextureBindingsRef, const TextureBindings*> find_texture_bindings(const TextureBindingsRaw& raw,
+                                                                           uint32_t count);
 
-wgpu::Sampler& sampler_ref(const wgpu::SamplerDescriptor& descriptor);
+const gpu::Sampler& sampler_ref(const SDL_GPUSamplerCreateInfo& descriptor);
 
 uint32_t align_uniform(uint32_t value);
 uint64_t staging_uniform_bytes(uint64_t bytes);

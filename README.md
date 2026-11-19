@@ -143,6 +143,50 @@ saves in `build/native/UserData`. Rerun it to resume. Options for `build.cmake`:
 - `-DMKW_HOST_ISA=v1` (SSE2) or `v2` (SSE4.2) builds for x86-64 processors older than the default `v3` (AVX2)
 - `-DMKW_FLAT_MEMORY=OFF` uses ordinary memory instead of reserving a fixed 4 GiB address range
 
+### Experimental optimizations
+
+This branch carries performance work that is still experimental. All of it is compiled in, but the plain build above
+uses flat memory, and most of it only takes effect in a lean-memory build. A build with everything that is safe for
+mods (Linux shell; on Windows, set `$env:MKW_EABI_REGS` instead and quote the `-D` arguments the same way):
+
+```sh
+cmake -DMKW_FLAT_MEMORY=OFF "-DNATIVE_ARGS=-DMKW_LEAN_MEMORY=ON" -P build.cmake
+```
+
+Vanilla Brawl only, with the remaining build-time options:
+
+```sh
+MKW_EABI_REGS=1 cmake -DMKW_FLAT_MEMORY=OFF \
+  "-DNATIVE_ARGS=-DMKW_LEAN_MEMORY=ON;-DMKW_FAST_FLOAT=ON;-DMKW_LEAN_DIRTY_MARKS=OFF" -P build.cmake
+```
+
+Build-time switches (`build.cmake` passes `MKW_FLAT_MEMORY` itself; the others go in `NATIVE_ARGS`, separated by `;`):
+
+| Switch | Default | What it does |
+|---|---|---|
+| `-DMKW_FLAT_MEMORY=OFF` + `-DMKW_LEAN_MEMORY=ON` | off (on for Switch) | Guest memory as one masked 1 GiB window. The native library code and the lean code generation need it. |
+| `MKW_EABI_REGS=1` (environment, at translation) | off | Passes arguments between translated functions in host registers. Vanilla only: mods that patch code (Project+) break it. |
+| `-DMKW_FAST_FLOAT=ON` | off | Host float instructions instead of bit-exact Gekko float emulation. Gameplay matched in testing, but results are no longer bit-identical to a Wii or Dolphin. |
+| `-DMKW_LEAN_DIRTY_MARKS=OFF` | on | Drops rollback's per-store dirty marks. Only for builds that never use rollback. |
+| `-DMKW_PGO_GENERATE=ON`, then `-DMKW_PGO_PROFILE=<file.profdata>` | off | Profile-guided code layout: an instrumented build writes a clang profile, and the next build uses it. `-DMKW_SPLIT_FUNCTIONS=ON` and `-DMKW_SECTION_ORDERING_FILE=<file>` refine it. |
+| `-DCODE_VARIANTS=<spec.txt>` | none | Translates a mod's fixed code patches ahead of time (`wiicompiled/projects/brawl/tools/gen_variant_spec.py` makes the spec from memory dumps of the mod running). A variant runs only while guest memory holds exactly the code it was made from, otherwise the interpreter does. |
+| `-DMKW_HZ_PERF_HOT_COUNTERS=OFF` | on | Switch only: drops the per-call performance counters. |
+
+Run-time switches (environment variables; the default is the optimized path):
+
+| Variable | Default | Set it to |
+|---|---|---|
+| `AURORA_GX_THREAD` | on | `0` to decode GX commands on the game thread |
+| `AURORA_GX_OLD_SYNC` | off | `1` for the old GXFlush/draw-done synchronization |
+| `G3D_NATIVE` | `1` | `0` for the translated nw4r g3d draw path, `2` to verify the native one against it |
+| `G3D_NATIVE_ASYNC` | `2` | `0` to replay native draws on the game thread instead of the draw worker |
+| `G3D_CALC`, `GAME_NATIVES` | `1` | `0` for the translated originals, `2` to verify the natives against them |
+| `MKW_INDIRECT_IC` | on | `0` to turn off the per-call-site caches for indirect calls |
+| `AXFX_EXACT` | off | `1` for bit-exact reverb (the fast one only affects audio) |
+| `AXFX_ASYNC` | on with `MKW_EABI_REGS`, else off | `0`/`1` to run the reverb and delay on the game thread or a worker |
+| `BRAWL_GX_DMA_FULL` | off | `1` to check every DMA write against tracked GX data |
+| `BRAWL_RESIM_HIDE` | `2` | `0` to draw re-simulated rollback frames in full |
+
 The translator's tests are described in [`wiicompiled/translator/tests/README.md`](wiicompiled/translator/tests/README.md).
 
 ### Release packaging

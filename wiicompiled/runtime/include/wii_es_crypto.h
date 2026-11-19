@@ -23,7 +23,12 @@
 #include <cryptopp/eccrypto.h>
 #include <cryptopp/ec2n.h>
 #include <cryptopp/oids.h>
+#if defined(__SWITCH__)
+#include <cryptopp/randpool.h>
+#include <switch.h>
+#else
 #include <cryptopp/osrng.h>
+#endif
 #include <cryptopp/sha.h>
 
 #include <algorithm>
@@ -150,7 +155,19 @@ inline EcSignature SignMessage(const uint8_t* key, const uint8_t* data, size_t s
         throw std::runtime_error("Crypto++ returned an unexpected sect233r1 signature size");
     }
 
+#if defined(__SWITCH__)
+    // Crypto++ has no OS RNG on Horizon; seed its pool from libnx's kernel-seeded CSPRNG.
+    thread_local CryptoPP::RandomPool random;
+    thread_local bool seeded = false;
+    if (!seeded) {
+        uint8_t seed[32];
+        randomGet(seed, sizeof seed);
+        random.IncorporateEntropy(seed, sizeof seed);
+        seeded = true;
+    }
+#else
     thread_local CryptoPP::AutoSeededRandomPool random;
+#endif
     EcSignature signature{};
     const size_t written = signer.SignMessage(random, data, size, signature.data());
     if (written != signature.size()) {

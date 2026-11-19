@@ -138,13 +138,17 @@ void MarkFatalErrorReported();
 // (e.g. rfi). This is intentionally loud so missing HLE hooks are easy to find.
 #define UNDEFINED(pc, rawInstruction, details) PPC_Undefined((pc), (rawInstruction), (details))
 
+#ifndef MKW_LEAN_FLAGS
+#define MKW_LEAN_FLAGS 0  // isa/ppc_isa_cr.h: compares leave SO clear (translated code never sets XER[SO])
+#endif
+
 // Helper to set CR bits (Signed)
 inline void SetCR(CpuContext* cpu, int field, int32_t a, int32_t b) {
     uint32_t crField = 0;
     if (a < b) crField |= 0x8; // LT
     if (a > b) crField |= 0x4; // GT
     if (a == b) crField |= 0x2; // EQ
-    crField |= (cpu->xer >> 31) & 1u; // SO
+    if (!MKW_LEAN_FLAGS) crField |= (cpu->xer >> 31) & 1u; // SO
     
     int shift = (7 - field) * 4;
     uint32_t mask = 0xF << shift;
@@ -157,7 +161,7 @@ inline void SetCR(CpuContext* cpu, int field, uint32_t a, uint32_t b) {
     if (a < b) crField |= 0x8; // LT
     if (a > b) crField |= 0x4; // GT
     if (a == b) crField |= 0x2; // EQ
-    crField |= (cpu->xer >> 31) & 1u; // SO
+    if (!MKW_LEAN_FLAGS) crField |= (cpu->xer >> 31) & 1u; // SO
     
     int shift = (7 - field) * 4;
     uint32_t mask = 0xF << shift;

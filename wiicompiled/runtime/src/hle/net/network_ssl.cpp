@@ -17,6 +17,16 @@
 #include <optional>
 #endif
 
+#if defined(__SWITCH__)
+#include <mbedtls/platform_time.h>
+#include <switch.h>
+
+// cmake/mbedtls-horizon.h: newlib has no monotonic POSIX clock for Mbed TLS to find.
+mbedtls_ms_time_t mbedtls_ms_time(void) {
+    return static_cast<mbedtls_ms_time_t>(armTicksToNs(armGetSystemTick()) / 1000000);
+}
+#endif
+
 namespace NetworkHle {
 
 enum SslError {

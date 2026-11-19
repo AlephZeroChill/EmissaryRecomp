@@ -1,6 +1,7 @@
 #include "network_internal.h"
 
 #include "fiber_manager.h"
+#include "guest_thread_guard.h"
 #include "hle/net/network.h"
 #include "ppc_runtime.h"
 #include "runtime_log.h"
@@ -132,13 +133,18 @@ using DeferredConnectPreparation =
 struct DeferredNetworkStore {
     std::mutex completedMutex;
     std::deque<DeferredDnsCompletion> completed;
+    // Set under completedMutex when a DNS worker queues a completion, so the scheduler's pump (~16 times a frame)
+    // takes the lock only when there is something to take.
+    std::atomic<bool> completedPending{false};
     // Pending polls are submitted and probed only by the emulation scheduler
     // thread, so unlike DNS worker completions they need no cross-thread lock.
     std::vector<DeferredPollWork> pendingPolls;
     std::vector<DeferredConnectWork> pendingConnects;
-    std::mutex resultMutex;
+    // The sync results and the scheduler-thread record are the emulation scheduler thread's alone (the guest CPU's
+    // thread, guest_thread_guard.h); NoteDeferredNetworkSchedulerThread (~16 times a frame) checks that.
+    GuestThreadGuard resultGuard{"DeferredNetworkStore::resultGuard"};
     std::unordered_map<uint64_t, int32_t> syncResults;
-    std::mutex schedulerThreadMutex;
+    GuestThreadGuard schedulerThreadGuard{"DeferredNetworkStore::schedulerThreadGuard"};
     std::optional<std::thread::id> schedulerThread;
     std::atomic<uint64_t> nextToken{1};
 };
@@ -167,7 +173,7 @@ void AbortPendingDeferredConnects(uint32_t wiiFd, int32_t result) {
 static void NoteDeferredNetworkSchedulerThread(const char* operation) {
     DeferredNetworkStore& store = GetDeferredNetworkStore();
     const std::thread::id current = std::this_thread::get_id();
-    std::lock_guard<std::mutex> lock(store.schedulerThreadMutex);
+    std::lock_guard<GuestThreadGuard> lock(store.schedulerThreadGuard);
     if (!store.schedulerThread) {
         store.schedulerThread = current;
         return;
@@ -198,6 +204,7 @@ static void QueueDeferredDnsCompletion(DeferredDnsCompletion completion) {
     DeferredNetworkStore& store = GetDeferredNetworkStore();
     std::lock_guard<std::mutex> lock(store.completedMutex);
     store.completed.push_back(std::move(completion));
+    store.completedPending.store(true, std::memory_order_release);
 }
 
 static DeferredDnsCompletion ResolveDeferredDns(DeferredDnsWork work) {
@@ -839,7 +846,7 @@ bool Network_HLE_TakeSyncResult(uint64_t token, int32_t* result) {
     }
     NoteDeferredNetworkSchedulerThread("result retrieval");
     DeferredNetworkStore& store = GetDeferredNetworkStore();
-    std::lock_guard<std::mutex> lock(store.resultMutex);
+    std::lock_guard<GuestThreadGuard> lock(store.resultGuard);
     const auto it = store.syncResults.find(token);
     if (it == store.syncResults.end()) {
         return false;
@@ -879,7 +886,7 @@ static void DeliverDeferredNetworkResult(CpuContext* cpu, DeferredNetworkStore& 
                                          const DeferredNetworkRoute& route, int32_t result) {
     if (route.kind == DeferredNetworkCompletionKind::SyncWaitQueue) {
         {
-            std::lock_guard<std::mutex> lock(store.resultMutex);
+            std::lock_guard<GuestThreadGuard> lock(store.resultGuard);
             const auto [it, inserted] = store.syncResults.emplace(route.token, result);
             if (!inserted) {
                 RT_LOGF(RT_TAG_NET,
@@ -959,9 +966,10 @@ bool Network_HLE_ProcessCompletions(CpuContext* cpu) {
 
     std::deque<DeferredDnsCompletion> ready;
     DeferredNetworkStore& store = GetDeferredNetworkStore();
-    {
+    if (store.completedPending.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(store.completedMutex);
         ready.swap(store.completed);
+        store.completedPending.store(false, std::memory_order_relaxed);
     }
     bool handledAny = false;
 

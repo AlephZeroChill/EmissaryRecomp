@@ -5,6 +5,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <array>
 #include "command_processor.hpp"
+#include "gx_worker.hpp"
 
 #include "../gfx/common.hpp"
 #include "../dolphin/gx/__gx.h"
@@ -29,11 +30,34 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 extern "C" {
 int g_spmDrawDump = 0;
 int g_spmBBoxArmed = 0;
+
+// Horizon draw-path timing into the runtime's counter table (runtime/include/hz_perf.h, slots 29..35; the runtime's
+// sampler prints them per frame). Elsewhere these compile to nothing.
+#if defined(__SWITCH__)
+extern "C" volatile unsigned long long g_hzPerf[48];
+static inline uint64_t AuroraHzTicks() {
+  uint64_t t;
+  asm volatile("mrs %0, cntpct_el0" : "=r"(t));  // cntvct_el0 traps at EL0 on Horizon hardware (hz_perf.h)
+  return t;
+}
+#define AURORA_HZ_MARK(var) const uint64_t var = AuroraHzTicks()
+#define AURORA_HZ_SPAN(slot, since) (g_hzPerf[slot] += AuroraHzTicks() - (since))
+#define AURORA_HZ_ADD(slot, n) (g_hzPerf[slot] += (n))
+#else
+#define AURORA_HZ_MARK(var) ((void)0)
+#define AURORA_HZ_SPAN(slot, since) ((void)0)
+#define AURORA_HZ_ADD(slot, n) ((void)0)
+#endif
+enum : int {
+  kAuroraHzDrawTicks = 29, kAuroraHzUnmergedDraws, kAuroraHzMergedDraws, kAuroraHzPipelineTicks, kAuroraHzBindTicks,
+  kAuroraHzUniformTicks, kAuroraHzArrayTicks,
+};
 }
 namespace aurora::gx {
 GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noexcept;  // gx.cpp
@@ -307,6 +331,18 @@ static inline f32 read_f32(const u8* ptr, bool bigEndian) {
   return val;
 }
 
+// N words to floats, as read_f32 reads each (the same bits), with N fixed: the byte swaps vectorize (a skinned model's
+// indexed matrix loads copy thousands of 12-word matrices a frame).
+template <u32 N>
+static inline void read_f32_words(f32* dst, const u8* src, bool bigEndian) {
+  u32 words[N];
+  std::memcpy(words, src, sizeof(words));
+  if (bigEndian) {
+    for (u32& w : words) w = bswap(w);
+  }
+  std::memcpy(dst, words, sizeof(words));
+}
+
 // Marks draw state dirty *and* invalidates the resolved-pipeline memo.
 static inline void mark_pipeline_state_dirty() noexcept {
   g_gxState.stateDirty = true;
@@ -331,11 +367,10 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     // We only support full writes to matrices
     XF_REQUIRE(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob; mtxIdx={}", mtxIdx);
     XF_REQUIRE(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+    resolve_zfreeze_plane();  // pending zfreeze captures read the position matrices at their solve
     auto& mtx = g_gxState.pnMtx[mtxIdx].pos;
     f32* flat = reinterpret_cast<f32*>(&mtx);
-    for (u32 i = 0; i < len; i++) {
-      flat[i] = read_f32(data + i * 4, bigEndian);
-    }
+    read_f32_words<12>(flat, data, bigEndian);  // len == 12
     g_gxState.stateDirty = true;
     return true;
   } else if (addr < 0x0F0) {
@@ -350,8 +385,10 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     // Determine if 2x4 or 3x4 from count
     auto& mtx = g_gxState.texMtxs[mtxIdx];
     f32* flat = reinterpret_cast<f32*>(&mtx);
-    for (u32 i = 0; i < len; i++) {
-      flat[i] = read_f32(data + i * 4, bigEndian);
+    if (len == 12) {
+      read_f32_words<12>(flat, data, bigEndian);
+    } else {
+      read_f32_words<8>(flat, data, bigEndian);  // len == 8
     }
     g_gxState.stateDirty = true;
     return true;
@@ -365,12 +402,11 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     XF_REQUIRE(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
     auto& mtx = g_gxState.pnMtx[mtxIdx].nrm;
     f32* flat = reinterpret_cast<f32*>(&mtx);
-    for (u32 i = 0; i < len; i++) {
-      u32 xfIdx = i;
-      u32 row = xfIdx / 3;
-      u32 col = xfIdx % 3;
-      if (row < 3) {
-        flat[row * 4 + col] = read_f32(data + i * 4, bigEndian);
+    f32 words[9];  // len == 9: rows of 3 into the 3x4 rows
+    read_f32_words<9>(words, data, bigEndian);
+    for (u32 row = 0; row < 3; ++row) {
+      for (u32 col = 0; col < 3; ++col) {
+        flat[row * 4 + col] = words[row * 3 + col];
       }
     }
     g_gxState.stateDirty = true;
@@ -384,9 +420,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     XF_REQUIRE(startOffset == 0 && len == 12, "XF: PTTexMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
     auto& mtx = g_gxState.ptTexMtxs[mtxIdx];
     f32* flat = reinterpret_cast<f32*>(&mtx);
-    for (u32 i = 0; i < len; i++) {
-      flat[startOffset + i] = read_f32(data + i * 4, bigEndian);
-    }
+    read_f32_words<12>(flat, data, bigEndian);  // startOffset == 0, len == 12
     g_gxState.stateDirty = true;
     return true;
   } else if (addr >= 0x600 && addr < 0x680) {
@@ -481,6 +515,7 @@ static float g_spmProjWiden = 1.f;  // the horizontal factor the current project
 float g_spmScreenWiden = 1.f;        // the same for the last screen-sized 16:9 view (texture copies use it)
 
 static void apply_xf_projection() {
+  resolve_zfreeze_plane();  // pending zfreeze captures read g_spmProjWiden, set below, at their solve
   const auto& raw = g_gxState.xfProjection;
   auto& proj = g_gxState.proj;
   proj = {};
@@ -548,19 +583,35 @@ static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 
 // NSMBW: time spent decoding GX commands (and waiting for the renderer lock first), and draws
 // decoded, for the runtime's NSMBW_LOG_FPS breakdown.
-std::atomic<uint64_t> g_statLockNanos{0}, g_statDraws{0};
+std::atomic<uint64_t> g_statLockNanos{0};
 std::atomic<uint64_t> g_statProcessTotalNanos{0};  // never reset: slow-frame breakdowns and AuroraTakeGxStats take deltas
+// Draws decoded, never reset either (AuroraTakeGxStats takes deltas). Only the decoding thread adds to it, and one at a
+// time (the GX thread, or a producer decoding a batch in place, ordered by the hand-off ring; inline decoding is the
+// producer's alone), so a relaxed load and store: no atomic read-modify-write per process() call (a locked add on
+// x86, an LL/SC loop on the Switch's cores). Reads may see a total a flush behind.
+std::atomic<uint64_t> g_statDrawsTotal{0};
 thread_local int t_statDepth = 0;  // only the outermost of nested process()/raw draws counts
-// Timed on Windows always (the slow-frame log splits a frame into GX and the rest), elsewhere only
-// while the runtime logs frame times (NSMBW_LOG_FPS): two clock reads per outermost call add up on a
-// phone. Read at first use: on Android the runtime sets the variable from a property after startup.
+// Draws counted since the last flush into g_statDrawsTotal: a plain add per draw, flushed by ~ProcessTimer, which
+// every draw path runs under.
+thread_local uint64_t t_pendingDraws = 0;
+// The zfreeze reference's draws recorded since the last flush (update_zfreeze_reference), and the flush. A run of
+// draws ends at any other command and where its vertex bytes go away (ZFreezeRunEnd).
+static u32 s_zFreezeDrawCount = 0;
+static void flush_zfreeze_draws() noexcept;
+struct ZFreezeRunEnd {
+  ~ZFreezeRunEnd() {
+    if (s_zFreezeDrawCount != 0)
+      flush_zfreeze_draws();
+  }
+};
+// Timed only with AURORA_GX_STATS set, on every platform: two clock reads per outermost call cost ~3% of
+// Brawl's game thread (~20k process() calls a frame), so neither Windows nor NSMBW_LOG_FPS (which the
+// measurement harness sets for its fps lines) turns it on. Without it the slow-frame log and the fps
+// line show 0 ms for GX time and lock wait. Read at first use: on Android the runtime sets variables from
+// properties after startup.
 static bool StatTiming() {
-#if defined(_WIN32)
-  return true;
-#else
-  static const bool on = std::getenv("NSMBW_LOG_FPS") != nullptr;
+  static const bool on = std::getenv("AURORA_GX_STATS") != nullptr;
   return on;
-#endif
 }
 struct ProcessTimer {
   std::chrono::steady_clock::time_point start{};
@@ -570,6 +621,11 @@ struct ProcessTimer {
     }
   }
   ~ProcessTimer() {
+    if (t_pendingDraws != 0) {
+      g_statDrawsTotal.store(g_statDrawsTotal.load(std::memory_order_relaxed) + t_pendingDraws,
+                             std::memory_order_relaxed);
+      t_pendingDraws = 0;
+    }
     if (StatTiming() && --t_statDepth == 0) {
       const auto elapsed =
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
@@ -597,13 +653,74 @@ static void note_write(u32 kind, u32 reg, u32 value, bool wasDirty) {
   }
 }
 
+// handle_load_indx's cold paths, out of line so that its common path keeps a small frame: a load whose source array
+// does not hold it (logged), and the NSMBW_MERGE_SUSPECTS diagnostic's load.
+[[gnu::noinline, gnu::cold]] static void log_invalid_indexed_xf_load(u32 arrayType, u32 srcArrayIdx, u32 stride,
+                                                                    u32 byteOffset, u32 byteCount, u32 size,
+                                                                    u16 dstAddr) {
+  static u32 invalidIndexedXfLogCount = 0;
+  if (invalidIndexedXfLogCount < 16) {
+    Log.warn("Skipping indexed XF load with invalid source array: array={} idx={} stride={} offset={} bytes={} "
+             "size={} dst=0x{:04X}",
+             arrayType, srcArrayIdx, stride, byteOffset, byteCount, size, dstAddr);
+    ++invalidIndexedXfLogCount;
+  }
+}
+[[gnu::noinline, gnu::cold]] static void load_indx_merge_suspects(u16 dstAddr, const u8* srcData, u16 len,
+                                                                 u32 byteCount, bool bigEndian) {
+  const bool wasDirtyIndx = g_gxState.stateDirty;
+  u32 hash = 2166136261u;
+  for (u32 i = 0; i < byteCount; ++i) hash = (hash ^ srcData[i]) * 16777619u;
+  // Kind 2 (XF) by destination address, as a direct XF write would be.
+  copy_xf_data(dstAddr, srcData, len, bigEndian);
+  note_write(2, 0x8000 | dstAddr, hash, wasDirtyIndx);
+}
+
+// An indexed XF load (GX_LOAD_INDX_A..D, opcode): the matrix or light the value's index selects in the corresponding
+// array, copied to its XF address. process() and the compiled draw lists (submit_compiled_draw_list) share it.
+static void handle_load_indx(u8 opcode, u32 value, bool bigEndian) {
+  const u32 arrayType = GX_POS_MTX_ARRAY + ((opcode - CP_CMD_LOAD_INDX_A) / 0x08);
+  const u32 srcArrayIdx = value >> 16;
+  const u16 len = static_cast<u16>(((value >> 12) & 0x0f) + 1);
+  const u16 dstAddr = static_cast<u16>(value & 0x0fff);
+  auto const& array = g_gxState.arrays[arrayType];
+  const u32 byteOffset = srcArrayIdx * array.stride;
+  const u32 byteCount = static_cast<u32>(len) * 4u;
+  if (array.data == nullptr || array.stride == 0 || byteOffset + byteCount > array.size) UNLIKELY {
+    log_invalid_indexed_xf_load(arrayType, srcArrayIdx, array.stride, byteOffset, byteCount, array.size, dstAddr);
+    return;
+  }
+  u8* srcData = ((u8*)array.data) + byteOffset;
+  if (MergeSuspectsOn()) UNLIKELY {
+    load_indx_merge_suspects(dstAddr, srcData, len, byteCount, bigEndian);
+    return;
+  }
+  if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
+#ifndef NDEBUG
+    Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=0x{:04X})", opcode, dstAddr);
+#endif
+  }
+}
+
+// With the GX thread on, decoded state is its alone: decoding on any other thread is a missed hand-off (as
+// GXApplyBPReg was). Logged, a few times, by where it happened.
+static void note_decode_off_gx_thread(const char* where) {
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+    std::fprintf(stderr, "[aurora] [gxthread] decoded state written off the GX thread: %s\n", where);
+}
+
 uint32_t process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
+  if (worker::enabled() && !worker::on_gx_thread()) UNLIKELY {
+    note_decode_off_gx_thread("process");
+  }
   ProcessTimer timer;
   // Everything decoded here mutates renderer state (GX state, the recorded command lists and the mapped staging buffers), so take the renderer GPU mutex once for the whole drain rather than once per draw command.
   // Only a contended acquire is timed: process() runs ~20k times a frame in SPM gn3_12, and two clock reads per call cost ~0.8 ms.
-  std::unique_lock gpuLock(aurora::renderer_gpu_mutex(), std::try_to_lock);
-  if (!gpuLock.owns_lock()) {
+  // The GX thread holds it across its whole batch already (worker::holds_batch_lock): no recursive re-lock per call.
+  std::unique_lock gpuLock(aurora::renderer_gpu_mutex(), std::defer_lock);
+  if (!worker::holds_batch_lock() && !gpuLock.try_lock()) {
     const auto lockStart = StatTiming() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     gpuLock.lock();
     if (StatTiming()) {
@@ -612,6 +729,7 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
           std::memory_order_relaxed);
     }
   }
+  const ZFreezeRunEnd zfreezeRunEnd;  // the recorded draws point into `data`, which outlives only this call
   u32 pos = 0;
 
   while (pos < size) {
@@ -619,6 +737,11 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
     u8 cmd = data[pos++];
     u8 opcode = cmd & CP_OPCODE_MASK;
     // Log.warn("Processing opcode {:02x} at pos {} (size {})", opcode, pos - 1, size);
+    // Any command but a draw (or a NOP) ends the run of draws the zfreeze reference was recorded from: it may change
+    // what their capture reads.
+    if (s_zFreezeDrawCount != 0 && opcode != CP_CMD_NOP && !is_draw_cmd(cmd)) UNLIKELY {
+      flush_zfreeze_draws();
+    }
 
     switch (opcode) {
     case CP_CMD_NOP:
@@ -666,41 +789,7 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
       CHECK(pos + 4 <= size, "indexed XF read overrun");
       const u32 value = read_u32(data + pos, bigEndian);
       pos += 4;
-
-      const u32 arrayType = GX_POS_MTX_ARRAY + ((opcode - CP_CMD_LOAD_INDX_A) / 0x08);
-      const u32 srcArrayIdx = value >> 16;
-      const u16 len = static_cast<u16>(((value >> 12) & 0x0f) + 1);
-      const u16 dstAddr = static_cast<u16>(value & 0x0fff);
-      auto const& array = g_gxState.arrays[arrayType];
-      const u32 byteOffset = srcArrayIdx * array.stride;
-      const u32 byteCount = static_cast<u32>(len) * 4u;
-      if (array.data == nullptr || array.stride == 0 || byteOffset + byteCount > array.size) {
-        static u32 invalidIndexedXfLogCount = 0;
-        if (invalidIndexedXfLogCount < 16) {
-          Log.warn("Skipping indexed XF load with invalid source array: array={} idx={} stride={} offset={} bytes={} "
-                   "size={} dst=0x{:04X}",
-                   arrayType, srcArrayIdx, array.stride, byteOffset, byteCount, array.size, dstAddr);
-          ++invalidIndexedXfLogCount;
-        }
-        break;
-      }
-      u8* srcData = ((u8*)array.data) + byteOffset;
-      const bool wasDirtyIndx = g_gxState.stateDirty;
-      if (MergeSuspectsOn()) {
-        u32 hash = 2166136261u;
-        for (u32 i = 0; i < byteCount; ++i) hash = (hash ^ srcData[i]) * 16777619u;
-        // Kind 2 (XF) by destination address, as a direct XF write would be.
-        const bool before = g_gxState.stateDirty;
-        (void)before;
-        copy_xf_data(dstAddr, srcData, len, bigEndian);
-        note_write(2, 0x8000 | dstAddr, hash, wasDirtyIndx);
-        break;
-      }
-      if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
-#ifndef NDEBUG
-        Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=0x{:04X})", opcode, dstAddr);
-#endif
-      }
+      handle_load_indx(opcode, value, bigEndian);
       break;
     }
 
@@ -1555,10 +1644,66 @@ static void handle_bp(u32 value, bool bigEndian) {
   }
 }
 
-extern "C" void GXApplyBPReg(u8 reg, u32 value) {
+void apply_bp_word(u32 word) {
+  if (worker::enabled() && !worker::on_gx_thread()) UNLIKELY {
+    note_decode_off_gx_thread("BP register");
+  }
   const bool wasDirty = g_gxState.stateDirty;
-  handle_bp((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu), true);
-  if (MergeSuspectsOn()) note_write(0, 0x100 | reg, value & 0x00FFFFFFu, wasDirty);
+  handle_bp(word, true);
+  if (MergeSuspectsOn()) note_write(0, 0x100 | (word >> 24), word & 0x00FFFFFFu, wasDirty);
+}
+
+// The runtime's gather-pipe parser and display-list interpreter hand BP writes here instead of through the FIFO.
+// They are decoded state: with the GX thread on they are queued in order (decoding one here, on the producer, changed
+// the state under draws the GX thread had not decoded yet: Brawl's HUD and fighters drew with later textures, TEV
+// colours and texture modes).
+extern "C" void GXApplyBPReg(u8 reg, u32 value) {
+  const u32 word = (static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu);
+  if (worker::producer()) {
+    worker::submit_bp(word);
+    return;
+  }
+  apply_bp_word(word);
+}
+
+// A display list of BP and CP register writes and NOP padding only (big-endian; the native nw4r g3d path's material
+// lists: TEV, pixel, TEV colour, indirect matrix; a shape's vertex formats), each write applied exactly as process()
+// applies it (handle_bp, handle_cp), without process()'s renderer lock and per-command dispatch, as the runtime applies
+// the guest FIFO's BP writes (GXApplyBPReg): state writes of the decoded GX state only (the caller's lists hold no
+// copy or clear trigger). GXCallStateDisplayList calls it after GXCallDisplayList's prelude (the FIFO drained first, so
+// the order stays the same).
+void apply_state_display_list(const u8* data, u32 size) {
+  if (worker::enabled() && !worker::on_gx_thread()) UNLIKELY {
+    note_decode_off_gx_thread("state display list");
+  }
+  ProcessTimer timer;
+  struct ReplayScope {  // as process_display_list (handle_bp reads it)
+    bool prev = g_replayingDisplayList;
+    ReplayScope() { g_replayingDisplayList = true; }
+    ~ReplayScope() { g_replayingDisplayList = prev; }
+  } replayScope;
+  u32 pos = 0;
+  while (pos < size) {
+    const u8 cmd = data[pos++];
+    const u8 opcode = cmd & CP_OPCODE_MASK;
+    if (opcode == CP_CMD_NOP) continue;
+    if (opcode == CP_CMD_LOAD_CP_REG) {
+      CHECK(pos + 5 <= size, "CP reg read overrun");
+      const u8 addr = data[pos++];
+      const u32 value = read_u32(data + pos, true);
+      pos += 4;
+      const bool wasDirty = g_gxState.stateDirty;
+      handle_cp(addr, value, true);
+      if (MergeSuspectsOn()) note_write(1, addr, value, wasDirty);
+      continue;
+    }
+    CHECK(opcode == CP_CMD_LOAD_BP_REG && pos + 4 <= size, "state display list: command 0x{:02X}", cmd);
+    const u32 value = read_u32(data + pos, true);
+    pos += 4;
+    const bool wasDirty = g_gxState.stateDirty;
+    handle_bp(value, true);
+    if (MergeSuspectsOn()) note_write(0, value >> 24, value & 0xFFFFFF, wasDirty);
+  }
 }
 
 static bool cacheable_cp_register(u8 addr) {
@@ -1899,6 +2044,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
       case 0x26: {
         // Projection: 6 params + type at XF 0x1020-0x1026
         const u32 projOff = reg - 0x20;
+        resolve_zfreeze_plane();  // pending zfreeze captures read the projection at their solve
         if (projOff < g_gxState.xfProjection.size()) {
           g_gxState.xfProjection[projOff] = read_f32(xfData + i * 4, bigEndian);
         } else {
@@ -2032,6 +2178,9 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
       vtxSize += (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 6 : 2;
       break;
     }
+    if (i == GX_VA_POS - 1) {
+      g_gxState.lastVtxMatrixPrefix = static_cast<u16>(vtxSize);  // every attribute before POS is a matrix index
+    }
   }
 
   g_gxState.lastVtxFmt = fmt;
@@ -2057,6 +2206,10 @@ static inline bool frame_interpolation_identity_needed() noexcept {
 }
 
 static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
+  // Cached with the vertex size, and invalidated with it (clearVtxSizeCache), for the format the last draw used.
+  if (g_gxState.lastVtxFmt == fmt) LIKELY {
+    return g_gxState.lastVtxMatrixPrefix;
+  }
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   uint32_t size = 0;
   for (int i = GX_VA_PNMTXIDX; i < GX_VA_POS; ++i) {
@@ -2190,23 +2343,6 @@ static const CachedIndexTemplate& cached_index_template(GXPrimitive prim, u16 vt
   return entry;
 }
 
-static IndexBuffer handle_draw_idx_buf;
-
-static ArrayRef<u16> offset_index_template(const CachedIndexTemplate& indexTemplate,
-                                           u16 vtxStart) {
-  // Grow-only: resizing down and back up made every merge zero-fill the buffer before the transform immediately overwrote it.
-  const size_t count = indexTemplate.indices.size();
-  if (handle_draw_idx_buf.size() < count) {
-    handle_draw_idx_buf.resize(count);
-  }
-  const u16* src = indexTemplate.indices.data();
-  u16* dst = handle_draw_idx_buf.data();
-  for (size_t i = 0; i < count; ++i) {
-    dst[i] = static_cast<u16>(src[i] + vtxStart);
-  }
-  return {dst, count};
-}
-
 struct CachedPipelineState {
   gfx::PipelineRef ref = 0;
   HashType configHash = 0;
@@ -2309,7 +2445,16 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
 
 // SPM bring-up diagnostic: runtime sets g_spmDrawDump during the drawdump frame.
 static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be);
-static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtxSize, const u8* v, bool be) {
+static void spm_dump_draw_logged(const char* path, u8 prim, u32 fmt, u32 count, u32 vtxSize, const u8* v, bool be);
+// SPM diagnostic (g_spmDrawDump): each draw of the dump frame. The check is inline: every draw calls this, and the
+// logging body's frame setup cost ~1.5% of the GX thread even when the dump was off.
+static inline void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtxSize, const u8* v, bool be) {
+  if (g_spmDrawDump) UNLIKELY {
+    spm_dump_draw_logged(path, prim, fmt, count, vtxSize, v, be);
+  }
+}
+[[gnu::noinline, gnu::cold]] static void spm_dump_draw_logged(const char* path, u8 prim, u32 fmt, u32 count,
+                                                             u32 vtxSize, const u8* v, bool be) {
   static int n = 0;
   if (!g_spmDrawDump || n++ > 6000) return;
   spm_log_draw_extent(prim, static_cast<GXVtxFmt>(fmt), v, count, vtxSize, be);
@@ -2388,6 +2533,7 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
         static int stLogged = 0;
         const auto& rv = g_gxState.renderViewport;
         const auto& rs = g_gxState.renderScissor;
+        resolve_zfreeze_plane();
         if (stLogged++ < 6000)
           Log.warn("[spmst] {} be {} frz {} {:.4f},{:.4f},{:.4f},{} cu {} au {} zc {} zf {} zu {} blend {} lop {} pn {} vp {:.0f},{:.0f} {:.0f}x{:.0f} z {:.2f}-{:.2f} sc {},{} {}x{} chans {} tg {} tev {} bbox {:.2f},{:.2f}..{:.2f},{:.2f} oz {:.7f}..{:.7f}",
                    path, be, g_gxState.zFreeze, g_gxState.zFreezePlane.x(), g_gxState.zFreezePlane.y(), g_gxState.zFreezePlane.z(), g_gxState.zFreezePlane.w(), g_gxState.colorUpdate, g_gxState.alphaUpdate, g_gxState.depthCompare, (int)g_gxState.depthFunc, g_gxState.depthUpdate, (int)g_gxState.blendMode,
@@ -2612,26 +2758,79 @@ static bool spm_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
 
 // GX coplanar ("zfreeze"): the depth plane of the last triangle of a draw made with zfreeze off, in the game's NDC
 // with x scaled into the widened projection the GPU uses. Frozen draws take their depth from it (shader.cpp).
-static bool gx_vertex_ndc(GXVtxFmt fmt, const u8* v, bool be, float out[3]) {
-  const auto& pf = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
+//
+// The plane is read only by a draw made with zfreeze on (pipeline config, build_uniform), yet every other draw
+// replaces it, so solving it per draw (three vertex transforms, ~14,000 draws a frame in a match) was mostly
+// wasted, and so was capturing its inputs per draw. A draw only records where its vertices are
+// (update_zfreeze_reference); when its run of draws ends (any other command, or the end of the call whose bytes
+// they point into: ZFreezeRunEnd) or resolve_zfreeze_plane() is called, the recorded draws are captured and solved
+// newest first, and the first one that solves is the plane: what solving each draw in order would have left, since
+// a draw whose solve fails keeps the previous plane. Nothing a capture reads (the vertex bytes and position array,
+// the vertex format and descriptor, the matrix index) changes within a run of draws, and nothing a solve reads (the
+// position matrices, the XF projection, g_spmProjWiden) changes without resolving first (copy_xf_data, handle_xf's
+// projection registers, apply_xf_projection), so capturing and solving at the run's end is exact. Compiled lists
+// solve their runs newest first at once (zfreeze_reference_solved).
+struct ZFreezeVertexInputs {
+  u8 pos[12];  // the position components as stored: the vertex's own bytes, or its entry in the position array
+  bool cbe;
+  u32 mi;  // g_gxState.pnMtx index
+};
+struct ZFreezeCapture {
+  GXCompType type;
+  u8 frac;
+  u32 compSize;
+  u32 comps;
+  ZFreezeVertexInputs v[3];
+};
+// A recorded draw: where its vertices are, until its run of draws ends.
+struct ZFreezeDraw {
+  const u8* verts;
+  u32 count;
+  u32 vtxSize;
+  GXPrimitive prim;
+  GXVtxFmt fmt;
+  bool be;
+};
+static constexpr u32 kZFreezeMaxPending = 32;
+static std::array<ZFreezeDraw, kZFreezeMaxPending> s_zFreezeDraws;
+
+// The input half of the former gx_vertex_ndc: everything it read from GX state, copied.
+static bool zfreeze_capture_vertex(u32 prefix, const u8* v, bool be, const ZFreezeCapture& c, ZFreezeVertexInputs& out) {
   const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
-  if (pd == GX_NONE) return false;
-  const u32 compSize = (pf.type == GX_F32) ? 4u : (pf.type >= GX_U16 ? 2u : 1u);
-  const u32 comps = pf.cnt == GX_POS_XY ? 2u : 3u;
-  const u8* pp = v + matrix_index_prefix_size(fmt);
+  const u32 compSize = c.compSize;
+  const u32 comps = c.comps;
+  const u8* pp = v + prefix;
   const auto& arr = g_gxState.arrays[GX_VA_POS];
   if (pd == GX_INDEX8 || pd == GX_INDEX16) {
     const u32 idx = pd == GX_INDEX8 ? pp[0] : (be ? u32((pp[0] << 8) | pp[1]) : u32(pp[0] | (pp[1] << 8)));
     if (!arr.data || u64(idx) * arr.stride + comps * compSize > arr.size) return false;
     pp = static_cast<const u8*>(arr.data) + idx * arr.stride;
   }
-  const bool cbe = (pd == GX_DIRECT) ? be : !arr.le;
-  float pos[3] = {0.f, 0.f, 0.f};
-  for (u32 c = 0; c < comps; ++c) pos[c] = spm_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
+  out.cbe = (pd == GX_DIRECT) ? be : !arr.le;
+  // comps * compSize bytes, as fixed-size copies (a variable-length memcpy is a libc call per vertex)
+  switch (comps * compSize) {
+  case 12: std::memcpy(out.pos, pp, 12); break;
+  case 8: std::memcpy(out.pos, pp, 8); break;
+  case 6: std::memcpy(out.pos, pp, 6); break;
+  case 4: std::memcpy(out.pos, pp, 4); break;
+  case 3: std::memcpy(out.pos, pp, 3); break;
+  default: std::memcpy(out.pos, pp, 2); break;  // two one-byte components
+  }
   const u32 mi = (g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT ? v[0] : g_gxState.currentPnMtx) / 3u;
   if (mi >= MaxPnMtx) return false;
+  out.mi = mi;
+  return true;
+}
+
+// The arithmetic half of the former gx_vertex_ndc, unchanged, on the captured values.
+static bool zfreeze_vertex_ndc(const ZFreezeCapture& c, const ZFreezeVertexInputs& in, float out[3]) {
+  const u32 compSize = c.compSize;
+  const u32 comps = c.comps;
+  const u8* pp = in.pos;
+  float pos[3] = {0.f, 0.f, 0.f};
+  for (u32 k = 0; k < comps; ++k) pos[k] = spm_bbox_comp(pp + k * compSize, c.type, c.frac, in.cbe);
   float m[12];
-  std::memcpy(m, &g_gxState.pnMtx[mi].pos, sizeof(m));
+  std::memcpy(m, &g_gxState.pnMtx[in.mi].pos, sizeof(m));
   const float vx = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
   const float vy = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
   const float vz = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
@@ -2651,39 +2850,99 @@ static bool gx_vertex_ndc(GXVtxFmt fmt, const u8* v, bool be, float out[3]) {
   return true;
 }
 
-static void update_zfreeze_reference(GXPrimitive prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
-  u32 i0, i1, i2;  // the draw's last triangle
-  switch (prim) {
-  case GX_TRIANGLES: {
-    const u32 n = count - count % 3;
-    if (n < 3) return;
-    i0 = n - 3; i1 = n - 2; i2 = n - 1;
-  } break;
-  case GX_TRIANGLESTRIP:
-    if (count < 3) return;
-    i0 = count - 3; i1 = count - 2; i2 = count - 1;
-    break;
-  case GX_TRIANGLEFAN:
-    if (count < 3) return;
-    i0 = 0; i1 = count - 2; i2 = count - 1;
-    break;
-  case GX_QUADS: {
-    const u32 n = count - count % 4;
-    if (n < 4) return;
-    i0 = n - 4; i1 = n - 2; i2 = n - 1;
-  } break;
-  default:
-    return;  // lines and points never set the reference
-  }
+// The former tail of update_zfreeze_reference: false where it returned without touching the plane.
+static bool zfreeze_solve(const ZFreezeCapture& cap) {
   float a[3], b[3], c[3];
-  if (!verts || !gx_vertex_ndc(fmt, verts + i0 * vtxSize, be, a) || !gx_vertex_ndc(fmt, verts + i1 * vtxSize, be, b) ||
-      !gx_vertex_ndc(fmt, verts + i2 * vtxSize, be, c))
-    return;
+  if (!zfreeze_vertex_ndc(cap, cap.v[0], a) || !zfreeze_vertex_ndc(cap, cap.v[1], b) ||
+      !zfreeze_vertex_ndc(cap, cap.v[2], c))
+    return false;
   const float det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
-  if (std::fabs(det) < 1e-12f) return;  // edge-on triangle: keep the previous plane
+  if (std::fabs(det) < 1e-12f) return false;  // edge-on triangle: keep the previous plane
   const float A = ((b[2] - a[2]) * (c[1] - a[1]) - (c[2] - a[2]) * (b[1] - a[1])) / det;
   const float B = ((b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2])) / det;
   g_gxState.zFreezePlane = {A, B, a[2] - A * a[0] - B * a[1], 1.f};
+  return true;
+}
+
+// The draw's last triangle (false: none, as for lines and points, which never set the reference).
+static bool zfreeze_last_triangle(GXPrimitive prim, u32 count, u32& i0, u32& i1, u32& i2) {
+  switch (prim) {
+  case GX_TRIANGLES: {
+    const u32 n = count - count % 3;
+    if (n < 3) return false;
+    i0 = n - 3; i1 = n - 2; i2 = n - 1;
+  } return true;
+  case GX_TRIANGLESTRIP:
+    if (count < 3) return false;
+    i0 = count - 3; i1 = count - 2; i2 = count - 1;
+    return true;
+  case GX_TRIANGLEFAN:
+    if (count < 3) return false;
+    i0 = 0; i1 = count - 2; i2 = count - 1;
+    return true;
+  case GX_QUADS: {
+    const u32 n = count - count % 4;
+    if (n < 4) return false;
+    i0 = n - 4; i1 = n - 2; i2 = n - 1;
+  } return true;
+  default:
+    return false;
+  }
+}
+
+// The capture of one triangle's inputs: false where the eager solve would have stopped (the plane stays as it was).
+static bool zfreeze_capture_triangle(ZFreezeCapture& cap, GXVtxFmt fmt, const u8* verts, u32 vtxSize, bool be, u32 i0,
+                                     u32 i1, u32 i2) {
+  const auto& pf = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
+  cap.type = pf.type;
+  cap.frac = pf.frac;
+  cap.compSize = (pf.type == GX_F32) ? 4u : (pf.type >= GX_U16 ? 2u : 1u);
+  cap.comps = pf.cnt == GX_POS_XY ? 2u : 3u;
+  const u32 prefix = matrix_index_prefix_size(fmt);
+  return zfreeze_capture_vertex(prefix, verts + i0 * vtxSize, be, cap, cap.v[0]) &&
+         zfreeze_capture_vertex(prefix, verts + i1 * vtxSize, be, cap, cap.v[1]) &&
+         zfreeze_capture_vertex(prefix, verts + i2 * vtxSize, be, cap, cap.v[2]);
+}
+
+// The capture of a recorded draw: false where the plane is left as it was.
+static bool capture_zfreeze_draw(const ZFreezeDraw& draw, ZFreezeCapture& cap) {
+  u32 i0, i1, i2;  // the draw's last triangle
+  if (!zfreeze_last_triangle(draw.prim, draw.count, i0, i1, i2)) return false;
+  if (!draw.verts) return false;
+  if (g_gxState.vtxDesc[GX_VA_POS] == GX_NONE) return false;
+  return zfreeze_capture_triangle(cap, draw.fmt, draw.verts, draw.vtxSize, draw.be, i0, i1, i2);
+}
+
+// The recorded draws, newest first, until one captures and solves (it sets the plane); the older ones would only
+// have been replaced by it.
+static void flush_zfreeze_draws() noexcept {
+  while (s_zFreezeDrawCount != 0) {
+    ZFreezeCapture cap;
+    if (capture_zfreeze_draw(s_zFreezeDraws[--s_zFreezeDrawCount], cap) && zfreeze_solve(cap)) {
+      s_zFreezeDrawCount = 0;
+      return;
+    }
+  }
+}
+
+// A draw made with zfreeze off: recorded, and captured only if no later draw of its run replaces it.
+static void update_zfreeze_reference(GXPrimitive prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
+  if (s_zFreezeDrawCount == kZFreezeMaxPending) flush_zfreeze_draws();
+  s_zFreezeDraws[s_zFreezeDrawCount++] = {verts, count, vtxSize, prim, fmt, be};
+}
+
+// update_zfreeze_reference solved at once: true when the draw's capture solves, which makes it the plane and
+// supersedes every pending capture (resolve_zfreeze_plane: the newest capture that solves is the plane). For the
+// newest-first walk over draws with nothing between them that a solve reads (submit_compiled_draw_list's runs).
+static bool zfreeze_reference_solved(GXPrimitive prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize,
+                                     bool be) {
+  u32 i0, i1, i2;
+  if (!zfreeze_last_triangle(prim, count, i0, i1, i2) || !verts || g_gxState.vtxDesc[GX_VA_POS] == GX_NONE)
+    return false;
+  ZFreezeCapture cap;
+  if (!zfreeze_capture_triangle(cap, fmt, verts, vtxSize, be, i0, i1, i2) || !zfreeze_solve(cap)) return false;
+  s_zFreezeDrawCount = 0;  // recorded draws older than this one would only have been replaced by it
+  return true;
 }
 
 static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
@@ -2759,8 +3018,9 @@ static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 coun
            (int)g_gxState.alphaCompare.comp1, g_gxState.alphaCompare.ref1);
 }
 
-static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t vertexBytes, bool merged = false) {
-  const auto& indexTemplate = cached_index_template(prim, count);
+static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t vertexBytes, bool merged = false,
+                       const CachedIndexTemplate* knownTemplate = nullptr) {
+  const auto& indexTemplate = knownTemplate != nullptr ? *knownTemplate : cached_index_template(prim, count);
   gfx::StagingSizes demand{vertexBytes, 0, indexTemplate.indices.size() * sizeof(u16), 0};
   if (merged) return gfx::staging_has_space(demand);
   const auto& info = resolve_pipeline_state(prim, fmt).shaderInfo;
@@ -2778,8 +3038,6 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
 bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
                      uint32_t vertexBytes) {
   ZoneScoped;
-  ProcessTimer timer;
-  g_statDraws.fetch_add(1, std::memory_order_relaxed);
   if (vertices == nullptr || vtxCount == 0 || vertexBytes == 0) {
     return false;
   }
@@ -2790,6 +3048,22 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
 
   // Raw bridge draws consume live decoded GX state that is also maintained by the HLE producer.
   drain();
+  // With the GX thread on, decoded state is its: the draw goes into its queue, after everything before it.
+  if (worker::producer()) {
+    worker::submit_raw_draw(static_cast<uint8_t>(prim), static_cast<uint8_t>(fmt), vertices, vtxCount, vertexBytes);
+    return true;
+  }
+  return submit_raw_draw_decoded(prim, fmt, vertices, vtxCount, vertexBytes);
+}
+
+bool submit_raw_draw_decoded(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+                             uint32_t vertexBytes) {
+  if (worker::enabled() && !worker::on_gx_thread()) UNLIKELY {
+    note_decode_off_gx_thread("raw draw");
+  }
+  ProcessTimer timer;
+  ++t_pendingDraws;  // flushed into g_statDraws by ~ProcessTimer
+  const ZFreezeRunEnd zfreezeRunEnd;  // the recorded draw points into `vertices`, which outlives only this call
 
   u32 vtxSize;
   if (g_gxState.lastVtxFmt == fmt) LIKELY {
@@ -2811,16 +3085,18 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
 
   ++s_drawDiagnosticIndex;
   spm_dump_draw("raw", static_cast<u8>(prim | fmt), fmt, vtxCount, vtxSize, vertices, false);
-  spm_bbox_accumulate(fmt, vertices, vtxCount, vtxSize, true);
+  if (g_spmBBoxArmed) spm_bbox_accumulate(fmt, vertices, vtxCount, vtxSize, true);  // the flag test it starts with
   if (!has_complete_primitive(prim, vtxCount)) return true;
   if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, vertices, vtxCount, vtxSize, true);
 
-  // This entry point bypasses process(), so it owns the renderer lock itself.
-  std::unique_lock gpuLock(aurora::renderer_gpu_mutex());
+  // This entry point bypasses process(), so it owns the renderer lock itself (unless the GX thread's batch holds it).
+  std::unique_lock gpuLock(aurora::renderer_gpu_mutex(), std::defer_lock);
+  if (!worker::holds_batch_lock()) gpuLock.lock();
   if (!admit_draw(prim, fmt, vtxCount, vertexBytes)) {
-    gpuLock.unlock();
+    const bool held = gpuLock.owns_lock();
+    if (held) gpuLock.unlock();
     gfx::split_staging_batch();
-    gpuLock.lock();
+    if (held) gpuLock.lock();
     if (!admit_draw(prim, fmt, vtxCount, vertexBytes))
       throw gfx::StagingCapacityError("Raw draw does not fit after capacity submission");
   }
@@ -2836,9 +3112,26 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
   return true;
 }
 
+// The draw dump (AURORA_DRAW_DUMP, below): the frame the request was decoded in, UINT32_MAX when none is armed. Every
+// draw asks draw_dump_active(), so its test of this is inline and only an armed dump takes the call.
+static u32 s_drawDumpArmFrame = UINT32_MAX;
+static bool draw_dump_active_armed() noexcept;
+static inline bool draw_dump_active() noexcept {
+  return s_drawDumpArmFrame != UINT32_MAX && draw_dump_active_armed();
+}
+static void dump_draw(char kind, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const gfx::Range& vertRange,
+                      const CachedPipelineState* pipelineState, const BindGroupRanges* ranges,
+                      const gfx::Range* uniformRange);
+
 static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
   ZoneScoped;
-  g_statDraws.fetch_add(1, std::memory_order_relaxed);
+#if defined(__SWITCH__)
+  struct AuroraDrawSpan {
+    uint64_t t0 = AuroraHzTicks();
+    ~AuroraDrawSpan() { AURORA_HZ_SPAN(kAuroraHzDrawTicks, t0); }
+  } auroraDrawSpan;
+#endif
+  ++t_pendingDraws;  // flushed into g_statDraws by ~ProcessTimer
   GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   GXPrimitive prim = primitive_from_draw_cmd(cmd);
 
@@ -2864,7 +3157,7 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   ++s_drawDiagnosticIndex;
   spm_dump_draw("fifo", cmd, fmt, vtxCount, vtxSize, data + pos, bigEndian);
-  spm_bbox_accumulate(fmt, data + pos, vtxCount, vtxSize, bigEndian);
+  if (g_spmBBoxArmed) spm_bbox_accumulate(fmt, data + pos, vtxCount, vtxSize, bigEndian);  // the flag test it starts with
   if (!has_complete_primitive(prim, vtxCount)) {
     pos += totalVtxBytes;
     return true;
@@ -2921,15 +3214,20 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     }
     g_mergeSuspects.clear();
   }
-  if (!admit_draw(prim, fmt, vtxCount, totalVtxBytes, mergeTarget != nullptr)) throw gfx::StagingBatchFull{};
+  // A merged draw looks its index template up once, for admission and for the indices it appends (nothing between
+  // the two touches the template cache).
+  const CachedIndexTemplate* mergeTemplate = mergeTarget != nullptr ? &cached_index_template(prim, vtxCount) : nullptr;
+  if (!admit_draw(prim, fmt, vtxCount, totalVtxBytes, mergeTarget != nullptr, mergeTemplate))
+    throw gfx::StagingBatchFull{};
   const uint8_t* vertices = data + pos;
   gfx::Range vertRange = gfx::push_verts(vertices, totalVtxBytes);
   pos += totalVtxBytes;
   if (auto* lastDraw = mergeTarget) {
-      const auto& indexTemplate = cached_index_template(prim, vtxCount);
-      const auto indices = offset_index_template(indexTemplate, lastDraw->vtxCount);
+      const auto& indexTemplate = *mergeTemplate;
       const u32 numIndices = indexTemplate.indexCount;
-      const gfx::Range idxRange = gfx::push_indices(indices);
+      // offset_index_template + push_indices, written straight into the index staging.
+      const gfx::Range idxRange = gfx::push_offset_indices(indexTemplate.indices.data(), indexTemplate.indices.size(),
+                                                           static_cast<u16>(lastDraw->vtxCount));
       CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
             "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
             vertRange.offset);
@@ -2940,7 +3238,11 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       lastDraw->idxRange.size += idxRange.size;
       lastDraw->vtxCount += vtxCount;
       lastDraw->indexCount += numIndices;
+      if (draw_dump_active()) UNLIKELY {
+        dump_draw('M', prim, fmt, vtxCount, vertRange, nullptr, nullptr, nullptr);
+      }
       ++gfx::g_mergedDrawCallCount;
+      AURORA_HZ_ADD(kAuroraHzMergedDraws, 1);
       // This primitive now renders through the draw we merged into, so its palette slots belong to that draw's interpolation snapshot as well.
       if (s_lastDrawRecordedInterpolation) UNLIKELY {
         extend_interpolation_draw(pn_mtx_mask(vertices, vtxCount, vtxSize));
@@ -2967,6 +3269,145 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     g_gxState.stateDirty = true;
   }
   return true;
+}
+
+// AURORA_DRAW_DUMP=<dir> (diagnostic): aurora_request_draw_dump(name) writes every draw of the next whole frame the
+// decoder starts to <dir>/<name>, one line per draw: what it draws (primitive, format, vertex count, vertex bytes), how
+// (pipeline config, uniform bytes without their staging offsets, the staged indexed arrays' bytes, viewport and
+// scissor) and with which textures (the source texture's and palette's bytes, size and format; the bound GPU
+// texture's size, format and the bytes it was created from). Two runs dumped at the same point compare draw by draw
+// wherever their decoding ran. The request goes through the GX thread's queue, so both modes arm at the same command.
+// AURORA_DRAW_DUMP_FRAMES=<k> (default 1): the next k frames, each to its own file, <name> for the first and
+// <name>.<i> for the i-th after it (runs whose clocks differ by a frame or two still share frames to compare).
+namespace {
+FILE* s_drawDumpFile = nullptr;
+// s_drawDumpArmFrame (above draw_dump_active): the frame the request was decoded in: the ones after it are dumped
+u32 s_drawDumpFileFrame = UINT32_MAX; // the frame s_drawDumpFile holds
+u32 s_drawDumpIndex = 0;
+std::string s_drawDumpName;
+} // namespace
+
+// draw_dump_active() with a dump armed (s_drawDumpArmFrame set).
+static bool draw_dump_active_armed() noexcept {
+  const u32 frame = gfx::current_frame();
+  if (frame == s_drawDumpArmFrame) {
+    return false;
+  }
+  static const u32 frames = [] {
+    const char* v = std::getenv("AURORA_DRAW_DUMP_FRAMES");
+    const long n = v != nullptr ? std::atol(v) : 1;
+    return static_cast<u32>(n < 1 ? 1 : n);
+  }();
+  if (s_drawDumpFile != nullptr && s_drawDumpFileFrame != frame) {
+    std::fclose(s_drawDumpFile);
+    s_drawDumpFile = nullptr;
+  }
+  const u32 offset = frame - s_drawDumpArmFrame - 1;
+  if (offset < frames) {
+    if (s_drawDumpFile == nullptr) {
+      const char* dir = std::getenv("AURORA_DRAW_DUMP");
+      std::string path = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/" + s_drawDumpName;
+      if (offset != 0) path += "." + std::to_string(offset);
+      s_drawDumpFile = std::fopen(path.c_str(), "w");
+      s_drawDumpFileFrame = frame;
+      s_drawDumpIndex = 0;
+      if (s_drawDumpFile == nullptr) {
+        s_drawDumpArmFrame = UINT32_MAX;
+        return false;
+      }
+    }
+    return true;
+  }
+  s_drawDumpArmFrame = UINT32_MAX;
+  return false;
+}
+
+static u64 dump_digest(const void* data, size_t size) noexcept {
+  return data != nullptr && size != 0 ? static_cast<u64>(xxh3_hash_s(data, size)) : 0;
+}
+
+// One line of the draw dump (only while draw_dump_active()). A merged draw (kind 'M') adds vertices to the previous
+// line's draw: only its own shape and vertex bytes are written.
+static void dump_draw(char kind, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const gfx::Range& vertRange,
+                      const CachedPipelineState* pipelineState, const BindGroupRanges* ranges,
+                      const gfx::Range* uniformRange) {
+  char line[4096];
+  int n = std::snprintf(line, sizeof(line), "%u %c p%02x f%u n%u v%016llx", s_drawDumpIndex++, kind,
+                        static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount,
+                        static_cast<unsigned long long>(dump_digest(gfx::staged_bytes(0, vertRange), vertRange.size)));
+  const auto append = [&](const char* format, auto... args) {
+    if (n >= 0 && n < static_cast<int>(sizeof(line))) {
+      n += std::snprintf(line + n, sizeof(line) - n, format, args...);
+    }
+  };
+  if (pipelineState != nullptr) {
+    // Uniforms: bytes 0-3 are the draw's vertex offset and 32.. its arrays' offsets in this frame's staging.
+    u64 uniformDigest = 0;
+    if (const u8* u = uniformRange != nullptr ? gfx::staged_bytes(1, *uniformRange) : nullptr) {
+      const size_t skipEnd = 32 + 4 * MaxIndexAttr;
+      uniformDigest = dump_digest(u + 4, 28);
+      if (uniformRange->size > skipEnd) {
+        uniformDigest = hash_combine(uniformDigest, dump_digest(u + skipEnd, uniformRange->size - skipEnd));
+      }
+    }
+    const auto& vp = g_gxState.renderViewport;
+    const auto& sc = g_gxState.renderScissor;
+    append(" P%016llx U%016llx vp%.2f,%.2f,%.2f,%.2f,%.4f,%.4f sc%d,%d,%d,%d",
+           static_cast<unsigned long long>(pipelineState->configHash), static_cast<unsigned long long>(uniformDigest),
+           vp.left, vp.top, vp.width, vp.height, vp.znear, vp.zfar, sc.x, sc.y, sc.width, sc.height);
+    if (g_gxState.zFreeze) {
+      // A coplanar draw: its depth comes from the zfreeze reference plane (in its uniforms, so in U too).
+      const auto& p = g_gxState.zFreezePlane;
+      append(" zf%.6g,%.6g,%.6g,%.0f", p.x(), p.y(), p.z(), p.w());
+    }
+    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+      if (ranges != nullptr && (g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16)) {
+        const auto& range = ranges->vaRanges[i - GX_VA_POS];
+        append(" a%d:%016llx", i, static_cast<unsigned long long>(dump_digest(gfx::staged_bytes(3, range), range.size)));
+      }
+    }
+    const auto& info = pipelineState->shaderInfo;
+    for (u32 i = 0; i < MaxTextures; ++i) {
+      if (!info.sampledTextures.test(i) && !info.sampledIndTextures.test(i)) {
+        continue;
+      }
+      const GXTexObj_& obj = g_gxState.loadedTextures[i];
+      u64 sourceDigest = 0;
+      if (obj.data != nullptr && obj.width() <= 1024 && obj.height() <= 1024 && obj.format() < 0x40) {
+        const u32 size = GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()), obj.format(),
+                                            obj.has_mips(), obj.has_mips() ? static_cast<u8>(obj.mip_count() - 1) : 0);
+        sourceDigest = dump_digest(obj.data, size);
+      }
+      u64 paletteDigest = 0;
+      if (is_palette_format(obj.format()) && obj.tlut < MaxTluts) {
+        const auto& tlut = g_gxState.loadedTluts[obj.tlut];
+        paletteDigest = dump_digest(tlut.data, static_cast<size_t>(tlut.numEntries) * 2);
+      }
+      const auto& bound = g_gxState.textures[i];
+      append(" t%u:%016llx,%ux%u,f%u,m%u,pal%016llx", i, static_cast<unsigned long long>(sourceDigest), obj.width(),
+             obj.height(), obj.format(), obj.mip_count(), static_cast<unsigned long long>(paletteDigest));
+      if (bound.ref) {
+        append("=gpu%ux%u,f%u,d%016llx,r%u,s%08x/%08x", bound.ref->size.width, bound.ref->size.height,
+               bound.ref->gxFormat, static_cast<unsigned long long>(bound.ref->debugDigest),
+               bound.ref->isReplacement ? 1u : 0u, bound.texObj.mode0 & 0x00FFFFFFu, bound.texObj.mode1 & 0x00FFFFFFu);
+      } else {
+        append("=none");
+      }
+    }
+  }
+  append("\n");
+  std::fputs(line, s_drawDumpFile);
+  std::fflush(s_drawDumpFile);  // the run may end in _Exit, which drops stdio buffers
+}
+
+void arm_draw_dump(std::string name) {
+  if (s_drawDumpFile != nullptr) {
+    std::fclose(s_drawDumpFile);
+    s_drawDumpFile = nullptr;
+  }
+  s_drawDumpFileFrame = UINT32_MAX;
+  s_drawDumpName = std::move(name);
+  s_drawDumpArmFrame = gfx::current_frame();
 }
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
@@ -3037,6 +3478,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       indexTemplate.indices.data(), indexTemplate.indices.size()});
 
   // Build pipeline, bind groups, and push draw command
+  AURORA_HZ_ADD(kAuroraHzUnmergedDraws, 1);
+  AURORA_HZ_MARK(hzArrays);
   BindGroupRanges ranges{};
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
     if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
@@ -3050,34 +3493,41 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       // (highest index used). Re-copying ~200 KB per draw filled the 8 MB storage staging every ~40 draws,
       // forcing a mid-frame GPU submit each time (gn3_12: 14 fps). Reuse this staging epoch's upload of
       // the same array when it already covers the requested size.
+      // Entries carry their epoch (an entry from an older one is no upload of this one) instead of the map being
+      // cleared at each new epoch: absl frees a cleared big table, so every epoch (several a frame) grew it again.
       struct StagedArray {
         gfx::Range range;
         u32 size;
+        u32 epoch;
       };
       static absl::flat_hash_map<const void*, StagedArray> s_staged;
-      static u32 s_stagedEpoch = 0;
-      if (s_stagedEpoch != g_arrayUploadEpoch) {
-        s_staged.clear();
-        s_stagedEpoch = g_arrayUploadEpoch;
+      if (s_staged.size() > 4096) UNLIKELY {  // addresses no longer drawn: drop the old epochs' entries
+        absl::erase_if(s_staged, [](const auto& entry) { return entry.second.epoch != g_arrayUploadEpoch; });
       }
       gfx::Range range;
-      if (const auto it = s_staged.find(array.data); it != s_staged.end() && it->second.size >= array.size) {
+      if (const auto it = s_staged.find(array.data);
+          it != s_staged.end() && it->second.epoch == g_arrayUploadEpoch && it->second.size >= array.size) {
         range = it->second.range;
       } else {
         range = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-        s_staged[array.data] = StagedArray{range, array.size};
+        s_staged[array.data] = StagedArray{range, array.size, g_arrayUploadEpoch};
       }
       ranges.vaRanges[i - GX_VA_POS] = range;
       array.cachedRange = range;
     }
   }
 
+  AURORA_HZ_SPAN(kAuroraHzArrayTicks, hzArrays);
+  AURORA_HZ_MARK(hzPipeline);
   const auto& pipelineState = resolve_pipeline_state(prim, fmt);
   const auto& info = pipelineState.shaderInfo;
+  AURORA_HZ_SPAN(kAuroraHzPipelineTicks, hzPipeline);
 
+  AURORA_HZ_MARK(hzBind);
   resolve_sampled_textures(info);
 
   const auto bindGroups = build_bind_groups(info);
+  AURORA_HZ_SPAN(kAuroraHzBindTicks, hzBind);
 
   const auto pipeline = pipelineState.ref;
 
@@ -3099,9 +3549,11 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
         .matrixTopology = matrixTopologySignature,
     };
   }
+  AURORA_HZ_MARK(hzUniform);
   const auto uniformRanges =
       build_uniform(info, vertRange.offset, ranges, drawIdentity, interpolationIdentityActive,
                     usedPnMtxMask);
+  AURORA_HZ_SPAN(kAuroraHzUniformTicks, hzUniform);
   s_lastDrawRecordedInterpolation = interpolationIdentityActive;
 
   uint32_t instanceCount = 1;
@@ -3125,6 +3577,9 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       .bindGroups = bindGroups,
       .dstAlpha = pipelineState.dstAlpha,
   });
+  if (draw_dump_active()) UNLIKELY {
+    dump_draw('U', prim, fmt, vtxCount, vertRange, &pipelineState, &ranges, &uniformRanges.current);
+  }
   g_gxState.stateDirty = false;
   if (flatSave) {
     g_gxState.tevStages[0] = flatSave->st0;
@@ -3138,6 +3593,344 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     g_gxState.pipelineStateGeneration = next_gx_state_epoch();
     g_gxState.stateDirty = true;
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Compiled draw lists, for the native nw4r g3d path (runtime hle/g3d_native.cpp, through GXCallDisplayListCompiled):
+// a model shape's primitive display list holds draw commands and, for a skinned (envelope) shape, groups of indexed XF
+// loads (its matrix palette) between them. process() handles each command by itself (handle_draw: vertex size,
+// zfreeze capture, merge test, a vertex push and an index push). Compiled, the list is runs: a group of loads, then
+// the draws after it, which go into one draw command (a load dirties the state, so a run's first draw opens one; a
+// rigid list is one run without loads, which may join the previous draw). Each run's loads go through the same code as
+// process()'s; its draws' work is done once: the vertices in one push, the index templates, pre-offset, in another;
+// the zfreeze reference plane as process()'s per-draw captures would leave it (only the newest that solves counts:
+// found newest first, solved at once); the counters as process() makes them. A run that does not fit the staging
+// batch, or would take the draw command it joins past 65536 vertices, goes draw by draw (submit_compiled_strip), as
+// process() splits it. Anything it does not reproduce exactly (diagnostics, interpolation, CULL_ALL, lines or points,
+// more than one vertex format, other commands) is left to process(). Entries are keyed by list address and checked
+// against the caller's digest; clear_compiled_draw_lists drops them all (the runtime calls it on a scene change).
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+struct CompiledStrip {
+  GXPrimitive prim;
+  u16 count;
+  bool complete;
+  u32 offset;  // into vertices (complete strips)
+};
+struct CompiledRun {
+  u32 firstLoad = 0, numLoads = 0;    // into loads
+  u32 firstStrip = 0, numStrips = 0;  // into strips
+  u32 vtxOffset = 0, vtxBytes = 0;    // its complete strips' vertices, in vertices
+  u32 idxOffset = 0, idxEntries = 0;  // their index templates, offset from the run's first vertex, in indices
+  u32 totalVerts = 0, completeStrips = 0;
+  u32 indexCount = 0;  // sum of the templates' index counts
+  GXPrimitive firstPrim = GX_TRIANGLES;  // its first complete strip
+  u16 firstCount = 0;
+  u32 firstIndexCount = 0, firstIndexEntries = 0;
+};
+struct CompiledDrawList {
+  u64 digest = 0;
+  u32 size = 0;
+  u32 vtxSize = 0;  // the layout it was compiled for
+  bool ok = false;
+  GXVtxFmt fmt = GX_VTXFMT0;
+  bool hasQuad4 = false;
+  u32 completeStrips = 0;  // over all runs
+  std::vector<std::pair<u8, u32>> loads;  // indexed XF loads: opcode, value
+  std::vector<CompiledRun> runs;
+  std::vector<CompiledStrip> strips;
+  std::vector<u8> vertices;
+  std::vector<u16> indices;
+};
+absl::flat_hash_map<const u8*, CompiledDrawList> s_compiledLists;
+} // namespace
+
+// The native path's scene changes (runtime g3d_native.cpp): compiled lists of the models a scene unloaded are dropped.
+// clear_compiled_draw_lists may run on any thread (the runtime calls it from the game's scene reports); the map belongs
+// to the decoding thread (inline, or the GX thread), which drops it at its next submit. On the GX thread that may be
+// ahead of lists submitted before the clear: they recompile from their bytes, which gives the same form.
+static std::atomic<u32> s_compiledListClears{0};
+static u32 s_compiledListClearsSeen = 0;
+void clear_compiled_draw_lists() noexcept { s_compiledListClears.fetch_add(1, std::memory_order_relaxed); }
+
+// calculate_last_vtx_size's size, without its effects (it also selects the format and dirties the state).
+static u32 vtx_size_pure(GXVtxFmt fmt) {
+  u32 vtxSize = 0;
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& attrFmt = vtxFmt.attrs[i];
+    switch (g_gxState.vtxDesc[i]) {
+    case GX_NONE:
+      break;
+    case GX_DIRECT:
+      vtxSize += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      break;
+    case GX_INDEX8:
+      vtxSize += (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3 : 1;
+      break;
+    case GX_INDEX16:
+      vtxSize += (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 6 : 2;
+      break;
+    }
+  }
+  return vtxSize;
+}
+
+static void compile_draw_list(CompiledDrawList& c, const u8* data, u32 size, u64 digest) {
+  c = CompiledDrawList{};
+  c.digest = digest;
+  c.size = size;
+  c.runs.emplace_back();
+  bool first = true;
+  u32 pos = 0;
+  while (pos < size) {
+    const u8 cmd = data[pos++];
+    if (cmd == CP_CMD_NOP) continue;
+    const u8 opcode = cmd & CP_OPCODE_MASK;
+    if (opcode == CP_CMD_LOAD_INDX_A || opcode == CP_CMD_LOAD_INDX_B || opcode == CP_CMD_LOAD_INDX_C ||
+        opcode == CP_CMD_LOAD_INDX_D) {
+      if (pos + 4 > size) return;
+      if (c.runs.back().numStrips != 0) {  // loads after draws: a new run
+        CompiledRun next;
+        next.firstLoad = static_cast<u32>(c.loads.size());
+        next.firstStrip = static_cast<u32>(c.strips.size());
+        next.vtxOffset = static_cast<u32>(c.vertices.size());
+        next.idxOffset = static_cast<u32>(c.indices.size());
+        c.runs.push_back(next);
+      }
+      c.loads.emplace_back(opcode, read_u32(data + pos, true));
+      ++c.runs.back().numLoads;
+      pos += 4;
+      continue;
+    }
+    if (!is_draw_cmd(cmd)) return;
+    const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
+    const GXPrimitive prim = primitive_from_draw_cmd(cmd);
+    if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) return;
+    if (first) {
+      c.fmt = fmt;
+      c.vtxSize = vtx_size_pure(fmt);
+      first = false;
+    } else if (fmt != c.fmt) {
+      return;
+    }
+    if (pos + 2 > size) return;
+    const u16 count = read_u16(data + pos, true);
+    pos += 2;
+    const u32 bytes = u32(count) * c.vtxSize;
+    if (c.vtxSize == 0 || pos + bytes > size) return;
+    CompiledRun& run = c.runs.back();
+    CompiledStrip strip{prim, count, has_complete_primitive(prim, count), 0};
+    if (strip.complete) {
+      strip.offset = static_cast<u32>(c.vertices.size());
+      c.vertices.insert(c.vertices.end(), data + pos, data + pos + bytes);
+      const auto& tmpl = cached_index_template(prim, count);
+      if (run.completeStrips == 0) {
+        run.firstPrim = prim;
+        run.firstCount = count;
+        run.firstIndexCount = tmpl.indexCount;
+        run.firstIndexEntries = static_cast<u32>(tmpl.indices.size());
+      }
+      if (run.totalVerts + count > 65536) return;
+      for (const u16 index : tmpl.indices) c.indices.push_back(static_cast<u16>(index + run.totalVerts));
+      run.totalVerts += count;
+      run.indexCount += tmpl.indexCount;
+      run.vtxBytes += bytes;
+      run.idxEntries += static_cast<u32>(tmpl.indices.size());
+      ++run.completeStrips;
+      ++c.completeStrips;
+      if (prim == GX_QUADS && count == 4) c.hasQuad4 = true;
+    }
+    c.strips.push_back(strip);
+    ++run.numStrips;
+    pos += bytes;
+  }
+  c.ok = !first;
+}
+
+// One complete strip, as handle_draw submits it after its zfreeze capture (the compiled path's rare case: a run that
+// does not fit the staging batch, or would push the draw it joins past 65536 vertices, where process() opens a new
+// draw mid-run). The renderer lock is held (gpuLock) and released only to split a full staging batch, as process()'s
+// caller does.
+static void submit_compiled_strip(std::unique_lock<std::recursive_mutex>& gpuLock, GXPrimitive prim, GXVtxFmt fmt,
+                                  const u8* vertices, u16 count, u32 vtxSize) {
+  const u32 bytes = u32(count) * vtxSize;
+  const auto& tmpl = cached_index_template(prim, count);
+  auto mergeTarget = [&]() -> DrawData* {
+    if (g_gxState.stateDirty) return nullptr;
+    auto* lastDraw = gfx::get_last_draw_command<DrawData>();
+    if (lastDraw == nullptr || lastDraw->expandedPrimitive || lastDraw->instanceCount != 1 ||
+        u64(lastDraw->vtxCount) + count > 65536u)
+      return nullptr;
+    return lastDraw;
+  };
+  DrawData* last = mergeTarget();
+  if (!admit_draw(prim, fmt, count, bytes, last != nullptr, last != nullptr ? &tmpl : nullptr)) {
+    const bool held = gpuLock.owns_lock();  // not when the GX thread's batch holds the lock instead
+    if (held) gpuLock.unlock();
+    gfx::split_staging_batch();
+    if (held) gpuLock.lock();
+    last = mergeTarget();
+    if (!admit_draw(prim, fmt, count, bytes, last != nullptr, last != nullptr ? &tmpl : nullptr))
+      throw gfx::StagingCapacityError("Compiled draw does not fit after capacity submission");
+  }
+  const gfx::Range vertRange = gfx::push_verts(vertices, bytes);
+  if (last != nullptr) {
+    const gfx::Range idxRange = gfx::push_offset_indices(tmpl.indices.data(), tmpl.indices.size(),
+                                                         static_cast<u16>(last->vtxCount));
+    last->vertRange.size += vertRange.size;
+    last->idxRange.size += idxRange.size;
+    last->vtxCount += count;
+    last->indexCount += tmpl.indexCount;
+    if (draw_dump_active()) UNLIKELY {
+      dump_draw('M', prim, fmt, count, vertRange, nullptr, nullptr, nullptr);
+    }
+    ++gfx::g_mergedDrawCallCount;
+    AURORA_HZ_ADD(kAuroraHzMergedDraws, 1);
+  } else {
+    handle_draw_unmerged(prim, fmt, count, vertRange, 0, 0, 0, false);
+  }
+}
+
+bool submit_compiled_draw_list(const u8* data, u32 size, u64 digest, const u8* key) {
+  static const bool off = std::getenv("NSMBW_NO_MERGE") != nullptr || std::getenv("SPM_FLAT_TEST") != nullptr ||
+                          std::getenv("AURORA_NO_COMPILED_DRAWS") != nullptr;
+  if (off || MergeSuspectsOn() || g_spmDrawDump || g_spmBBoxArmed || frame_interpolation_identity_needed() ||
+      s_lastDrawRecordedInterpolation || g_gxState.cullMode == GX_CULL_ALL)
+    return false;
+  if (const u32 clears = s_compiledListClears.load(std::memory_order_relaxed); clears != s_compiledListClearsSeen) {
+    s_compiledLists.clear();
+    s_compiledListClearsSeen = clears;
+  }
+  auto& c = s_compiledLists[key != nullptr ? key : data];
+  // The format's current vertex size: calculate_last_vtx_size's cached one when it holds this format (every vertex
+  // descriptor or format write drops that cache, clearVtxSizeCache), else the 21-attribute sum.
+  const auto currentVtxSize = [](GXVtxFmt fmt) {
+    return g_gxState.lastVtxFmt == fmt ? u32{g_gxState.lastVtxSize} : vtx_size_pure(fmt);
+  };
+  if (c.digest != digest || c.size != size || (c.ok && c.vtxSize != currentVtxSize(c.fmt)))
+    compile_draw_list(c, data, size, digest);
+  if (!c.ok || c.completeStrips == 0 || (c.hasQuad4 && g_spmProjWiden != 1.f)) return false;
+
+  ProcessTimer timer;
+  std::unique_lock gpuLock(aurora::renderer_gpu_mutex(), std::defer_lock);  // as process()
+  if (!worker::holds_batch_lock() && !gpuLock.try_lock()) {
+    const auto lockStart = StatTiming() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    gpuLock.lock();
+    if (StatTiming()) {
+      g_statLockNanos.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lockStart).count(),
+          std::memory_order_relaxed);
+    }
+  }
+  // handle_draw's first steps for the first draw: the format's vertex size (selecting the format dirties the state).
+  const GXVtxFmt fmt = c.fmt;
+  const u32 vtxSize = g_gxState.lastVtxFmt == fmt ? g_gxState.lastVtxSize : calculate_last_vtx_size(fmt);
+  // Run by run, as process() would decode the list: the run's indexed XF loads (a skinned shape's matrix palette; each
+  // dirties the state, so the run's first draw opens a new draw command), then its draws: the first merges into the
+  // last draw command or opens one, the others merge into that.
+  for (const CompiledRun& run : c.runs) {
+    for (u32 i = 0; i < run.numLoads; ++i) {
+      const auto& [opcode, value] = c.loads[run.firstLoad + i];
+      handle_load_indx(opcode, value, true);
+    }
+    if (run.numStrips == 0) continue;
+    t_pendingDraws += run.numStrips;
+    s_drawDiagnosticIndex += run.numStrips;
+    if (run.completeStrips == 0) continue;
+    const u8* const runVertices = c.vertices.data() + run.vtxOffset;
+    // The run's zfreeze captures: nothing a solve reads (matrices, projection, widening) changes between its draws,
+    // so of their captures only the newest that solves would count; it is found newest first and solved now.
+    if (!g_gxState.zFreeze) {
+      for (u32 s = run.numStrips; s-- > 0;) {
+        const CompiledStrip& strip = c.strips[run.firstStrip + s];
+        if (strip.complete && zfreeze_reference_solved(strip.prim, fmt, c.vertices.data() + strip.offset, strip.count,
+                                                       vtxSize, true))
+          break;
+      }
+    }
+    DrawData* last = nullptr;
+    if (!g_gxState.stateDirty) {
+      auto* lastDraw = gfx::get_last_draw_command<DrawData>();
+      if (lastDraw != nullptr && !lastDraw->expandedPrimitive && lastDraw->instanceCount == 1) last = lastDraw;
+    }
+    // The fast path needs every draw of the run where process() would put it (into `last`, or into the first draw's new
+    // command) and room for all of it; otherwise the run goes draw by draw, splitting the batch where it fills up.
+    bool fast = (last != nullptr ? u64(last->vtxCount) : 0) + run.totalVerts <= 65536u;
+    if (fast) {
+      gfx::StagingSizes demand{run.vtxBytes, 0, run.idxEntries * sizeof(u16), 0};
+      if (last == nullptr) {
+        demand[1] = gfx::staging_uniform_bytes(resolve_pipeline_state(run.firstPrim, fmt).shaderInfo.uniformSize);
+        for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+          if ((g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16) &&
+              g_gxState.arrays[i].cachedRange.size == 0)
+            demand[3] += gfx::staging_storage_bytes(g_gxState.arrays[i].size);
+        }
+      }
+      fast = gfx::staging_has_space(demand);
+    }
+    if (!fast) {
+      for (u32 s = 0; s < run.numStrips; ++s) {
+        const CompiledStrip& strip = c.strips[run.firstStrip + s];
+        if (strip.complete)
+          submit_compiled_strip(gpuLock, strip.prim, fmt, c.vertices.data() + strip.offset, strip.count, vtxSize);
+      }
+      continue;
+    }
+    const gfx::Range vertRange = gfx::push_verts(runVertices, run.vtxBytes);
+    u32 mergedDraws = run.completeStrips;
+    const u16* restIndices = c.indices.data() + run.idxOffset;
+    size_t restEntries = run.idxEntries;
+    u32 restVerts = run.totalVerts, restIndexCount = run.indexCount;
+    u16 base = 0;
+    const bool openedHere = last == nullptr;
+    if (last == nullptr) {
+      // The first draw opens a draw command, as handle_draw_unmerged makes it; the others merge into it.
+      handle_draw_unmerged(run.firstPrim, fmt, run.firstCount,
+                           gfx::Range{vertRange.offset, u32(run.firstCount) * vtxSize}, 0, 0, 0, false);
+      last = gfx::get_last_draw_command<DrawData>();
+      CHECK(last != nullptr, "compiled draw list: no draw command");
+      --mergedDraws;
+      restIndices += run.firstIndexEntries;
+      restEntries -= run.firstIndexEntries;
+      restVerts -= run.firstCount;
+      restIndexCount -= run.firstIndexCount;
+      last->vertRange.size += vertRange.size - u32(run.firstCount) * vtxSize;
+    } else {
+      base = static_cast<u16>(last->vtxCount);
+      CHECK(last->vertRange.offset + last->vertRange.size == vertRange.offset,
+            "Non-consecutive vertex ranges ({} < {})", last->vertRange.offset + last->vertRange.size, vertRange.offset);
+      last->vertRange.size += vertRange.size;
+    }
+    if (restEntries != 0) {
+      const gfx::Range idxRange = gfx::push_offset_indices(restIndices, restEntries, base);
+      CHECK(last->idxRange.offset + last->idxRange.size == idxRange.offset, "Non-consecutive index ranges ({} < {})",
+            last->idxRange.offset + last->idxRange.size, idxRange.offset);
+      last->idxRange.size += idxRange.size;
+    }
+    last->vtxCount += restVerts;
+    last->indexCount += restIndexCount;
+    // The draw dump's lines as process() writes them: one per complete draw (the one that opened the command here was
+    // written by handle_draw_unmerged), so a compiled list dumps like a decoded one.
+    if (draw_dump_active()) UNLIKELY {
+      bool skipFirst = openedHere;
+      for (u32 s = 0; s < run.numStrips; ++s) {
+        const CompiledStrip& strip = c.strips[run.firstStrip + s];
+        if (!strip.complete) continue;
+        if (skipFirst) {
+          skipFirst = false;
+          continue;
+        }
+        dump_draw('M', strip.prim, fmt, strip.count,
+                  gfx::Range{vertRange.offset + (strip.offset - run.vtxOffset), static_cast<u32>(strip.count) * vtxSize},
+                  nullptr, nullptr, nullptr);
+      }
+    }
+    gfx::g_mergedDrawCallCount += mergedDraws;
+    AURORA_HZ_ADD(kAuroraHzMergedDraws, mergedDraws);
+  }
+  return true;
 }
 
 std::string read_string(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -3304,6 +4097,13 @@ bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
 
 } // namespace aurora::gx::fifo
 
+void aurora::gx::resolve_zfreeze_plane() noexcept {
+  using namespace aurora::gx::fifo;
+  // Newest first: the newest recorded draw that solves is the plane the eager per-draw solve would have left.
+  if (s_zFreezeDrawCount != 0)
+    flush_zfreeze_draws();
+}
+
 // NSMBW: widen 16:9 perspective cameras to `aspect` (the screen's, when wider than 16:9; 0 = off).
 extern std::atomic<uint64_t> g_statCopies, g_statCopyCreates;
 extern "C" void AuroraTakeCopyStats(uint64_t* copies, uint64_t* creates) {
@@ -3321,7 +4121,10 @@ extern "C" void AuroraTakeGxStats(uint64_t* processNanos, uint64_t* lockNanos, u
   *processNanos = total - s_takenProcessNanos;
   s_takenProcessNanos = total;
   *lockNanos = aurora::gx::fifo::g_statLockNanos.exchange(0, std::memory_order_relaxed);
-  *draws = aurora::gx::fifo::g_statDraws.exchange(0, std::memory_order_relaxed);
+  static uint64_t s_takenDraws = 0;  // single caller, as above
+  const uint64_t drawsTotal = aurora::gx::fifo::g_statDrawsTotal.load(std::memory_order_relaxed);
+  *draws = drawsTotal - s_takenDraws;
+  s_takenDraws = drawsTotal;
 }
 
 extern "C" void AuroraSetWidePerspectiveAspect(float aspect) {
@@ -3340,4 +4143,11 @@ extern "C" void aurora_spm_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3) {
       o[1] = static_cast<uint8_t>(af.type);
       o[2] = af.frac;
     }
+}
+
+// AURORA_DRAW_DUMP: dump the next whole frame's draws to <AURORA_DRAW_DUMP>/<name> (see dump_draw). Queued like any
+// decoded-state change, so with the GX thread on it arms at the same point in the command stream as inline.
+extern "C" void aurora_request_draw_dump(const char* name) {
+  std::string fileName = name != nullptr ? name : "drawdump.txt";
+  aurora::gx::worker::run_ordered([fileName] { aurora::gx::fifo::arm_draw_dump(fileName); });
 }

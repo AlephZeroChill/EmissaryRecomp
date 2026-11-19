@@ -52,7 +52,7 @@ public sealed partial class CxxLinearCodeGenerator
     /// so a call-site memo would just duplicate the catalog's own lookup for no benefit.
     /// </summary>
     private static Translator.Core.Analysis.GuestHelperEffect AnalyzeGuestHelperEffect(IrCall call) =>
-        Translator.Core.Analysis.GuestHelperEffectCatalog.Analyze(call);
+        Translator.Core.Analysis.GuestEabi.HelperEffect(call);
 
     private static string SanitizeLabel(string label)
     {

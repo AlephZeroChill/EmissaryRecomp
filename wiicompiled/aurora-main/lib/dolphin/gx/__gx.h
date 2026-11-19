@@ -162,7 +162,20 @@ struct __GXData_struct {
                     // bit 4: VAT
 };
 
-extern __GXData_struct* __gx;
+// A thread_local with a constant initializer, declared so: other translation units then access it directly instead
+// of through a TLS wrapper call that checks for a dynamic initializer (every GX call reads __gx).
+#ifndef AURORA_TLS_CONSTINIT
+#if defined(__clang__)
+#define AURORA_TLS_CONSTINIT [[clang::require_constant_initialization]]
+#elif defined(__GNUC__) && __GNUC__ >= 10
+#define AURORA_TLS_CONSTINIT __constinit
+#else
+#define AURORA_TLS_CONSTINIT
+#endif
+#endif
+// The producer's GX register shadow. Per thread: every thread starts on the one shared instance (GXManage.cpp); a
+// draw worker filling a deferred job (gx_worker.hpp) points it at its own copy.
+AURORA_TLS_CONSTINIT extern thread_local __GXData_struct* __gx;
 
 extern "C" {
 

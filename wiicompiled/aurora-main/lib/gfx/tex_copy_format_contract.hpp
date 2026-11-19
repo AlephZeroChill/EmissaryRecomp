@@ -12,12 +12,9 @@ constexpr std::array<std::uint8_t, 4> z16_ra8_as_ia8_rgba(std::uint8_t high) noe
   return {high, high, high, 0xff};
 }
 
+// Fragment body (gpu::shader dialect), run after the depth copy prefix has produced `depth_bytes`.
 inline constexpr std::string_view Z16FragmentShader = R"(
-@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let depth_bytes = sample_depth_copy(in.uv);
-    let i = f32(depth_bytes.r) / 255.0;
-    return vec4f(i, i, i, 1.0);
-}
-)";
+  float i = float(depth_bytes.r) / 255.0;
+  out_color = vec4(i, i, i, 1.0);)";
 
 } // namespace aurora::gfx::tex_copy_conv::detail

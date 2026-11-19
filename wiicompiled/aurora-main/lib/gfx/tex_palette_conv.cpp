@@ -1,186 +1,85 @@
 #include "tex_palette_conv.hpp"
 
 #include "../internal.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../gpu/gpu.hpp"
+#include "../gpu/shader.hpp"
 #include "texture.hpp"
 
-#include <vector>
+#include <array>
 
 namespace aurora::gfx::tex_palette_conv {
 static Module Log("aurora::gfx::tex_palette_conv");
 
-using webgpu::g_device;
+using namespace std::string_view_literals;
 
-static constexpr std::string_view ShaderPreambleVtx = R"(
-struct VertexOutput {
-    @builtin(position) pos: vec4f,
-    @location(0) uv: vec2f,
-};
-
-var<private> positions: array<vec2f, 3> = array(
-    vec2f(-1.0, 1.0),
-    vec2f(-1.0, -3.0),
-    vec2f(3.0, 1.0),
-);
-var<private> uvs: array<vec2f, 3> = array(
-    vec2f(0.0, 0.0),
-    vec2f(0.0, 2.0),
-    vec2f(2.0, 0.0),
-);
-
-@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.pos = vec4f(positions[vi], 0.0, 1.0);
-    out.uv = uvs[vi];
-    return out;
-}
-
-fn intensity(rgb: vec3f) -> f32 {
-    // ITU-R BT.601 luma coefficients
-    return dot(rgb, vec3f(0.257, 0.504, 0.098)) + 16.0 / 255.0;
-}
-)"sv;
+static constexpr std::string_view VertexBody = R"(
+  vec2 p = vidx == 0u ? vec2(-1.0, 1.0) : (vidx == 1u ? vec2(-1.0, -3.0) : vec2(3.0, 1.0));
+  vec2 uv = vidx == 0u ? vec2(0.0, 0.0) : (vidx == 1u ? vec2(0.0, 2.0) : vec2(2.0, 0.0));
+  out_pos = vec4(p, 0.0, 1.0);
+  vout.uv = uv;)"sv;
 
 // Direct: R16Sint index texture + TLUT -> RGBA8
 static constexpr std::string_view ShaderDirect = R"(
-@group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<i32>;
-@group(0) @binding(2) var tlut: texture_2d<f32>;
-
-@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let texSize = vec2f(textureDimensions(src));
-    let coord = vec2i(floor(in.uv * texSize));
-    let idx = textureLoad(src, coord, 0).r;
-    return textureLoad(tlut, vec2i(idx, 0), 0);
-}
-)"sv;
+  vec2 texSize = vec2(DIMS(src));
+  ivec2 coord = ivec2(floor(vin.uv * texSize));
+  int idx = LOAD(src, coord).r;
+  out_color = LOAD(tlut, ivec2(idx, 0));)"sv;
 
 // FromFloat8: f32 texture (R8Unorm) -> 8-bit index -> TLUT -> RGBA8
 static constexpr std::string_view ShaderFromFloat8 = R"(
-@group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;
-@group(0) @binding(2) var tlut: texture_2d<f32>;
-
-@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let texSize = vec2f(textureDimensions(src));
-    let coord = vec2i(floor(in.uv * texSize));
-    let r = textureLoad(src, coord, 0).r;
-    return textureLoad(tlut, vec2i(i32(r * 255.0), 0), 0);
-}
-)"sv;
+  vec2 texSize = vec2(DIMS(src));
+  ivec2 coord = ivec2(floor(vin.uv * texSize));
+  float r = LOAD(src, coord).r;
+  out_color = LOAD(tlut, ivec2(int(r * 255.0), 0));)"sv;
 
 // FromFloat4: f32 texture (R8Unorm) -> 4-bit index -> TLUT -> RGBA8
 static constexpr std::string_view ShaderFromFloat4 = R"(
-@group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;
-@group(0) @binding(2) var tlut: texture_2d<f32>;
+  vec2 texSize = vec2(DIMS(src));
+  ivec2 coord = ivec2(floor(vin.uv * texSize));
+  float r = LOAD(src, coord).r;
+  out_color = LOAD(tlut, ivec2(int(r * 15.0), 0));)"sv;
 
-@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let texSize = vec2f(textureDimensions(src));
-    let coord = vec2i(floor(in.uv * texSize));
-    let r = textureLoad(src, coord, 0).r;
-    return textureLoad(tlut, vec2i(i32(r * 15.0), 0), 0);
-}
-)"sv;
+static gpu::GraphicsPipeline g_directPipeline;
+static gpu::GraphicsPipeline g_fromFloat8Pipeline;
+static gpu::GraphicsPipeline g_fromFloat4Pipeline;
+static gpu::Sampler g_sampler;
 
-struct PipelineInfo {
-  wgpu::RenderPipeline pipeline;
-  wgpu::BindGroupLayout bindGroupLayout;
-};
-
-static PipelineInfo g_directPipeline;
-static PipelineInfo g_fromFloat8Pipeline;
-static PipelineInfo g_fromFloat4Pipeline;
-static wgpu::Sampler g_sampler;
-
-static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, wgpu::TextureSampleType srcSampleType,
-                                    const char* label) {
-  std::string shaderSource;
-  shaderSource.reserve(ShaderPreambleVtx.size() + fragBindingsAndShader.size());
-  shaderSource += ShaderPreambleVtx;
-  shaderSource += fragBindingsAndShader;
-
-  wgpu::ShaderSourceWGSL wgslSource{};
-  wgslSource.code = shaderSource.c_str();
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &wgslSource,
-      .label = label,
+static gpu::GraphicsPipeline create_pipeline(std::string_view fragBody, gpu::shader::TextureKind srcKind,
+                                             const char* label) {
+  const gpu::shader::Interface vs{
+      .stage = SDL_GPU_SHADERSTAGE_VERTEX,
+      .varyings = {{"vec2", "uv"}},
   };
-  auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  const gpu::shader::Interface fs{
+      .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+      .textures = {{"src", srcKind}, {"tlut", gpu::shader::TextureKind::Float}},
+      .varyings = {{"vec2", "uv"}},
+  };
+  const auto vertexLabel = fmt::format("{} vertex", label);
+  const auto fragmentLabel = fmt::format("{} fragment", label);
+  const auto vertex = gpu::shader::create(vs, {}, VertexBody, vertexLabel.c_str());
+  const auto fragment = gpu::shader::create(fs, {}, fragBody, fragmentLabel.c_str());
+  if (!vertex || !fragment) {
+    return nullptr;
+  }
 
-  const std::array bindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler =
-              wgpu::SamplerBindingLayout{
-                  .type = wgpu::SamplerBindingType::NonFiltering,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = srcSampleType,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 2,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-  };
-  const auto bindGroupLayoutLabel = fmt::format("{} Bind Group Layout", label);
-  const wgpu::BindGroupLayoutDescriptor bindGroupLayoutDescriptor{
-      .label = bindGroupLayoutLabel.c_str(),
-      .entryCount = bindGroupLayoutEntries.size(),
-      .entries = bindGroupLayoutEntries.data(),
-  };
-  auto bindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
-
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 1,
-      .bindGroupLayouts = &bindGroupLayout,
-  };
-  auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-
-  constexpr std::array colorTargets{wgpu::ColorTargetState{
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-  }};
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
-  };
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = label,
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
+  const SDL_GPUColorTargetDescription colorTarget{.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM};
+  const SDL_GPUGraphicsPipelineCreateInfo info{
+      .vertex_shader = vertex->handle,
+      .fragment_shader = fragment->handle,
+      .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+      .rasterizer_state =
+          {
+              .fill_mode = SDL_GPU_FILLMODE_FILL,
+              .cull_mode = SDL_GPU_CULLMODE_NONE,
+              .enable_depth_clip = true,
           },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .fragment = &fragmentState,
+      .target_info = {.color_target_descriptions = &colorTarget, .num_color_targets = 1},
   };
-
-  return PipelineInfo{
-      .pipeline = g_device.CreateRenderPipeline(&pipelineDescriptor),
-      .bindGroupLayout = std::move(bindGroupLayout),
-  };
+  return gpu::create_graphics_pipeline(info, label);
 }
 
-static const PipelineInfo& pipeline_for_variant(Variant variant) {
+static const gpu::GraphicsPipeline& pipeline_for_variant(Variant variant) {
   switch (variant) {
   case Variant::Direct:
     return g_directPipeline;
@@ -193,17 +92,20 @@ static const PipelineInfo& pipeline_for_variant(Variant variant) {
 }
 
 void initialize() {
-  g_directPipeline = create_pipeline(ShaderDirect, wgpu::TextureSampleType::Sint, "TexPaletteConv Direct");
+  g_directPipeline = create_pipeline(ShaderDirect, gpu::shader::TextureKind::Int, "TexPaletteConv Direct");
   g_fromFloat8Pipeline =
-      create_pipeline(ShaderFromFloat8, wgpu::TextureSampleType::UnfilterableFloat, "TexPaletteConv FromFloat8");
+      create_pipeline(ShaderFromFloat8, gpu::shader::TextureKind::Float, "TexPaletteConv FromFloat8");
   g_fromFloat4Pipeline =
-      create_pipeline(ShaderFromFloat4, wgpu::TextureSampleType::UnfilterableFloat, "TexPaletteConv FromFloat4");
-  constexpr wgpu::SamplerDescriptor samplerDesc{
-      .label = "TexPaletteConv Sampler",
-      .magFilter = wgpu::FilterMode::Nearest,
-      .minFilter = wgpu::FilterMode::Nearest,
+      create_pipeline(ShaderFromFloat4, gpu::shader::TextureKind::Float, "TexPaletteConv FromFloat4");
+  constexpr SDL_GPUSamplerCreateInfo samplerInfo{
+      .min_filter = SDL_GPU_FILTER_NEAREST,
+      .mag_filter = SDL_GPU_FILTER_NEAREST,
+      .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+      .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+      .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+      .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
   };
-  g_sampler = g_device.CreateSampler(&samplerDesc);
+  g_sampler = gpu::create_sampler(samplerInfo);
 }
 
 void shutdown() {
@@ -213,48 +115,31 @@ void shutdown() {
   g_sampler = {};
 }
 
-void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
-  const auto& [pipeline, bindGroupLayout] = pipeline_for_variant(req.variant);
+void run(gpu::Encoder& enc, const ConvRequest& req) {
+  const auto& pipeline = pipeline_for_variant(req.variant);
+  if (!pipeline || !g_sampler) {
+    return;
+  }
 
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .sampler = g_sampler,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .textureView = req.src->sampleTextureView,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 2,
-          .textureView = req.tlut->sampleTextureView,
-      },
+  const SDL_GPUColorTargetInfo colorTarget{
+      .texture = req.dst->texture->handle,
+      .clear_color = {0.f, 0.f, 0.f, 0.f},
+      .load_op = SDL_GPU_LOADOP_CLEAR,
+      .store_op = SDL_GPU_STOREOP_STORE,
   };
-  const wgpu::BindGroupDescriptor bindGroupDescriptor{
-      .layout = bindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
+  SDL_GPURenderPass* pass = enc.begin_render_pass(&colorTarget, 1, nullptr);
+  if (pass == nullptr) {
+    Log.error("TexPaletteConv: failed to begin render pass: {}", SDL_GetError());
+    return;
+  }
+  SDL_BindGPUGraphicsPipeline(pass, pipeline->handle);
+  const std::array bindings{
+      SDL_GPUTextureSamplerBinding{.texture = req.src->texture->handle, .sampler = g_sampler->handle},
+      SDL_GPUTextureSamplerBinding{.texture = req.tlut->texture->handle, .sampler = g_sampler->handle},
   };
-  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-
-  const std::array colorAttachments{
-      wgpu::RenderPassColorAttachment{
-          .view = req.dst->attachmentTextureView,
-          .loadOp = wgpu::LoadOp::Clear,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 0.0},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = "TexPaletteConv Pass",
-      .colorAttachmentCount = colorAttachments.size(),
-      .colorAttachments = colorAttachments.data(),
-  };
-  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  pass.SetPipeline(pipeline);
-  pass.SetBindGroup(0, bindGroup);
-  pass.Draw(3);
-  pass.End();
+  SDL_BindGPUFragmentSamplers(pass, 0, bindings.data(), bindings.size());
+  SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+  SDL_EndGPURenderPass(pass);
 }
 
 } // namespace aurora::gfx::tex_palette_conv

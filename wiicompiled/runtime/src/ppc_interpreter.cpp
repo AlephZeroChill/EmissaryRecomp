@@ -34,11 +34,21 @@
 #include <vector>
 
 #include "abi_bridge.h"
+#include "guest_code_patch.h"
+#include "guest_float_abi.h"
+#include "hz_perf.h"
 #include "memory.h"
 #include "memory_access.h"
 #include "ppc_runtime.h"
 #include "runtime_log.h"
 #include "system_bridge.h"
+#if MKW_INTERP_PROFILE
+#include <optional>
+
+#include <pthread.h>
+
+#include "save_states.h"
+#endif
 
 namespace PpcInterpreter {
 namespace {
@@ -56,6 +66,105 @@ constexpr uint32_t kRecentBranches = 64;
 thread_local uint32_t t_recentBranches[kRecentBranches];
 thread_local uint32_t t_recentBranchCount = 0;
 thread_local uint32_t t_lastPc = 0;
+// The interpreter frame running the rollback-driven main loop body (BrawlRollback::RunLoop), whose calls
+// BrawlRollback::LoopCall sees (and, during resimulation, may skip or run inline). Only the game thread sets it; other
+// threads' frames never compare equal. Not a thread_local: Call() reads it on every interpreted call, and emulated TLS
+// (Horizon) makes each thread_local access a runtime call.
+std::atomic<const struct Frame*> g_rollbackLoopFrame{nullptr};
+
+#if MKW_INTERP_PROFILE
+// MKW_INTERP_PROFILE=1 builds only (a diagnostic; product builds compile none of this). With BRAWL_INTERP_PROFILE=<prefix>
+// set, every interpreter entry address gets its calls, guest instructions and exclusive host ticks (rdtsc while the
+// interpreter runs it, the translated, native and patched code it calls excluded), and every guest PC its executed
+// instructions. ProfileDump writes them to <prefix>.<n>.<label>.txt and starts the next segment (pad scripts dump at
+// each scene change and at EXIT; BRAWL_INTERP_PROFILE_FRAMES=N also dumps every N frames).
+namespace prof {
+struct Entry {
+    uint64_t calls = 0, instructions = 0, ticks = 0;
+    uint32_t firstCaller = 0;
+};
+constexpr uint32_t kMem1Words = 0x01800000u / 4, kMem2Words = Memory::kMem2Size / 4;  // 0x80000000.., 0x90000000..
+struct Table {
+    std::mutex mutex;  // guards `entries`' structure: inserts here, iteration by the dump
+    std::unordered_map<uint32_t, Entry> entries;
+    std::vector<uint32_t> pcs = std::vector<uint32_t>(kMem1Words + kMem2Words);
+    uint64_t otherInstructions = 0;
+    std::string thread;
+    struct Slot {
+        uint32_t entry = 0;
+        Entry* stat = nullptr;
+    } cache[4096];
+};
+std::mutex g_tablesMutex;
+std::vector<Table*> g_tables;
+const char* Prefix() {
+    static const char* const prefix = std::getenv("BRAWL_INTERP_PROFILE");
+    return prefix;
+}
+thread_local Table* t_table = nullptr;
+thread_local Entry* t_running = nullptr;
+thread_local uint64_t t_since = 0;
+inline uint64_t Ticks() { return __builtin_ia32_rdtsc(); }
+Table* MyTable() {
+    if (t_table == nullptr) {
+        t_table = new Table;
+        char name[32] = "?";
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        t_table->thread = name;
+        std::lock_guard<std::mutex> lock(g_tablesMutex);
+        g_tables.push_back(t_table);
+    }
+    return t_table;
+}
+Entry* Find(Table* t, uint32_t entry, uint32_t caller) {
+    auto& slot = t->cache[(entry >> 2) & 4095];
+    if (slot.stat != nullptr && slot.entry == entry) return slot.stat;
+    std::lock_guard<std::mutex> lock(t->mutex);
+    auto [it, fresh] = t->entries.try_emplace(entry);
+    if (fresh) it->second.firstCaller = caller;
+    slot = {entry, &it->second};
+    return &it->second;
+}
+inline void Switch(Entry* next) {
+    const uint64_t now = Ticks();
+    if (t_running != nullptr) t_running->ticks += now - t_since;
+    t_running = next;
+    t_since = now;
+}
+inline void CountPc(Table* t, uint32_t pc) {
+    const uint32_t mem1 = (pc - 0x80000000u) >> 2, mem2 = (pc - 0x90000000u) >> 2;
+    if (mem1 < kMem1Words) ++t->pcs[mem1];
+    else if (mem2 < kMem2Words) ++t->pcs[kMem1Words + mem2];
+    else ++t->otherInstructions;
+}
+// One interpreter frame: its entry's clock runs while it lives (paused by Pause for the code it calls out to).
+struct Scope {
+    Table* table;
+    Entry* previous;
+    Entry* mine;
+    const uint64_t& executed;
+    Scope(uint32_t entry, uint32_t caller, const uint64_t& count)
+        : table(MyTable()), previous(t_running), mine(Find(table, entry, caller)), executed(count) {
+        ++mine->calls;
+        Switch(mine);
+    }
+    ~Scope() {
+        mine->instructions += executed;
+        Switch(previous);
+    }
+};
+struct Pause {
+    Entry* previous;
+    Pause() : previous(t_running) { Switch(nullptr); }
+    ~Pause() { Switch(previous); }
+};
+uint64_t g_frame = 0, g_segmentStart = 0;
+uint32_t g_dumps = 0;
+}  // namespace prof
+#define MKW_INTERP_PROFILE_PAUSE() prof::Pause interpProfilePause
+#else
+#define MKW_INTERP_PROFILE_PAUSE() ((void)0)
+#endif
 
 // BRAWL_TRACE_PC=<hex>,<hex>...: a debugging aid for mods; the registers whenever interpreted code reaches one of
 // those addresses (the first 20 times each).
@@ -215,12 +324,50 @@ void NormalizeCallFloatReturn(Frame& f) {
     f.form[1] = Form::Scalar;
 }
 
+// The float ABI translated callers assume of a translated callee (guest_float_abi.h); null for anything without an
+// entry (natives, mod overrides, interpreted code), which then gets no conversion, as from a translated caller that
+// knows no ABI for it.
+const MkwGuestFloatAbi* FloatAbiOf(uint32_t target) {
+    const MkwGuestFloatAbi* begin = g_mkwGuestFloatAbi;
+    const MkwGuestFloatAbi* end = begin + g_mkwGuestFloatAbiCount;
+    const MkwGuestFloatAbi* it = std::lower_bound(begin, end, target,
+        [](const MkwGuestFloatAbi& entry, uint32_t address) { return entry.address < address; });
+    return it != end && it->address == target ? it : nullptr;
+}
+
+// Before a call into translated code, as a translated caller does (EmitNormalizeGuestCallFloatArguments): a register the
+// callee reads as a scalar float, held here in paired form, becomes the scalar it stands for. Registers the callee does
+// not read that way keep their paired form (P+ code keeps paired values in volatile FPRs across calls).
+void NormalizeCallFloatArguments(Frame& f, const MkwGuestFloatAbi* abi) {
+    if (abi == nullptr) return;
+    for (uint32_t r = 1; r <= 13; ++r) {
+        if ((abi->scalarFloatArgMask & (1u << r)) != 0 && f.form[r] == Form::Paired) SetScalar(f, r, Scalar(f, r));
+    }
+}
+
+// After it (EmitNormalizeGuestCallFloatReturn): a callee that returns a paired scalar leaves f1 in paired form.
+void NormalizeCalleeFloatReturn(Frame& f, const MkwGuestFloatAbi* abi) {
+    if (abi != nullptr && abi->returnsPairedScalarFloat != 0) f.ctx->fpr[1].d = PPC_PsToScalarInline(f.ctx->fpr[1].d);
+}
+
 // A call (bl, bcl, blrl, bctrl). Translated, native and patched code runs through the function registry; other code
 // (a mod's) returns false and is interpreted right here, as the processor would run it: code that does not return the
 // usual way (bl to read its own address, a hook that branches back) must not leave a host call frame behind.
 bool Call(Frame& f, uint32_t target, uint32_t returnTo) {
     f.ctx->lr = returnTo;
+    const bool loopCall = &f == g_rollbackLoopFrame.load(std::memory_order_relaxed);
+    if (loopCall) {
+        switch (BrawlRollback::LoopCall(f.ctx, target)) {
+        case BrawlRollback::LoopCallAction::Inline: return false;  // interpreted in this frame: its calls come here too
+        case BrawlRollback::LoopCallAction::Skipped: NormalizeCallFloatReturn(f); return true;
+        case BrawlRollback::LoopCallAction::Invoke: break;
+        }
+    }
     if (TranslatedFunctionRegistry::FindByAddressPtr(target) == nullptr && CanRun(target)) return false;
+    const MkwGuestFloatAbi* floatAbi = FloatAbiOf(target);
+    NormalizeCallFloatArguments(f, floatAbi);
+    HZ_EXCLUSIVE_PAUSE();  // translated code's time is not the interpreter's
+    MKW_INTERP_PROFILE_PAUSE();
     if (target == 0x80017618u)
         BrawlRollback::Run(f.ctx, [](CpuContext* ctx) { InvokeIndirectCpu(0x80017618u, ctx); });
     else if (target == 0x8002A210u)
@@ -229,6 +376,8 @@ bool Call(Frame& f, uint32_t target, uint32_t returnTo) {
         InvokeIndirectCpu(target, f.ctx);
         if (target == 0x80029438u) BrawlRollback::AnchorPads();
     }
+    if (loopCall) BrawlRollback::LoopCallDone(target);
+    NormalizeCalleeFloatReturn(f, floatAbi);
     NormalizeCallFloatReturn(f);
     return true;
 }
@@ -239,7 +388,42 @@ bool Call(Frame& f, uint32_t target, uint32_t returnTo) {
 // the function the frame was entered for.
 bool TailCall(Frame& f, uint32_t target, uint32_t returnAddress) {
     const uint32_t back = f.ctx->lr & ~3u;
-    InvokeIndirectCpu(target, f.ctx);
+    const MkwGuestFloatAbi* floatAbi = FloatAbiOf(target);
+    NormalizeCallFloatArguments(f, floatAbi);
+    {
+        HZ_EXCLUSIVE_PAUSE();
+        MKW_INTERP_PROFILE_PAUSE();
+        InvokeIndirectCpu(target, f.ctx);
+    }
+    if (&f == g_rollbackLoopFrame.load(std::memory_order_relaxed)) BrawlRollback::LoopCallDone(target);
+    NormalizeCalleeFloatReturn(f, floatAbi);
+    NormalizeCallFloatReturn(f);
+    f.ctx->lr = back;
+    return back == (returnAddress & ~3u);
+}
+
+// A tail call (b/bctr to a translated function) made in the rollback loop frame, as BrawlRollback::LoopCall decides
+// (Call() does the same for calls): true when handled here, with `next` the pc to continue at (inline: the callee,
+// interpreted in this frame; skipped: the caller's return address, lr). False: make the tail call as usual.
+bool LoopTailCall(Frame& f, uint32_t target, uint32_t& next) {
+    if (&f != g_rollbackLoopFrame.load(std::memory_order_relaxed)) return false;
+    switch (BrawlRollback::LoopCall(f.ctx, target)) {
+    case BrawlRollback::LoopCallAction::Inline: next = target; return true;
+    case BrawlRollback::LoopCallAction::Skipped: NormalizeCallFloatReturn(f); next = f.ctx->lr & ~3u; return true;
+    case BrawlRollback::LoopCallAction::Invoke: return false;
+    }
+    return false;
+}
+
+// TailCall into a code variant entered inside a function (GuestCodePatch::ContinuationAt): a plugin loader's "call the
+// original" stub runs the replaced function's first instruction and branches to the second.
+bool TailCallEntry(Frame& f, void (*entry)(CpuContext*), uint32_t returnAddress) {
+    const uint32_t back = f.ctx->lr & ~3u;
+    {
+        HZ_EXCLUSIVE_PAUSE();
+        MKW_INTERP_PROFILE_PAUSE();
+        entry(f.ctx);
+    }
     NormalizeCallFloatReturn(f);
     f.ctx->lr = back;
     return back == (returnAddress & ~3u);
@@ -267,9 +451,13 @@ bool CanRun(uint32_t address) {
 }
 
 void Run(CpuContext* ctx, uint32_t entry) {
-    // Each entry is logged once; the per-thread set keeps the lock off the path of every later call.
+    HZ_EXCLUSIVE(kHzInterpTicks);
+    // Each entry is logged once; the per-thread set keeps the lock off the path of every later call, and a small
+    // direct-mapped cache of recent entries keeps the set's hashing off it (0.66% of P+'s game thread).
     thread_local std::unordered_set<uint32_t> seen;
-    if (seen.insert(entry).second) {
+    thread_local uint32_t recentEntries[1024];
+    uint32_t& recentEntry = recentEntries[(entry >> 2) & 1023u];
+    if (recentEntry != entry && (recentEntry = entry, seen.insert(entry).second)) {
         static std::mutex logMutex;
         static std::unordered_set<uint32_t> logged;
         std::lock_guard<std::mutex> lock(logMutex);
@@ -288,13 +476,35 @@ void Run(CpuContext* ctx, uint32_t entry) {
     static thread_local unsigned rollbackLoopDepth=0;
     static const bool coreEnabled=BrawlOnlineCore::Enabled();
     static const bool rollbackEnabled=std::getenv("BRAWL_ROLLBACK_INPUT")!=nullptr || std::getenv("BRAWL_ONLINE_IPC")!=nullptr || coreEnabled;
+    // The per-instruction bookkeeping below touches these thread_locals on every guest instruction. Resolve each once
+    // per Run: on targets built with emulated TLS (Horizon), every thread_local access is otherwise a runtime call.
+    unsigned& loopDepth = rollbackLoopDepth;
+    uint32_t* const recentBranches = t_recentBranches;
+    uint32_t& recentBranchCount = t_recentBranchCount;
+    uint32_t& lastPc = t_lastPc;
+    const bool rollbackLoopFrame = loopDepth && entry == 0x800171B4u;  // only on the game thread (loopDepth)
+    struct LoopFrameScope {
+        bool owner;
+        const Frame* saved;
+        ~LoopFrameScope() { if (owner) g_rollbackLoopFrame.store(saved, std::memory_order_relaxed); }
+    } loopFrameScope{rollbackLoopFrame, g_rollbackLoopFrame.load(std::memory_order_relaxed)};
+    if (rollbackLoopFrame) g_rollbackLoopFrame.store(&f, std::memory_order_relaxed);
+#if MKW_INTERP_PROFILE
+    std::optional<prof::Scope> profile;
+    if (prof::Prefix() != nullptr) profile.emplace(entry, returnAddress, executed);
+    prof::Table* const profileTable = profile ? profile->table : nullptr;
+#endif
     for (;;) {
         const uint32_t pc = f.pc;
+#if MKW_INTERP_PROFILE
+        if (profileTable != nullptr) prof::CountPc(profileTable, pc);
+#endif
         if(pc==0x80949BC0u) BrawlOnline::Stage();
         if(pc==0x809435F0u) BrawlRollback::SeedCrossplayStage();
         // Brawl Online's complete main-loop boundary, including pad bookkeeping,
         // render-side game writes and the application frame counter.
-        if(rollbackEnabled && pc==0x800171B4u && !rollbackLoopDepth) {
+        if(rollbackEnabled && pc==0x800171B4u && !loopDepth) {
+            MKW_INTERP_PROFILE_PAUSE();  // the rollback session's own time; each frame's Run below is its own entry
             BrawlRollback::RunLoop(ctx,[](CpuContext* c) {
                 ++rollbackLoopDepth;Run(c,0x800171B4u);--rollbackLoopDepth;
             });
@@ -302,16 +512,16 @@ void Run(CpuContext* ctx, uint32_t entry) {
             continue;
         }
         // Brawl Online's core (Dolphin's Brawlback hooks): the frame end inside the pass.
-        if(coreEnabled && rollbackLoopDepth && pc==0x80017504u) {
+        if(coreEnabled && loopDepth && pc==0x80017504u) {
             for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
             if(BrawlOnlineCore::FrameEnd(ctx)) {f.pc=0x80017508u;continue;}
         }
-        if(rollbackLoopDepth && pc==0x80017508u) {
+        if(loopDepth && pc==0x80017508u) {
             for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
             if(coreEnabled) BrawlOnlineCore::LoopEnd(ctx);
             g_instructions.fetch_add(executed,std::memory_order_relaxed);return;
         }
-        if(rollbackLoopDepth && BrawlRollback::DrivesLoop()) {
+        if(loopDepth && BrawlRollback::DrivesLoop()) {
             if(pc==0x800172D0u) ctx->gpr[20]=1;
             if(pc==0x8001730Cu) {
                 ctx->gpr[20]=1;
@@ -321,8 +531,8 @@ void Run(CpuContext* ctx, uint32_t entry) {
         const uint32_t w = MemoryInline::FlatRead32(pc);
         ctx->pc = pc;
         ++executed;
-        if (pc != t_lastPc + 4) t_recentBranches[t_recentBranchCount++ % kRecentBranches] = pc;
-        t_lastPc = pc;
+        if (pc != lastPc + 4) recentBranches[recentBranchCount++ % kRecentBranches] = pc;
+        lastPc = pc;
         if (!tracePcs.empty() && std::find(tracePcs.begin(), tracePcs.end(), pc) != tracePcs.end()) TracePc(ctx, pc);
         uint32_t next = pc + 4;
         CpuContext* const c = ctx;
@@ -426,7 +636,13 @@ void Run(CpuContext* ctx, uint32_t entry) {
             if (w & 1u) { if (!Call(f, target, pc + 4)) next = target; break; }
             // A branch to another function's start is a tail call (a Gecko hook ending a function with b 0x800018A8).
             if (TranslatedFunctionRegistry::FindByAddressPtr(target) != nullptr) {
+                if (LoopTailCall(f, target, next)) break;
                 if (TailCall(f, target, returnAddress)) { g_instructions.fetch_add(executed, std::memory_order_relaxed); return; }
+                next = c->lr & ~3u;
+                break;
+            }
+            if (const auto continuation = GuestCodePatch::ContinuationAt(target)) {
+                if (TailCallEntry(f, continuation, returnAddress)) { g_instructions.fetch_add(executed, std::memory_order_relaxed); return; }
                 next = c->lr & ~3u;
                 break;
             }
@@ -463,6 +679,7 @@ void Run(CpuContext* ctx, uint32_t entry) {
                     if (w & 1u) { if (!Call(f, target, pc + 4)) next = target; break; }
                     // bctr: a switch-table jump inside this function, or a tail call to another function.
                     if (TranslatedFunctionRegistry::FindByAddressPtr(target) != nullptr) {
+                        if (LoopTailCall(f, target, next)) break;
                         if (TailCall(f, target, returnAddress)) { g_instructions.fetch_add(executed, std::memory_order_relaxed); return; }
                         next = c->lr & ~3u;
                         break;
@@ -765,5 +982,80 @@ void Run(CpuContext* ctx, uint32_t entry) {
         f.pc = next;
     }
 }
+
+#if MKW_INTERP_PROFILE
+// The segment since the last dump, to <prefix>.<n>.<label>.txt: "F frames", "T thread instructions ticks" per thread,
+// "E entry calls instructions ticks translated firstCaller" per entry (translated: the address has a translation, so
+// the interpreter runs it because its code was patched or redirected), "P pc instructions" per guest PC.
+void ProfileDump(const char* label) {
+    const char* prefix = prof::Prefix();
+    if (prefix == nullptr) return;
+    char path[512];
+    std::snprintf(path, sizeof path, "%s.%03u.%s.txt", prefix, prof::g_dumps++, label && *label ? label : "none");
+    FILE* out = std::fopen(path, "w");
+    if (out == nullptr) return;
+    std::fprintf(out, "F %llu\n", static_cast<unsigned long long>(prof::g_frame - prof::g_segmentStart));
+    prof::g_segmentStart = prof::g_frame;
+    std::unordered_map<uint32_t, prof::Entry> merged;
+    std::vector<uint64_t> pcs(prof::kMem1Words + prof::kMem2Words);
+    std::lock_guard<std::mutex> tablesLock(prof::g_tablesMutex);
+    for (prof::Table* t : prof::g_tables) {
+        std::lock_guard<std::mutex> lock(t->mutex);
+        uint64_t instructions = 0, ticks = 0;
+        for (auto& [entry, stat] : t->entries) {
+            auto& m = merged[entry];
+            m.calls += stat.calls;
+            m.instructions += stat.instructions;
+            m.ticks += stat.ticks;
+            if (m.firstCaller == 0) m.firstCaller = stat.firstCaller;
+            instructions += stat.instructions;
+            ticks += stat.ticks;
+            stat.calls = stat.instructions = stat.ticks = 0;
+        }
+        for (size_t i = 0; i < pcs.size(); ++i) {
+            pcs[i] += t->pcs[i];
+            t->pcs[i] = 0;
+        }
+        std::fprintf(out, "T %s %llu %llu other %llu\n", t->thread.c_str(), static_cast<unsigned long long>(instructions),
+                     static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(t->otherInstructions));
+        t->otherInstructions = 0;
+    }
+    for (const auto& [entry, stat] : merged) {
+        if (stat.calls == 0) continue;
+        std::fprintf(out, "E %08X %llu %llu %llu %d %08X\n", entry, static_cast<unsigned long long>(stat.calls),
+                     static_cast<unsigned long long>(stat.instructions), static_cast<unsigned long long>(stat.ticks),
+                     TranslatedFunctionRegistry::FindByAddressPtr(entry) != nullptr ? 1 : 0, stat.firstCaller);
+    }
+    for (size_t i = 0; i < pcs.size(); ++i) {
+        if (pcs[i] == 0) continue;
+        const uint32_t pc = i < prof::kMem1Words ? 0x80000000u + static_cast<uint32_t>(i) * 4
+                                                 : 0x90000000u + static_cast<uint32_t>(i - prof::kMem1Words) * 4;
+        std::fprintf(out, "P %08X %llu\n", pc, static_cast<unsigned long long>(pcs[i]));
+    }
+    std::fclose(out);
+}
+
+// Once per presented frame (GuestCodePatch::SyncFrame): a segment ends at each scene change, labelled with the scene
+// it covered, and every BRAWL_INTERP_PROFILE_FRAMES frames.
+void ProfileFrame() {
+    if (prof::Prefix() == nullptr) return;
+    ++prof::g_frame;
+    static const uint64_t every = [] {
+        const char* text = std::getenv("BRAWL_INTERP_PROFILE_FRAMES");
+        return text ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::string scene;
+    std::string now = SaveStates::SceneName();
+    if (now != scene) {
+        ProfileDump(scene.c_str());
+        scene = std::move(now);
+    } else if (every != 0 && prof::g_frame - prof::g_segmentStart >= every) {
+        ProfileDump(scene.c_str());
+    }
+}
+#else
+void ProfileDump(const char*) {}
+void ProfileFrame() {}
+#endif
 
 }  // namespace PpcInterpreter

@@ -118,6 +118,230 @@ static void UpdateDeviceIdentity(SDL_HIDAPI_Device *device)
 
     now = SDL_GetTicks();
 ]==])
+
+  # Horizon (libnx homebrew): newlib's pthreads and POSIX clocks. Every other subsystem falls
+  # back to SDL's dummy driver; the runtime polls libnx's pads into a virtual gamepad itself.
+  _aurora_sdl3_replace("${sdl_source_dir}/CMakeLists.txt" "Horizon platform"
+[==[elseif(N3DS)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/main/n3ds/*.c")
+]==]
+[==[elseif(NINTENDO_SWITCH)
+  set(SDL_THREAD_PTHREAD 1)
+  set(SDL_THREAD_PTHREAD_RECURSIVE_MUTEX 1)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/thread/pthread/*.c")
+  set(HAVE_SDL_THREADS TRUE)
+  set(SDL_TIMER_UNIX 1)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/timer/unix/*.c")
+  set(HAVE_SDL_TIMERS TRUE)
+  set(SDL_TIME_UNIX 1)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/time/unix/*.c")
+  set(HAVE_SDL_TIME TRUE)
+  set(SDL_FSOPS_POSIX 1)
+  sdl_sources("${SDL3_SOURCE_DIR}/src/filesystem/posix/SDL_sysfsops.c")
+  set(HAVE_SDL_FSOPS TRUE)
+  # Vulkan through the dummy video driver (src/video/dummy/SDL_horizonvulkan.c), which also builds SDL_GPU's Vulkan backend.
+  set(SDL_VIDEO_VULKAN 1)
+  set(HAVE_VULKAN TRUE)
+  sdl_sources("${SDL3_SOURCE_DIR}/src/video/dummy/SDL_horizonvulkan.c")
+elseif(N3DS)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/main/n3ds/*.c")
+]==])
+  _aurora_sdl3_replace("${sdl_source_dir}/src/dynapi/SDL_dynapi.h" "Horizon: no dynamic API"
+[==[#elif defined(SDL_PLATFORM_3DS)
+#define SDL_DYNAMIC_API 0 // devkitARM doesn't support dynamic linking
+]==]
+[==[#elif defined(SDL_PLATFORM_3DS)
+#define SDL_DYNAMIC_API 0 // devkitARM doesn't support dynamic linking
+#elif defined(__SWITCH__)
+#define SDL_DYNAMIC_API 0 // devkitA64 doesn't support dynamic linking
+]==])
+  # newlib's struct tm has no tm_gmtoff; Horizon's libc runs in UTC.
+  _aurora_sdl3_replace("${sdl_source_dir}/src/time/unix/SDL_systime.c" "Horizon: no tm_gmtoff"
+[==[#if (_POSIX_VERSION >= 202405L) || (!defined(sun) && !defined(__sun))
+        dt->utc_offset = (int)tm->tm_gmtoff;]==]
+[==[#if defined(__SWITCH__)
+        dt->utc_offset = 0;
+#elif (_POSIX_VERSION >= 202405L) || (!defined(sun) && !defined(__sun))
+        dt->utc_offset = (int)tm->tm_gmtoff;]==])
+  # Horizon: Vulkan for the dummy video driver, from cmake/sdl-horizon.
+  file(COPY_FILE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/sdl-horizon/SDL_horizonvulkan.c"
+       "${sdl_source_dir}/src/video/dummy/SDL_horizonvulkan.c" ONLY_IF_DIFFERENT)
+  _aurora_sdl3_replace("${sdl_source_dir}/src/video/dummy/SDL_nullvideo.c" "Horizon: Vulkan on the dummy driver"
+[==[    device->free = DUMMY_DeleteDevice;
+]==]
+[==[    device->free = DUMMY_DeleteDevice;
+#if defined(__SWITCH__) && defined(SDL_VIDEO_VULKAN)
+    {
+        extern void HORIZON_SetupVulkan(SDL_VideoDevice *device);  // SDL_horizonvulkan.c
+        HORIZON_SetupVulkan(device);
+    }
+#endif
+]==])
+  # Horizon: the dummy display is the VI layer, not a fake 1024x768 desktop. With the fake mode the window ends up
+  # 1024x768 and the compositor stretches that 4:3 swapchain onto the 16:9 screen.
+  _aurora_sdl3_replace("${sdl_source_dir}/src/video/dummy/SDL_nullvideo.c" "Horizon: display mode is the VI layer"
+[==[    mode.w = 1024;
+    mode.h = 768;
+]==]
+[==[    mode.w = 1024;
+    mode.h = 768;
+#if defined(__SWITCH__)
+    {
+        extern void HORIZON_DisplaySize(int *w, int *h);  // SDL_horizonvulkan.c
+        HORIZON_DisplaySize(&mode.w, &mode.h);
+    }
+#endif
+]==])
+  # SDL_GPU skips Vulkan drivers that report no conformance version; on Horizon the one driver, Mesa NVK,
+  # reports none, so that would leave no device at all.
+  _aurora_sdl3_replace("${sdl_source_dir}/src/gpu/vulkan/SDL_gpu_vulkan.c" "Horizon: accept NVK"
+[==[    if (!isConformant) {
+        return 0;
+    }
+]==]
+[==[#if !defined(__SWITCH__)
+    if (!isConformant) {
+        return 0;
+    }
+#else
+    (void)isConformant;
+#endif
+]==])
+  # The dummy filesystem's fallback would collide with the POSIX file operations' getcwd one.
+  _aurora_sdl3_replace("${sdl_source_dir}/src/filesystem/dummy/SDL_sysfilesystem.c" "Horizon: POSIX current directory"
+[==[char *SDL_SYS_GetCurrentDirectory(void)
+{
+    const char *base = SDL_GetBasePath();
+    if (!base) {
+        return NULL;
+    }
+
+    return SDL_strdup(base);
+}
+]==]
+[==[#ifndef SDL_FSOPS_POSIX
+char *SDL_SYS_GetCurrentDirectory(void)
+{
+    const char *base = SDL_GetBasePath();
+    if (!base) {
+        return NULL;
+    }
+
+    return SDL_strdup(base);
+}
+#endif
+]==])
+  # libnx's pthreads have no scheduling policies (newlib declares the functions; nothing defines them).
+  _aurora_sdl3_replace("${sdl_source_dir}/src/thread/pthread/SDL_systhread.c" "Horizon: no pthread scheduling"
+[==[bool SDL_SYS_SetThreadPriority(SDL_ThreadPriority priority)
+{
+#ifdef SDL_PLATFORM_RISCOS]==]
+[==[bool SDL_SYS_SetThreadPriority(SDL_ThreadPriority priority)
+{
+#if defined(SDL_PLATFORM_RISCOS) || defined(__SWITCH__)]==])
+
+  # Vulkan: no memory defragmentation while another thread records a command buffer.
+  #
+  # VULKAN_Submit defragments: it moves buffers and textures to new memory and re-points their containers, uniform
+  # buffers included (uniformBufferForDefrag->buffer). It only skips allocations with pending transfers; render-pass
+  # use pins nothing (VULKAN_INTERNAL_TrackBuffer counts the buffer, not its allocation). Aurora's presenter submits
+  # (and so defragments) while its frame worker records the next frame on another command buffer, so the frame
+  # worker can push uniforms or bind through a pointer that is being replaced (ThreadSanitizer: DefragmentMemory on
+  # the presenter against PushUniformData, BindIndexBuffer, BindGraphicsDescriptorSets, FetchFramebuffer on the frame
+  # worker). x86 sees the new buffer's fields before its pointer; ARM need not, which fits crashes seen only on the
+  # Switch and on Apple-silicon Ryujinx (NULL in VULKAN_INTERNAL_AcquireUniformBufferFromPool). Count the command
+  # buffers being recorded, gate new ones, and defragment only while the submitting one is the only one, from any
+  # submit rather than only swapchain submits (those overlap recording most of the time, and allocations marked for
+  # defrag stay out of service until it runs).
+  set(_vk "${sdl_source_dir}/src/gpu/vulkan/SDL_gpu_vulkan.c")
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (renderer fields)"
+[==[    // We don't want transfer commands to block each other,
+    // but we want all transfers to block during defrag.
+    SDL_RWLock *defragLock;
+]==]
+[==[    // We don't want transfer commands to block each other,
+    // but we want all transfers to block during defrag.
+    SDL_RWLock *defragLock;
+
+    // WiiCompiled: command buffers acquired and not yet submitted or cancelled, and the gate VULKAN_Submit holds
+    // while it defragments so that none starts meanwhile (see its defragmentation).
+    SDL_Mutex *defragGate;
+    SDL_AtomicInt recordingCommandBuffers;
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (create)"
+[==[    renderer->acquireCommandBufferLock = SDL_CreateMutex();
+]==]
+[==[    renderer->acquireCommandBufferLock = SDL_CreateMutex();
+    renderer->defragGate = SDL_CreateMutex();
+    SDL_SetAtomicInt(&renderer->recordingCommandBuffers, 0);
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (destroy)"
+[==[    SDL_DestroyMutex(renderer->acquireCommandBufferLock);
+]==]
+[==[    SDL_DestroyMutex(renderer->acquireCommandBufferLock);
+    SDL_DestroyMutex(renderer->defragGate);
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (acquire)"
+[==[    SDL_UnlockMutex(renderer->acquireCommandBufferLock);
+
+    commandBuffer->descriptorSetCache = descriptorSetCache;
+]==]
+[==[    SDL_UnlockMutex(renderer->acquireCommandBufferLock);
+
+    // WiiCompiled: recording from here until submitted or cancelled; never starts while a submit defragments.
+    SDL_LockMutex(renderer->defragGate);
+    (void)SDL_AtomicIncRef(&renderer->recordingCommandBuffers);
+    SDL_UnlockMutex(renderer->defragGate);
+
+    commandBuffer->descriptorSetCache = descriptorSetCache;
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (submitted)"
+[==[static void VULKAN_INTERNAL_ReleaseCommandBuffer(VulkanCommandBuffer *vulkanCommandBuffer)
+{
+    VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
+]==]
+[==[static void VULKAN_INTERNAL_ReleaseCommandBuffer(VulkanCommandBuffer *vulkanCommandBuffer)
+{
+    VulkanRenderer *renderer = vulkanCommandBuffer->renderer;
+
+    (void)SDL_AtomicDecRef(&renderer->recordingCommandBuffers);  // WiiCompiled: submitted, no longer recording
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (cancelled)"
+[==[    vulkanCommandBuffer->autoReleaseFence = false;
+    SDL_LockMutex(renderer->submitLock);
+    VULKAN_INTERNAL_CleanCommandBuffer(renderer, vulkanCommandBuffer, true);
+    SDL_UnlockMutex(renderer->submitLock);
+]==]
+[==[    vulkanCommandBuffer->autoReleaseFence = false;
+    SDL_LockMutex(renderer->submitLock);
+    VULKAN_INTERNAL_CleanCommandBuffer(renderer, vulkanCommandBuffer, true);
+    SDL_UnlockMutex(renderer->submitLock);
+    (void)SDL_AtomicDecRef(&renderer->recordingCommandBuffers);  // WiiCompiled: cancelled, no longer recording
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan defrag gate (defragment alone)"
+[==[    if (performCleanups &&
+        renderer->allocationsToDefragCount > 0 &&
+        !renderer->defragInProgress) {
+        if (!VULKAN_INTERNAL_DefragmentMemory(renderer, vulkanCommandBuffer))
+        {
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "%s", "Failed to defragment memory, likely OOM!");
+        }
+    }
+]==]
+[==[    // WiiCompiled: only while this is the one command buffer being recorded, with the gate held so none starts
+    // meanwhile (defragmentation re-points buffers another thread's recording may be using), and from any submit.
+    if (renderer->allocationsToDefragCount > 0 &&
+        !renderer->defragInProgress) {
+        SDL_LockMutex(renderer->defragGate);
+        if (SDL_GetAtomicInt(&renderer->recordingCommandBuffers) <= 1) {
+            if (!VULKAN_INTERNAL_DefragmentMemory(renderer, vulkanCommandBuffer))
+            {
+                SDL_LogError(SDL_LOG_CATEGORY_GPU, "%s", "Failed to defragment memory, likely OOM!");
+            }
+        }
+        SDL_UnlockMutex(renderer->defragGate);
+    }
+]==])
 endfunction()
 
 # Script mode (FetchContent PATCH_COMMAND).

@@ -16,7 +16,6 @@ Set-StrictMode -Version 3.0
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $auroraCMake = Join-Path $repoRoot 'aurora-main\CMakeLists.txt'
 $auroraExtern = Join-Path $repoRoot 'aurora-main\extern\CMakeLists.txt'
-$auroraDawn = Join-Path $repoRoot 'aurora-main\cmake\AuroraDawnProvider.cmake'
 $auroraLibUsb = Join-Path $repoRoot 'aurora-main\cmake\AuroraLibUSB.cmake'
 $auroraSdl = Join-Path $repoRoot 'aurora-main\cmake\AuroraSDL3Provider.cmake'
 
@@ -34,12 +33,6 @@ $packages = @(
         Name = 'abseil-cpp'; File = 'abseil-cpp-20240722.0.tar.gz'
         Uris = @('https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz')
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz' })
-    },
-    [pscustomobject]@{
-        Name = 'dawn_prebuilt'; File = 'dawn-v20260603.191052-windows-amd64.tar.gz'
-        Uris = @('https://github.com/theofficialgman/dawn-build/releases/download/v20260603.191052/dawn-windows-amd64.tar.gz')
-        Pins = @(@{ File = $auroraCMake; Text = 'set(AURORA_DAWN_VERSION "v20260603.191052"' },
-                 @{ File = $auroraDawn; Text = 'SHA256=13be9cff8b9b179c42dcd16aeabb6effcc8f0dfdcc14463eda2a5caeda225142' })
     },
     [pscustomobject]@{
         Name = 'fmt'; File = 'fmt-11.1.4.tar.gz'
@@ -70,11 +63,6 @@ $packages = @(
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz' })
     },
     [pscustomobject]@{
-        Name = 'sqlite3'; File = 'sqlite-amalgamation-3510300.zip'
-        Uris = @('https://sqlite.org/2026/sqlite-amalgamation-3510300.zip')
-        Pins = @(@{ File = $auroraExtern; Text = 'https://sqlite.org/2026/sqlite-amalgamation-3510300.zip' })
-    },
-    [pscustomobject]@{
         Name = 'xxhash'; File = 'xxHash-0.8.4.tar.gz'
         Uris = @('https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.4.tar.gz')
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.4.tar.gz' })
@@ -83,11 +71,6 @@ $packages = @(
         Name = 'zlib'; File = 'zlib-1.3.2.tar.gz'
         Uris = @('https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz')
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz' })
-    },
-    [pscustomobject]@{
-        Name = 'zstd'; File = 'zstd-1.5.7.tar.gz'
-        Uris = @('https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz')
-        Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz' })
     }
 )
 
@@ -138,13 +121,12 @@ function Get-Archive($Package) {
 }
 
 function Expand-Package([string]$Archive, [string]$Target) {
-    # Release archives wrap everything in one versioned directory (for example SDL3-3.4.4/) while
-    # dawn-build's package is flat; either way the tree lands directly under the target.
+    # Release archives wrap everything in one versioned directory (for example SDL3-3.4.4/); the tree
+    # lands directly under the target.
     $extract = Join-Path (Split-Path -Parent $Target) ('.extract-' + (Split-Path -Leaf $Target))
     if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
     [IO.Directory]::CreateDirectory($extract) | Out-Null
-    # Symbolic links need a privilege Windows tar usually lacks; the only ones in these archives
-    # are zstd test aliases, and none are build inputs.
+    # Symbolic links need a privilege Windows tar usually lacks; none in these archives are build inputs.
     $listing = & $tar -tvf $Archive
     if ($LASTEXITCODE -ne 0) { throw "Listing $Archive failed with exit code $LASTEXITCODE." }
     $excludes = @($listing | ForEach-Object { if ($_ -match '^l.*\s(\S+)\s->\s') { '--exclude=' + $Matches[1] } })

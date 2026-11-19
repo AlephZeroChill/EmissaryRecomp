@@ -71,7 +71,9 @@ constexpr u32 MaxPostexMtx = MaxPnMtx + MaxTexMtx;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
 
-extern wgpu::BindGroup g_emptyTextureBindGroup;
+// Bindings with every slot holding the empty texture, for passes before the first GX draw. Lives outside
+// the binding cache, which clear_caches() empties.
+extern const gfx::TextureBindings* g_emptyTextureBindings;
 
 template <typename Arg, Arg Default>
 struct TevPass {
@@ -361,6 +363,7 @@ struct GXState {
   std::array<TcgConfig, MaxTexCoord> tcgs;
   std::array<TexCoordScale, MaxTexCoord> texCoordScales;
   u16 lastVtxSize = 0;
+  u16 lastVtxMatrixPrefix = 0;  // bytes of matrix-index attributes ahead of POS in lastVtxFmt's vertices
   GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
   std::array<GXAttrType, MaxVtxAttr> vtxDesc;
   std::array<GXAttrType, MaxVtxAttr> sourceVtxDesc;
@@ -421,12 +424,14 @@ struct GXState {
   absl::flat_hash_map<const void*, CopyTextureRef> copyTextures;
   absl::flat_hash_map<CopyTextureKey, CopyTextureRef> copyTextureCache;
   gfx::TextureHandle displayCopyTexture;
-  wgpu::BindGroup displayCopyBindGroup;
   u32 displayCopyWidth = 0;
   u32 displayCopyHeight = 0;
+  // A display copy that keeps the image already in displayCopyTexture resolves here (aurora_gx_keep_display_copy_once).
+  gfx::TextureHandle displayCopyDiscard;
   bool depthCompare = true;
   // GX coplanar ("zfreeze", genMode bit 19): while set, primitives take their depth from the plane of the last
   // triangle drawn with it clear. zFreezePlane = z = x*A + y*B + C in the game's (unwidened) NDC, w = valid.
+  // Draws only capture the plane's inputs; call resolve_zfreeze_plane() before reading zFreezePlane.
   bool zFreeze = false;
   Vec4<float> zFreezePlane{0.f, 0.f, 0.f, 0.f};
   bool depthUpdate = true;
@@ -463,6 +468,8 @@ struct GXState {
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };
 extern GXState g_gxState;
+// Brings g_gxState.zFreezePlane up to date with the draws captured since the last call (command_processor.cpp).
+void resolve_zfreeze_plane() noexcept;
 struct ShaderInfo;
 struct MappedRenderState {
   gfx::Viewport viewport{};
@@ -730,9 +737,9 @@ inline int tev_z_texture_stage(const ShaderConfig& config) noexcept {
 struct PipelineConfig;
 
 struct GXBindGroups {
-  gfx::BindGroupRef textureBindGroup;
-  // Bind group resolved at draw-build time so that gx::render does not have to hash-map the ref again for every draw.
-  WGPUBindGroup resolvedTextureBindGroup = nullptr;
+  gfx::TextureBindingsRef textureBindGroup;
+  // Resolved at draw-build time so that gx::render does not have to hash-map the ref again for every draw.
+  const gfx::TextureBindings* resolvedTextureBindGroup = nullptr;
 };
 // Which matrix-memory slots a generated shader can actually read, and where each one lives in the compacted uniform arrays.
 struct UniformMatrixLayout {
@@ -779,9 +786,16 @@ struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept;
-wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;
+// A GX shader pair. Both stages read the uniform block `ubuf` (slot 0); the vertex stage pulls vertices from
+// the storage buffers vbuf (slot 0) and abuf (slot 1); the fragment stage declares tex0..tex7 at sampler
+// slots 0..7 whether or not it samples them, so every draw binds all MaxTextures slots.
+struct GXShaders {
+  gpu::Shader vertex;
+  gpu::Shader fragment;
+  explicit operator bool() const noexcept { return vertex && fragment; }
+};
+gpu::GraphicsPipeline build_pipeline(const PipelineConfig& config, const GXShaders& shaders, const char* label) noexcept;
+GXShaders build_shader(const ShaderConfig& config) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 void notify_copy_texture_created() noexcept;
 

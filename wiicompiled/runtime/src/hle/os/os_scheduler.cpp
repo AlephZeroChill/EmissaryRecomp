@@ -17,16 +17,17 @@
 namespace {
 void LinkMutexToThread(uint32_t threadPtr, uint32_t mutexPtr)
 {
-    const uint32_t tail = ::Memory::Read32(threadPtr + kThreadMutexTailOffset);
+    // Inline accessors, as UnlinkGuestListNode (os_internal.h).
+    const uint32_t tail = MemoryInline::FlatRead32(threadPtr + kThreadMutexTailOffset);
     if (tail == 0) {
-        ::Memory::Write32(threadPtr + kThreadMutexQueueOffset, mutexPtr);
+        MemoryInline::FlatWrite32(threadPtr + kThreadMutexQueueOffset, mutexPtr);
     } else {
-        ::Memory::Write32(tail + kMutexThreadNextOffset, mutexPtr);
+        MemoryInline::FlatWrite32(tail + kMutexThreadNextOffset, mutexPtr);
     }
 
-    ::Memory::Write32(mutexPtr + kMutexThreadPrevOffset, tail);
-    ::Memory::Write32(mutexPtr + kMutexThreadNextOffset, 0);
-    ::Memory::Write32(threadPtr + kThreadMutexTailOffset, mutexPtr);
+    MemoryInline::FlatWrite32(mutexPtr + kMutexThreadPrevOffset, tail);
+    MemoryInline::FlatWrite32(mutexPtr + kMutexThreadNextOffset, 0);
+    MemoryInline::FlatWrite32(threadPtr + kThreadMutexTailOffset, mutexPtr);
 }
 
 void UnlinkMutexFromThread(uint32_t threadPtr, uint32_t mutexPtr)
@@ -514,25 +515,27 @@ extern "C" void OSLockMutex_HLE(CpuContext* ctx)
     const int32_t irqState = OS__DisableInterrupts_HLE();
 
     try {
-        const uint32_t currentThread = ::Memory::Read32(kOSRunningContextAddr);
+        // The uncontended paths (nearly every call) use the inline accessors translated code uses, the same accesses
+        // the guest's own OSLockMutex makes; the out-of-line Memory::Read32/Write32 cost a call each.
+        const uint32_t currentThread = MemoryInline::FlatRead32(kOSRunningContextAddr);
         if (currentThread == 0) {
             OS__RestoreInterrupts_HLE(irqState);
             return;
         }
 
         while (true) {
-            const uint32_t ownerThread = ::Memory::Read32(mutexPtr + kMutexOwnerOffset);
+            const uint32_t ownerThread = MemoryInline::FlatRead32(mutexPtr + kMutexOwnerOffset);
             if (ownerThread == 0) {
-                ::Memory::Write32(mutexPtr + kMutexOwnerOffset, currentThread);
-                const uint32_t count = ::Memory::Read32(mutexPtr + kMutexCountOffset);
-                ::Memory::Write32(mutexPtr + kMutexCountOffset, count + 1u);
+                MemoryInline::FlatWrite32(mutexPtr + kMutexOwnerOffset, currentThread);
+                const uint32_t count = MemoryInline::FlatRead32(mutexPtr + kMutexCountOffset);
+                MemoryInline::FlatWrite32(mutexPtr + kMutexCountOffset, count + 1u);
                 LinkMutexToThread(currentThread, mutexPtr);
                 break;
             }
 
             if (ownerThread == currentThread) {
-                const uint32_t count = ::Memory::Read32(mutexPtr + kMutexCountOffset);
-                ::Memory::Write32(mutexPtr + kMutexCountOffset, count + 1u);
+                const uint32_t count = MemoryInline::FlatRead32(mutexPtr + kMutexCountOffset);
+                MemoryInline::FlatWrite32(mutexPtr + kMutexCountOffset, count + 1u);
                 break;
             }
 
@@ -564,15 +567,16 @@ extern "C" void OSUnlockMutex_HLE(CpuContext* ctx)
     const int32_t irqState = OS__DisableInterrupts_HLE();
 
     try {
-        const uint32_t currentThread = ::Memory::Read32(kOSRunningContextAddr);
+        // As in OSLockMutex_HLE: inline accessors on the common path.
+        const uint32_t currentThread = MemoryInline::FlatRead32(kOSRunningContextAddr);
         if (currentThread == 0) {
             OS__RestoreInterrupts_HLE(irqState);
             return;
         }
 
-        if (::Memory::Read32(mutexPtr + kMutexOwnerOffset) == currentThread) {
-            const uint32_t count = ::Memory::Read32(mutexPtr + kMutexCountOffset) - 1u;
-            ::Memory::Write32(mutexPtr + kMutexCountOffset, count);
+        if (MemoryInline::FlatRead32(mutexPtr + kMutexOwnerOffset) == currentThread) {
+            const uint32_t count = MemoryInline::FlatRead32(mutexPtr + kMutexCountOffset) - 1u;
+            MemoryInline::FlatWrite32(mutexPtr + kMutexCountOffset, count);
             if (count == 0) {
                 UnlinkMutexFromThread(currentThread, mutexPtr);
                 ::Memory::Write32(mutexPtr + kMutexOwnerOffset, 0);
@@ -588,7 +592,13 @@ extern "C" void OSUnlockMutex_HLE(CpuContext* ctx)
                 }
 
                 cpu->gpr[3] = mutexPtr;
-                OSWakeupThread_HLE(cpu);
+                // OSWakeupThread_HLE on an empty wait queue changes nothing: it reads the head (0), wakes no thread
+                // so never reschedules, and its nested disable/restore leaves the interrupt flag and the current
+                // context's mode bit as they are (interrupts are already off here; both write only on a change).
+                // Nearly every unlock has no waiter, so the call is skipped then (~600 a frame).
+                if (MemoryInline::FlatRead32(mutexPtr + kMutexWaitQueueHeadOffset) != 0) {
+                    OSWakeupThread_HLE(cpu);
+                }
             }
         }
     } catch (const ::Memory::AccessViolation& e) {

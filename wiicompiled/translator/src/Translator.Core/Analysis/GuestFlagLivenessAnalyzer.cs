@@ -203,7 +203,7 @@ public static class GuestFlagLivenessAnalyzer
         // Non-address targets are either runtime helpers with a cataloged
         // effect, or guest symbols the emitter calls directly. The catalog
         // classifies anything it does not recognize as a complete boundary.
-        var effect = GuestHelperEffectCatalog.Analyze(call);
+        var effect = GuestEabi.HelperEffect(call);
         var readsCarry = effect.ReadsXer && !CarryProducingHelpers.Contains(call.Target);
         var result = new GuestFlagState(effect.CrReadMask, readsCarry);
         foreach (var argument in call.Arguments)

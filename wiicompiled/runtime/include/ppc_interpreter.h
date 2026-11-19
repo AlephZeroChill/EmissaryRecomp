@@ -16,5 +16,9 @@ void DumpRecentBranches();
 // Runs the guest function at entry until it returns to ctx->lr as it was on entry.
 void Run(CpuContext* ctx, uint32_t entry);
 uint64_t InstructionCount();
+// MKW_INTERP_PROFILE=1 builds with BRAWL_INTERP_PROFILE=<prefix> (a diagnostic; empty otherwise): write the per-entry
+// and per-PC interpreter profile of the segment since the last dump to <prefix>.<n>.<label>.txt, and count a frame.
+void ProfileDump(const char* label);
+void ProfileFrame();
 
 }  // namespace PpcInterpreter

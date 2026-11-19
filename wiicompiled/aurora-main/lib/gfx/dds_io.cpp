@@ -8,7 +8,7 @@
 
 namespace aurora::gfx::dds {
 struct ParsedDDSLayout {
-  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  SDL_GPUTextureFormat format = SDL_GPU_TEXTUREFORMAT_INVALID;
   size_t dataOffset = 0;
 };
 
@@ -107,20 +107,20 @@ bool validate_dds_header(const DDSHeader& header) noexcept {
   return true;
 }
 
-std::optional<wgpu::TextureFormat> resolve_dx10_format(uint32_t dxgiFormat) noexcept {
+std::optional<SDL_GPUTextureFormat> resolve_dx10_format(uint32_t dxgiFormat) noexcept {
   switch (dxgiFormat) {
   case 28:
-    return wgpu::TextureFormat::RGBA8Unorm;
+    return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
   case 87:
-    return wgpu::TextureFormat::BGRA8Unorm;
+    return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
   case 71:
-    return wgpu::TextureFormat::BC1RGBAUnorm;
+    return SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
   case 77:
-    return wgpu::TextureFormat::BC3RGBAUnorm;
+    return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
   case 83:
-    return wgpu::TextureFormat::BC5RGUnorm;
+    return SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM;
   case 98:
-    return wgpu::TextureFormat::BC7RGBAUnorm;
+    return SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM;
   default:
     return std::nullopt;
   }
@@ -132,13 +132,13 @@ std::optional<ParsedDDSLayout> resolve_dds_layout(ArrayRef<uint8_t> bytes, const
   if ((header.ddspf.flags & 0x00000004) != 0) { // DDS has FourCC
     switch (header.ddspf.fourCC) {
     case 0x31545844:
-      out.format = wgpu::TextureFormat::BC1RGBAUnorm;
+      out.format = SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
       return out;
     case 0x35545844:
-      out.format = wgpu::TextureFormat::BC3RGBAUnorm;
+      out.format = SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
       return out;
     case 0x32495441:
-      out.format = wgpu::TextureFormat::BC5RGUnorm;
+      out.format = SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM;
       return out;
     case 0x30315844: {
       if (bytes.size() < out.dataOffset + sizeof(DDSHeaderDX10)) {
@@ -164,12 +164,12 @@ std::optional<ParsedDDSLayout> resolve_dds_layout(ArrayRef<uint8_t> bytes, const
   if ((header.ddspf.flags & 0x00000040) != 0 && header.ddspf.rgbBitCount == 32) {
     if (header.ddspf.rBitMask == 0x000000FF && header.ddspf.gBitMask == 0x0000FF00 &&
         header.ddspf.bBitMask == 0x00FF0000 && header.ddspf.aBitMask == 0xFF000000) {
-      out.format = wgpu::TextureFormat::RGBA8Unorm;
+      out.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
       return out;
     }
     if (header.ddspf.rBitMask == 0x00FF0000 && header.ddspf.gBitMask == 0x0000FF00 &&
         header.ddspf.bBitMask == 0x000000FF && header.ddspf.aBitMask == 0xFF000000) {
-      out.format = wgpu::TextureFormat::BGRA8Unorm;
+      out.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
       return out;
     }
   }

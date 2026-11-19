@@ -8,12 +8,20 @@
 #include <dolphin/gx/GXAurora.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <map>
 #include <mutex>
 #include <vector>
+#include "hz_perf.h"
+
+extern "C" void aurora_gx_order_point();  // aurora.cpp: drain GX work in order without waiting for the GX thread
+// GXFrameBuffer.cpp: the next GXCopyDisp clears the EFB but keeps the image already in the display copy.
+extern "C" void aurora_gx_keep_display_copy_once();
 
 namespace {
 // Copy destinations stay GPU-only until an explicit/lazy readback. Track the
@@ -24,17 +32,55 @@ namespace {
 std::mutex g_efbCopyDestinationsMutex;
 std::map<uint32_t, uint32_t> g_efbCopyDestinations;
 uint32_t g_largestEfbCopyDestination = 0;
+// The 4 KB pages that hold a destination, a bit per page (canonical address >> 12, modulo 128K pages: an alias only
+// costs a locked check), so the range checks below take the lock only for ranges touching such a page. Data-cache ops
+// and DMA writes (locked-cache stores in nw4r g3d's matrix work) run thousands of times a frame and copy destinations
+// are a handful of textures: ~1% of the game thread in P+ online play went to this lock. Written under the lock: set
+// when a destination is added (the game thread, GX__CopyTex_HLE), recomputed when destinations are retired, each word
+// stored once with its final bits, so a reader sees a superset of the destinations' pages until they are retired; after
+// an addition only another thread's concurrent check can miss it, which with the lock was a matter of timing as well.
+constexpr uint32_t kEfbCopyPageBits = 1u << 17;
+std::array<std::atomic<uint64_t>, kEfbCopyPageBits / 64> g_efbCopyPages{};
+
+void MarkEfbCopyPages(std::array<uint64_t, kEfbCopyPageBits / 64>& words, uint64_t start, uint64_t size) {
+    const uint64_t first = start >> 12, last = (start + size - 1) >> 12;
+    for (uint64_t page = first; page <= last && page - first < kEfbCopyPageBits; ++page) {
+        const uint32_t bit = static_cast<uint32_t>(page) & (kEfbCopyPageBits - 1);
+        words[bit >> 6] |= 1ull << (bit & 63);
+    }
+}
+
+bool TouchesEfbCopyPage(uint64_t start, uint64_t end) {
+    const uint64_t first = start >> 12, last = (end - 1) >> 12;
+    if (last - first >= kEfbCopyPageBits) {
+        return true;
+    }
+    for (uint64_t page = first; page <= last; ++page) {
+        const uint32_t bit = static_cast<uint32_t>(page) & (kEfbCopyPageBits - 1);
+        if (g_efbCopyPages[bit >> 6].load(std::memory_order_acquire) & (1ull << (bit & 63))) {
+            return true;
+        }
+    }
+    return false;
+}
 
 void RememberEfbCopyDestination(uint32_t addr, uint32_t size) {
     if (size == 0) {
         return;
     }
     std::lock_guard<std::mutex> guard(g_efbCopyDestinationsMutex);
-    g_efbCopyDestinations[CanonicalizeGxMainRamAddress(addr)] = size;
+    const uint64_t start = CanonicalizeGxMainRamAddress(addr);
+    g_efbCopyDestinations[static_cast<uint32_t>(start)] = size;
     // A conservative monotonic maximum lets invalidation jump directly to
     // the only map interval that could overlap instead of walking every copy
     // destination on every DCStoreRange.
     g_largestEfbCopyDestination = std::max(g_largestEfbCopyDestination, size);
+    const uint64_t first = start >> 12, last = (start + size - 1) >> 12;
+    for (uint64_t page = first; page <= last && page - first < kEfbCopyPageBits; ++page) {
+        const uint32_t bit = static_cast<uint32_t>(page) & (kEfbCopyPageBits - 1);
+        auto& word = g_efbCopyPages[bit >> 6];
+        word.store(word.load(std::memory_order_relaxed) | (1ull << (bit & 63)), std::memory_order_release);
+    }
 }
 
 } // namespace
@@ -48,6 +94,9 @@ void DownloadEfbCopiesForRange(uint32_t addr, uint32_t size) {
     }
     const uint64_t start = CanonicalizeGxMainRamAddress(addr);
     const uint64_t end = start + size;
+    if (!TouchesEfbCopyPage(start, end)) {
+        return;
+    }
     std::vector<uint32_t> overlapping;
     {
         std::lock_guard<std::mutex> guard(g_efbCopyDestinationsMutex);
@@ -62,6 +111,14 @@ void DownloadEfbCopiesForRange(uint32_t addr, uint32_t size) {
     }
 }
 
+bool EfbCopyPagesTouched(uint32_t addr, uint32_t size) {
+    if (size == 0) {
+        return false;
+    }
+    const uint64_t start = CanonicalizeGxMainRamAddress(addr);
+    return TouchesEfbCopyPage(start, start + size);
+}
+
 void InvalidateEfbCopyDestinationsForRange(uint32_t addr, uint32_t size) {
     if (size == 0) {
         return;
@@ -69,6 +126,9 @@ void InvalidateEfbCopyDestinationsForRange(uint32_t addr, uint32_t size) {
 
     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
     const uint64_t dirtyEnd = dirtyStart + size;
+    if (!TouchesEfbCopyPage(dirtyStart, dirtyEnd)) {
+        return;
+    }
     std::vector<uint32_t> retired;
     {
         std::lock_guard<std::mutex> guard(g_efbCopyDestinationsMutex);
@@ -84,6 +144,19 @@ void InvalidateEfbCopyDestinationsForRange(uint32_t addr, uint32_t size) {
             }
             retired.push_back(it->first);
             it = g_efbCopyDestinations.erase(it);
+        }
+        if (!retired.empty()) {
+            // The pages of what is left (a handful of destinations), each word stored once: its bits only clear.
+            static std::array<uint64_t, kEfbCopyPageBits / 64> words;
+            words.fill(0);
+            for (const auto& [copyStart, copySize] : g_efbCopyDestinations) {
+                MarkEfbCopyPages(words, copyStart, copySize);
+            }
+            for (size_t i = 0; i < words.size(); ++i) {
+                if (g_efbCopyPages[i].load(std::memory_order_relaxed) != words[i]) {
+                    g_efbCopyPages[i].store(words[i], std::memory_order_release);
+                }
+            }
         }
     }
 
@@ -140,10 +213,13 @@ PPC_NATIVE_OVERRIDE_VOID(801f1d10, GX__SetDispCopyGamma_HLE, (uint32_t g), (g));
 // ============================================================================
 
 extern "C" void GX__CopyDisp_HLE(uint32_t da, uint32_t c) {
+    HZ_PHASE(kHzCopyDispTicks);
     EnsureAuroraFrameActive();
     // GX copies are FIFO-ordered on hardware. Drain submitted draws before
-    // resolving the EFB so high-level copies see the same contents.
-    GXDrawDone();
+    // resolving the EFB so high-level copies see the same contents. An ordering point, not GXDrawDone: with Aurora's
+    // GX thread on the copy is queued behind those draws, so waiting for them here would only stall this thread.
+    aurora_gx_order_point();
+    if (VI_HLE_KeepDisplayCopy()) aurora_gx_keep_display_copy_once();  // rollback: show the previous image again
     GXCopyDisp(GuestToHostPtr(da), (GXBool)c);
     // No second GXDrawDone here: the frame-worker wait below is for the DONE
     // phase, which strictly subsumes the drain this call would perform.
@@ -163,9 +239,11 @@ PPC_NATIVE_OVERRIDE_VOID(801f1d24, GX__CopyDisp_HLE, (uint32_t da, uint32_t c), 
 
 
 extern "C" void GX__CopyTex_HLE(uint32_t da, uint32_t c) {
+    HZ_PHASE(kHzCopyTexTicks);
     EnsureAuroraFrameActive();
-    // Match GX FIFO ordering: texture copies observe all prior draws.
-    GXDrawDone();
+    // Match GX FIFO ordering: texture copies observe all prior draws (an ordering point; see GX__CopyDisp_HLE). A copy
+    // the CPU reads back waits where it is read (aurora_flush_efb_copy_to_ram syncs).
+    aurora_gx_order_point();
     const uint16_t rawSrcLeft = g_texCopyState.srcLeft;
     const uint16_t rawSrcTop = g_texCopyState.srcTop;
     const uint16_t rawSrcWidth = g_texCopyState.srcWidth;

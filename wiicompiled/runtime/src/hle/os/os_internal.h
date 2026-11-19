@@ -100,26 +100,28 @@ inline bool ThreadStateIsTerminated(uint16_t state)
 // node's link field offsets; `headAddr`/`tailAddr` are the list's head and tail
 // slots (a fixed OS global for the thread list, `queue`/`queue + 4` for an
 // OSThreadQueue, a thread field pair for the owned-mutex list).
+// The inline accessors translated code uses (lean policy test, checked fallback): the same accesses as the out-of-line
+// Memory::Read32/Write32 without a call each; every mutex lock/unlock and run-queue change walks these lists.
 inline void UnlinkGuestListNode(uint32_t node, uint32_t nextOff, uint32_t prevOff,
                                 uint32_t headAddr, uint32_t tailAddr)
 {
-    const uint32_t next = ::Memory::Read32(node + nextOff);
-    const uint32_t prev = ::Memory::Read32(node + prevOff);
+    const uint32_t next = MemoryInline::FlatRead32(node + nextOff);
+    const uint32_t prev = MemoryInline::FlatRead32(node + prevOff);
 
     if (next != 0) {
-        ::Memory::Write32(next + prevOff, prev);
+        MemoryInline::FlatWrite32(next + prevOff, prev);
     } else {
-        ::Memory::Write32(tailAddr, prev);
+        MemoryInline::FlatWrite32(tailAddr, prev);
     }
 
     if (prev != 0) {
-        ::Memory::Write32(prev + nextOff, next);
+        MemoryInline::FlatWrite32(prev + nextOff, next);
     } else {
-        ::Memory::Write32(headAddr, next);
+        MemoryInline::FlatWrite32(headAddr, next);
     }
 
-    ::Memory::Write32(node + nextOff, 0);
-    ::Memory::Write32(node + prevOff, 0);
+    MemoryInline::FlatWrite32(node + nextOff, 0);
+    MemoryInline::FlatWrite32(node + prevOff, 0);
 }
 
 // Defined in os_thread.cpp.

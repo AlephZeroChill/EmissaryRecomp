@@ -8,23 +8,18 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(AURORA_ENABLE_GX "Enable GX implementation and WebGPU renderer" ON)
+option(AURORA_ENABLE_GX "Enable GX implementation and SDL_GPU renderer" ON)
 option(AURORA_ENABLE_DVD "Enable DVD implementation backed by nod" OFF)  # TODO: need to fix tests
 option(AURORA_ENABLE_CARD "Enable CARD implementation based on kabufuda" ON)
-option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
 
 # Dependency versions
-set(AURORA_DAWN_VERSION "v20260603.191052" CACHE STRING "Dawn package tag (https://github.com/theofficialgman/dawn-build/releases)")
-# Source revision used by the pinned package release; package tags are not Dawn source tags.
-set(AURORA_DAWN_SOURCE_REVISION "13abc3bc8ea2d3c2050f9e77a12d012108ceee24" CACHE STRING "Google Dawn source commit")
-set(AURORA_DAWN_SOURCE_HASH "SHA256=713bea5b92d4f6c5175752fd7cbf1c3c5ce36598ff5dd98685d8a1216614ebba" CACHE STRING "Dawn source archive digest")
 set(AURORA_SDL3_VERSION "3.4.4" CACHE STRING "SDL3 version tag (https://github.com/libsdl-org/SDL/releases)")
 set(AURORA_NOD_VERSION "v2.0.0-alpha.8" CACHE STRING "nod version tag (https://github.com/encounter/nod/releases)")
 set(AURORA_LIBUSB_VERSION "1.0.30" CACHE STRING "libusb version tag (https://github.com/libusb/libusb/releases)")
 
 # Platform-specific defaults
 if (CMAKE_CROSSCOMPILING)
-  # Build SDL/nod from source when cross-compiling; Dawn resolves its target package separately.
+  # Build SDL/nod from source when cross-compiling.
   set(_default_provider "vendor")
   set(_default_linkage "static")
 else ()
@@ -35,13 +30,6 @@ else ()
     set(_default_linkage "static")
   endif ()
 endif ()
-
-# Dawn/WebGPU (if AURORA_ENABLE_GX)
-set(AURORA_DAWN_PROVIDER "auto" CACHE STRING
-  "How to provide Dawn: auto, vendor (build from source), system (find_package/imported), package (download prebuilt)")
-set_property(CACHE AURORA_DAWN_PROVIDER PROPERTY STRINGS auto vendor system package)
-set(AURORA_DAWN_LINKAGE "${_default_linkage}" CACHE STRING "Dawn linkage type preference")
-set_property(CACHE AURORA_DAWN_LINKAGE PROPERTY STRINGS shared static)
 
 # SDL3
 set(AURORA_SDL3_PROVIDER "${_default_provider}" CACHE STRING
@@ -88,9 +76,3 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CMAKE_CROSSCOMPIL
   add_subdirectory(tests)
 endif ()
 
-option(AURORA_BUILD_METALFX_PRESENTATION_TEST "Build the macOS MetalFX presentation test" OFF)
-if (AURORA_BUILD_METALFX_PRESENTATION_TEST AND APPLE AND AURORA_ENABLE_GX AND DAWN_ENABLE_METAL AND AURORA_METALFX_FRAMEWORK)
-    add_executable(metalfx_presentation_test tests/metalfx_interop/presentation_test.cpp)
-    target_include_directories(metalfx_presentation_test PRIVATE lib)
-    target_link_libraries(metalfx_presentation_test PRIVATE aurora::core aurora::gx aurora::vi dawn::webgpu_dawn)
-endif ()

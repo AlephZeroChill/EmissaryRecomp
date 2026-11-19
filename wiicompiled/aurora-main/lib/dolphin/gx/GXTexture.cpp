@@ -8,6 +8,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <utility>
 
@@ -23,21 +24,24 @@ constexpr u8 GXTexImage3Ids[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7
 constexpr u8 GXTexTlutIds[8] = {0x98, 0x99, 0x9A, 0x9B, 0xB8, 0xB9, 0xBA, 0xBB};
 constexpr u8 GX2HWFiltConv[6] = {0x00, 0x04, 0x01, 0x05, 0x02, 0x06};
 
-u32 sNextTexObjId = 1;
-u32 sNextTlutObjId = 1;
+// Atomic: the runtime's draw worker (deferred native draws) initializes texture and TLUT objects too.
+std::atomic<u32> sNextTexObjId{1};
+std::atomic<u32> sNextTlutObjId{1};
 
 u32 next_tex_obj_id() {
-  if (sNextTexObjId == 0) {
+  const u32 id = sNextTexObjId.fetch_add(1, std::memory_order_relaxed);
+  if (id == 0) {
     FATAL("texObj ID overflow");
   }
-  return sNextTexObjId++;
+  return id;
 }
 
 u32 next_tlut_obj_id() {
-  if (sNextTlutObjId == 0) {
+  const u32 id = sNextTlutObjId.fetch_add(1, std::memory_order_relaxed);
+  if (id == 0) {
     FATAL("tlutObj ID overflow");
   }
-  return sNextTlutObjId++;
+  return id;
 }
 
   // Give each palette buffer a stable ID so its GPU cache can be reused.
@@ -310,6 +314,20 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
   __gx->bpSent = 1;
 
   emit_loaded_texobj_metadata(*obj, id);
+}
+
+// The register shadow GXLoadTexObj(obj, id) leaves for the map (tImage0/tMode0, read by the SU flush), without the
+// load: a deferred native draw's texture load is made by the draw worker, on its own shadow (runtime
+// hle/g3d_native.cpp), and the producer that recorded it sets its own shadow with this. Dirty state and bpSent are the
+// job's (the producer's copy has the dirty bits cleared after the draw; bpSent is never read).
+void GXShadowSetTexMap(const GXTexObj* obj_, u32 id) {
+  if (id >= 8)
+    return;
+  GXTexObj_ obj = *reinterpret_cast<const GXTexObj_*>(obj_);
+  SET_REG_FIELD(0, obj.mode0, 8, 24, GXTexMode0Ids[id]);
+  SET_REG_FIELD(0, obj.image0, 8, 24, GXTexImage0Ids[id]);
+  __gx->tImage0[id] = obj.image0;
+  __gx->tMode0[id] = obj.mode0;
 }
 
 u32 GXGetTexBufferSize(u16 width, u16 height, u32 fmt, GXBool mips, u8 maxLod) {

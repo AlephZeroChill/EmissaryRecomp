@@ -24,15 +24,20 @@ public static class GuestMemoryRangeLowering
     private const uint HardwareRegisterWindowStart = 0xCC000000u;
     private const uint HardwareRegisterWindowEnd = 0xCE000000u;
 
+    /// <param name="liveInRanges">Also reuse ranges across CFG edges. Off for the lean runtime's resolved forms
+    /// (memory_access.h, kLeanRangePolicyOffset), whose read ranges are untested pointers that rely on every access of a
+    /// range running in the straight-line segment that resolves it.</param>
     public static IrFunction Lower(IrFunction function, int minimumAccesses = 8,
         bool ignoreDisabledPcTraces = false,
-        bool scalarOnly = false)
+        bool scalarOnly = false,
+        bool liveInRanges = true)
     {
         var nextRange = 0;
         var hardwareConstants = CxxLinearCodeGenerator.BuildKnownUIntConstants(function);
-        function = LowerFunctionLiveInRanges(
-            function, ref nextRange, minimumAccesses, ignoreDisabledPcTraces,
-            hardwareConstants);
+        if (liveInRanges)
+            function = LowerFunctionLiveInRanges(
+                function, ref nextRange, minimumAccesses, ignoreDisabledPcTraces,
+                hardwareConstants);
         var blocks = function.Blocks.Select(block =>
             block with { Instructions = CombineAdjacentLoads(
                 LowerBlock(block.Instructions, ref nextRange, minimumAccesses,
@@ -60,7 +65,9 @@ public static class GuestMemoryRangeLowering
                 new IrAddress(psqBase, 0),
             _ => null
         };
-        if (address is null || !constants.TryGetValue(address.Base, out var baseAddress))
+        // Not where the base is read across a guest call that may have changed it (CallClobberedValues).
+        if (address is null || CallClobberedValues.IsStaleUse(instruction, address.Base) ||
+            !constants.TryGetValue(address.Base, out var baseAddress))
             return false;
         var effective = unchecked(baseAddress + (uint)address.Offset);
         return effective >= HardwareRegisterWindowStart && effective < HardwareRegisterWindowEnd;

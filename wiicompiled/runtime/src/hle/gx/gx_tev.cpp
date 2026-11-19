@@ -87,18 +87,7 @@ PPC_NATIVE_OVERRIDE_VOID(801f3d08, GX__SetTevAlphaOp_HLE, (uint32_t s, uint32_t 
 extern "C" void GX__SetTevColor_HLE(uint32_t id, uint32_t cp) {
     if (!TevRegOk(id)) return;
     const uint8_t* p=Memory::GetPointer(cp, 4); GXColor c; c.r=p[0]; c.g=p[1]; c.b=p[2]; c.a=p[3];
-    if (SpmDumpFrame()) { const CpuContext* x = TryGetCpuContext(); RT_LOGF(RT_TAG_GX, "[drawdump] tevcolor %u %02X%02X%02X%02X lr %08X\n", id, c.r, c.g, c.b, c.a, x ? x->lr : 0);
-        if (x && x->lr == 0x8004ED88u) {
-            uint32_t bg = 0, mw = 0, idx = 0, b12 = 0, fl = 0, e26 = 0, e30 = 0;
-            Memory::TryRead32(0x805A161Cu, bg); Memory::TryRead32(0x805A1608u, mw);
-            if (bg) Memory::TryRead32(bg + 12, b12);
-            if (mw) { Memory::TryRead32(mw + 1688, idx); const uint32_t e = mw + idx * 844; Memory::TryRead32(e + 4, fl); Memory::TryRead32(e + 26, e26); Memory::TryRead32(e + 30, e30); }
-            RT_LOGF(RT_TAG_GX, "[drawdump] bgcolor bg %08X col %08X map %08X idx %u flags %08X blend %08X blend2 %08X\n", bg, b12, mw, idx, fl, e26, e30);
-            uint32_t k0 = 0, k1 = 0, s20 = 0, s24 = 0;
-            Memory::TryRead32(0x8056F21Cu, k0); Memory::TryRead32(0x8056F220u, k1);
-            Memory::TryRead32(x->gpr[1] + 20, s20); Memory::TryRead32(x->gpr[1] + 24, s24);
-            RT_LOGF(RT_TAG_GX, "[drawdump] bgconst %08X %08X stack20 %08X stack24 %08X sp %08X\n", k0, k1, s20, s24, x->gpr[1]);
-        } }
+    if (SpmDumpFrame()) { const CpuContext* x = TryGetCpuContext(); RT_LOGF(RT_TAG_GX, "[drawdump] tevcolor %u %02X%02X%02X%02X lr %08X\n", id, c.r, c.g, c.b, c.a, x ? x->lr : 0); }
     GXSetTevColor((GXTevRegID)id, c);
 }
 PPC_NATIVE_OVERRIDE_VOID(801f3d60, GX__SetTevColor_HLE, (uint32_t id, uint32_t cp), (id, cp));

@@ -8,14 +8,22 @@
 #include <algorithm>
 #include <cstdlib>
 
+// The draw worker (gx_internal.h t_gxDrawWorker) leaves guest memory and the guest-thread tables to the game thread,
+// which plans a deferred draw's texture and TLUT loads when it records them (GX_HLE_Plan*ForJob below).
+thread_local bool t_gxDrawWorker = false;
+extern "C" void GX_HLE_SetDrawWorker(bool worker) { t_gxDrawWorker = worker; }
+
 // Helper to write GXTexObj structure to guest memory in SDK format
 // This is needed because other code may read the structure directly
 static void WriteGuestTexObj(uint32_t addr, uint32_t dataAddr, uint16_t width, uint16_t height, 
                              uint32_t format, uint32_t wrapS, uint32_t wrapT, bool mipmap,
                              bool writeTlut, uint32_t tlut) {
     dataAddr = CanonicalizeGxMainRamAddress(dataAddr);
-    for (int i = 0; i < 8; i++) {
-        Memory::Write32(addr + i * 4, 0);
+    // The struct ends all zero but for the words written below: only the user data word (+0x10) and, without a TLUT,
+    // +0x18 need their zero (the rest are rewritten below, so their zero stores changed nothing).
+    Memory::Write32(addr + 0x10, 0);
+    if (!writeTlut) {
+        Memory::Write32(addr + 0x18, 0);
     }
 
     uint32_t word0 = (wrapS & 0x3u) | ((wrapT & 0x3u) << 2) | 0x10u;
@@ -234,15 +242,10 @@ static void ApplyHostTexObjLod(GXTexObj* obj, const TexObjMeta& meta, GXTexFilte
 }
 
 static uint32_t ComputeMaxMipLevel(uint16_t width, uint16_t height) noexcept {
-    uint32_t w = std::max<uint32_t>(1u, width);
-    uint32_t h = std::max<uint32_t>(1u, height);
-    uint32_t levels = 0;
-    while (w > 1u || h > 1u) {
-        w = std::max<uint32_t>(1u, w >> 1u);
-        h = std::max<uint32_t>(1u, h >> 1u);
-        ++levels;
-    }
-    return levels;
+    const uint32_t w = std::max<uint32_t>(1u, width);
+    const uint32_t h = std::max<uint32_t>(1u, height);
+    // Halving a side to 1 takes floor(log2) steps, and the levels run until both sides are 1.
+    return static_cast<uint32_t>(31 - __builtin_clz(std::max(w, h)));
 }
 
 extern "C" void GX__InitTexObj_HLE(uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m) {
@@ -253,7 +256,8 @@ extern "C" void GX__InitTexObj_HLE(uint32_t oa, uint32_t da, uint32_t w, uint32_
                 oa, da, w, h, f, ws, wt, m, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
     }
     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard); GXTexObj* obj = CreateHostTexObj(oa);
+    TexObjMeta& meta = GetTexObjMetaForImageWrite(oa, canonicalDataAddr, (u16)w, (u16)h, f, m != 0);
     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.userData=0; meta.needsUpload=true;
     GXInitTexObj(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXTexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m); MarkHostTexObjConstructed(oa);
     // Also write to guest memory so reads work
@@ -287,7 +291,8 @@ extern "C" void GX__InitTexObjCI_HLE(uint32_t oa, uint32_t da, uint32_t w, uint3
                 oa, da, w, h, f, ws, wt, m, tl, cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
     }
     const uint32_t canonicalDataAddr = CanonicalizeGxMainRamAddress(da);
-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = CreateHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard); GXTexObj* obj = CreateHostTexObj(oa);
+    TexObjMeta& meta = GetTexObjMetaForImageWrite(oa, canonicalDataAddr, (u16)w, (u16)h, f, m != 0);
     meta.dataAddr=canonicalDataAddr; meta.width=(u16)w; meta.height=(u16)h; meta.format=f; meta.wrapS=ws; meta.wrapT=wt; meta.mipmap=(m!=0); meta.tlut=tl; meta.userData=0; meta.needsUpload=true;
     GXInitTexObjCI(obj, GuestToHostPtr(da), (u16)w, (u16)h, (GXCITexFmt)f, (GXTexWrapMode)ws, (GXTexWrapMode)wt, (GXBool)m, tl); MarkHostTexObjConstructed(oa);
     // Also write to guest memory so reads work
@@ -302,8 +307,9 @@ extern "C" void GX__InitTexObjCI_HLE(uint32_t oa, uint32_t da, uint32_t w, uint3
 PPC_NATIVE_OVERRIDE_VOID(801f2afc, GX__InitTexObjCI_HLE, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
 
 extern "C" void GX__InitTexObjLOD_HLE(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard); GXTexObj* obj = GetHostTexObj(oa);
     float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
+    TexObjMeta& meta = GetTexObjMetaForMaxLodWrite(oa, fmal);
     meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
     GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
     // Also write LOD info to guest memory
@@ -312,9 +318,9 @@ extern "C" void GX__InitTexObjLOD_HLE(uint32_t oa, uint32_t mif, uint32_t maf, f
 PPC_NATIVE_OVERRIDE_VOID(801f2b44, GX__InitTexObjLOD_HLE, (uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma), (oa, mif, maf, mil, mal, lb, bc, el, ma));
 
 extern "C" void GX__InitTexObjWrapMode_HLE(uint32_t oa, uint32_t ws, uint32_t wt) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     GXTexObj* obj = GetHostTexObj(oa);
-    TexObjMeta& meta = GetTexObjMeta(oa);
+    TexObjMeta& meta = GetTexObjMetaKeepingInterval(oa);
     meta.wrapS = ws;
     meta.wrapT = wt;
     try {
@@ -328,9 +334,9 @@ extern "C" void GX__InitTexObjWrapMode_HLE(uint32_t oa, uint32_t ws, uint32_t wt
 PPC_NATIVE_OVERRIDE_VOID(801f2c58, GX__InitTexObjWrapMode_HLE, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
 
 extern "C" void GX__InitTexObjTlut_HLE(uint32_t oa, uint32_t tl) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     GXTexObj* obj = GetHostTexObj(oa);
-    TexObjMeta& meta = GetTexObjMeta(oa);
+    TexObjMeta& meta = GetTexObjMetaKeepingInterval(oa);
     meta.tlut = tl;
     GXInitTexObjTlut(obj, tl);
     // Keep guest GXTexObj coherent for later GXLoadTexObj from memory.
@@ -343,8 +349,8 @@ PPC_NATIVE_OVERRIDE_VOID(801f2c6c, GX__InitTexObjTlut_HLE, (uint32_t oa, uint32_
 
 // GXInitTexObjFilter - sets mag/min filter modes
 extern "C" void GX__InitTexObjFilter_HLE(uint32_t oa, uint32_t minFilter, uint32_t magFilter) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
-    TexObjMeta& meta = GetTexObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
+    TexObjMeta& meta = GetTexObjMetaKeepingInterval(oa);
     meta.minFilter = minFilter;
     meta.magFilter = magFilter;
     
@@ -371,9 +377,9 @@ PPC_NATIVE_OVERRIDE_VOID(801f2c74, GX__InitTexObjFilter_HLE, (uint32_t oa, uint3
 
 // GXInitTexObjLODBias - sets LOD bias value
 extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
-    TexObjMeta& meta = GetTexObjMeta(oa);
-    
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
+    TexObjMeta& meta = GetTexObjMetaKeepingInterval(oa);
+
     // Clamp bias to [-4.0, 3.99...] range as per SDK
     constexpr float kMinBias = -4.0f;
     constexpr float kMaxBias = 3.99f; // Actually ~3.990000009536743
@@ -399,8 +405,8 @@ extern "C" void GX__InitTexObjLODBias_80170b94(uint32_t oa, float bias) {
 }
 
 extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
-    TexObjMeta& meta = GetTexObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
+    TexObjMeta& meta = GetTexObjMetaKeepingInterval(oa);
     meta.userData = userData;
 
     // The RVL SDK stores this opaque guest pointer verbatim at GXTexObj + 0x10.
@@ -421,22 +427,27 @@ extern "C" void GX__InitTexObjUserData_80170be8(uint32_t oa, uint32_t userData) 
 // slot (rejection paths used to just return, so draws sampled stale, unrelated art). Bind
 // aurora's empty texture instead: null image data resolves to a 1x1 transparent placeholder,
 // which is also the correct result for the common case of an intentionally-transparent hide texture.
-static void BindUnloadableTexturePlaceholder(uint32_t tid) {
-    if (tid >= g_boundTexMaps.size()) {
-        return;
-    }
-    // Callers hold g_texObjMutex, so this initialization is serialized.
-    static GXTexObj s_placeholder{};
-    static bool s_placeholderReady = false;
+// One per producer thread (the game thread's; a draw worker's for a deferred draw's rejected load, RunTexLoadPlan):
+// Aurora's GXLoadTexObj writes the map's register ids into the object it loads.
+static GXTexObj* UnloadableTexturePlaceholder() {
+    static thread_local GXTexObj s_placeholder{};
+    static thread_local bool s_placeholderReady = false;
     if (!s_placeholderReady) {
         GXInitTexObj(&s_placeholder, nullptr, 1, 1, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
         s_placeholderReady = true;
+    }
+    return &s_placeholder;
+}
+
+static void BindUnloadableTexturePlaceholder(uint32_t tid) {
+    if (tid >= g_boundTexMaps.size()) {
+        return;
     }
     // A zeroed binding record can never compare equal to a real load (those
     // always carry a non-zero objAddr), so the CanSkipHostLoad fast path cannot
     // mistake a later genuine bind for a no-op.
     g_boundTexMaps[tid] = BoundTexInfo{};
-    GXLoadTexObj(&s_placeholder, (GXTexMapID)tid);
+    GXLoadTexObj(UnloadableTexturePlaceholder(), (GXTexMapID)tid);
 }
 
 // One host texture object per (image, sampler) for loads recorded into display lists; never freed
@@ -458,22 +469,63 @@ static GXTexObj* PersistentDlTexObj(const TexObjMeta& meta, GXTexWrapMode wrapS,
     return slot.get();
 }
 
-extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
+// GXLoadTexObj in two halves. The table half (PlanTexLoad: the guest GXTexObj, the texture tables and host objects,
+// under g_texObjGuard, so on the guest thread) works out what the load does; the per-thread half (RunTexLoadPlan: this
+// thread's map bindings and Aurora register shadow) does it. Inline, both run here. A deferred native draw
+// (g3d_native.cpp) plans on the game thread when it records the load and runs the plan on the draw worker, with a
+// copy of the host object (GX_HLE_PlanTexLoadForJob / GX_HLE_RunTexLoadPlan below).
+struct TexLoadPlan {
+    enum Kind : uint8_t { kNothing, kPlaceholder, kLoad };
+    Kind kind = kNothing;  // kNothing: an invalid map id; kPlaceholder: a rejected load
+    bool needsInit = false;
+    bool tlutChanged = false;
+    bool textureDataUploaded = false;
+    bool isPalette = false;
+    bool spmPersistent = false;  // SPM display-list recording: loads a PersistentDlTexObj, always
+    TexObjMeta meta{};           // as loaded (sanitized)
+    BoundTexInfo bound{};        // the map's binding after the load
+    GXTexObj* obj = nullptr;     // the host object to load
+};
+static uint32_t s_texLoadExceptionLogCount = 0;
+
+// Aurora digests a loaded object's bytes under a write generation it takes on the GX thread (or a draw worker's job):
+// their pages are marked on this (the guest) thread, before the hand-off (gx_guest_write.h g_trackedPages). The whole
+// mip chain bounds what any LOD setting reads. Marks are sticky, so an image (data, size, format) marked before is
+// skipped: a direct-mapped memo of marked images, filled only where the mark happened. Guest thread (PlanTexLoad).
+static void NoteTexObjTracked(GXTexObj* obj) {
+    const void* data = GXGetTexObjData(obj);
+    if (data == nullptr) return;
+    const uint16_t w = GXGetTexObjWidth(obj);
+    const uint16_t h = GXGetTexObjHeight(obj);
+    const uint32_t fmt = static_cast<uint32_t>(GXGetTexObjFmt(obj));
+    struct Marked {
+        const void* data;
+        uint64_t image;
+    };
+    static std::array<Marked, 512> s_marked{};
+    const uint64_t image = uint64_t{w} | uint64_t{h} << 16 | uint64_t{fmt} << 32;
+    Marked& m = s_marked[((reinterpret_cast<uintptr_t>(data) >> 5) * 0x9E3779B97F4A7C15ull) >> 55];
+    if (m.data == data && m.image == image) return;
+    if (GxGuestWrite::NoteTrackedHostRange(data, GXGetTexBufferSize(w, h, fmt, GX_TRUE, 255))) m = {data, image};
+}
+
+static TexLoadPlan PlanTexLoadFull(uint32_t oa, uint32_t tid) {
     static uint32_t s_invalidMetaLogCount = 0;
     static uint32_t s_invalidTidLogCount = 0;
     static uint32_t s_invalidDimLogCount = 0;
-    static uint32_t s_hostExceptionLogCount = 0;
+    uint32_t& s_hostExceptionLogCount = s_texLoadExceptionLogCount;
     static uint32_t s_metaLookupLogCount = 0;
     static uint32_t s_unknownFormatLogCount = 0;
     static uint32_t s_invalidDataLogCount = 0;
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    TexLoadPlan plan;
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
 
     if (tid >= g_boundTexMaps.size()) {
         if (s_invalidTidLogCount < 128) {
             RT_LOGF(RT_TAG_GX, "GXLoadTexObj: invalid tex map id %u (oa=0x%08X)\n", tid, oa);
             ++s_invalidTidLogCount;
         }
-        return;
+        return plan;
     }
     
     // Check if we have metadata for this texture, or try to extract it from guest memory
@@ -483,8 +535,8 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
             RT_LOGF(RT_TAG_GX,
                     "GXLoadTexObj rejected reason=no-metadata oa=0x%08X tid=%u\n", oa, tid);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
 
     if (meta.dataAddr == 0 || meta.width == 0 || meta.height == 0) {
@@ -493,8 +545,8 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
                     "GXLoadTexObj rejected reason=invalid-meta oa=0x%08X tid=%u data=0x%08X %ux%u\n",
                     oa, tid, meta.dataAddr, meta.width, meta.height);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
     if (!IsReasonableTextureDimensions(meta.width, meta.height)) {
         if (s_invalidDimLogCount++ < 128) {
@@ -502,8 +554,8 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
                     "GXLoadTexObj rejected reason=bad-dimensions oa=0x%08X tid=%u %ux%u fmt=0x%X\n",
                     oa, tid, meta.width, meta.height, meta.format);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
     // One gate, two reasons: every aurora-loadable format is also a known one,
     // so a separate IsKnownTexFormat rejection could never fire on anything this
@@ -518,8 +570,8 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
                     known ? "unsupported-format" : "unknown-format", oa, tid, meta.format,
                     meta.width, meta.height);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
     const float maxMipLevel = static_cast<float>(ComputeMaxMipLevel(meta.width, meta.height));
     const float minLodSafe = SanitizeLodValue(meta.minLod, 0.0f);
@@ -528,7 +580,7 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
     const float clampedMinLodSafe = std::min(minLodSafe, maxLodSafe);
     const float lodBiasSafe = SanitizeLodBias(meta.lodBias);
     const uint8_t maxLod = (maxLodSafe > 0.0f) ? ((maxLodSafe > 255.0f) ? 255u : static_cast<uint8_t>(maxLodSafe)) : 0u;
-    const uint32_t size = GXGetTexBufferSize(meta.width, meta.height, meta.format, (GXBool)meta.mipmap, maxLod);
+    const uint32_t size = CachedTexBufferSize(meta.width, meta.height, meta.format, (GXBool)meta.mipmap, maxLod);
     if (size == 0 || !Memory::Contains(meta.dataAddr, size)) {
         if (s_invalidDataLogCount++ < 64) {
             auto* cpu = TryGetCpuContext();
@@ -539,8 +591,8 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
                     meta.mipmap ? 1u : 0u, static_cast<uint32_t>(maxLod),
                     cpu ? cpu->pc : 0u, cpu ? cpu->lr : 0u);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
     const GXTexWrapMode wrapS = SanitizeWrapMode(meta.wrapS);
     const GXTexWrapMode wrapT = SanitizeWrapMode(meta.wrapT);
@@ -560,9 +612,11 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
     GXTexObj* obj = TryGetHostTexObj(oa);
     const bool isPalette = IsPaletteTexFormat(meta.format);
     bool needsInit = (obj == nullptr);
-    const auto metaIt = g_TexObjMeta.find(oa);
-    if (!needsInit && metaIt != g_TexObjMeta.end()) {
-        const TexObjMeta& cached = metaIt->second;
+    // The object's slot, as TryGetHostTexObj just found it (FindTexObjSlot's one-entry memo, not another hash lookup;
+    // slots are never erased).
+    const TexObjMeta* cachedMeta = FindTexObjSlotForPlan(oa);
+    if (!needsInit && cachedMeta != nullptr) {
+        const TexObjMeta& cached = *cachedMeta;
         if (cached.width != meta.width || cached.height != meta.height || cached.format != meta.format ||
             cached.wrapS != meta.wrapS || cached.wrapT != meta.wrapT || cached.mipmap != meta.mipmap ||
             cached.minFilter != meta.minFilter || cached.magFilter != meta.magFilter ||
@@ -602,12 +656,12 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
                 GXInitTexObjUserData(obj, GuestToHostPtr(meta.userData));
             }
             MarkHostTexObjConstructed(oa);
-            // Write through GetTexObjMeta so the DCStoreRange interval index is
+            // Write through GetTexObjMetaForWrite so the DCStoreRange interval index is
             // told this entry's backing may have moved.
-            GetTexObjMeta(oa) = meta;
-        } else if (isPalette && metaIt != g_TexObjMeta.end() && metaIt->second.tlut != meta.tlut) {
+            GetTexObjMetaForWrite(oa, meta) = meta;
+        } else if (isPalette && cachedMeta != nullptr && cachedMeta->tlut != meta.tlut) {
             GXInitTexObjTlut(obj, meta.tlut);
-            GetTexObjMeta(oa).tlut = meta.tlut;
+            GetTexObjMetaKeepingInterval(oa).tlut = meta.tlut;
             tlutChanged = true;
         }
 
@@ -624,50 +678,280 @@ extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
         static_cast<GxTextureBindingContract::SamplerState&>(newBound) = meta;
         newBound.objAddr = oa;
         newBound.dataAddr = CanonicalizeGxMainRamAddress(meta.dataAddr);
-        const BoundTexInfo& oldBound = g_boundTexMaps[tid];
-        const bool canSkipHostLoad = GxTextureBindingContract::CanSkipHostLoad(
-            oldBound, newBound, needsInit, tlutChanged, textureDataUploaded);
-
-        g_boundTexMaps[tid] = newBound;
-        GetTexObjMeta(oa) = meta;
-        if (SpmDumpFrame()) {
-            RT_LOGF(RT_TAG_GX, "[drawdump] loadtex map %u oa 0x%08X data 0x%08X %ux%u fmt 0x%X pal %d tlut %u skip %d init %d up %d\n", tid, oa,
-                    meta.dataAddr, meta.width, meta.height, meta.format, isPalette ? 1 : 0, meta.tlut, canSkipHostLoad ? 1 : 0,
-                    needsInit ? 1 : 0, textureDataUploaded ? 1 : 0);
-        }
-        if (SpmAuroraDlRecording()) {
-            static int s_texLog = 0;
-            if (s_texLog++ < 60) RT_LOGF(RT_TAG_GX, "[spmdl] recorded tex load map %u data 0x%08X %ux%u fmt 0x%X pal %d\n", tid, meta.dataAddr, meta.width, meta.height, meta.format, isPalette ? 1 : 0);
-        }
-        if (SpmAuroraDlRecording() && !isPalette) {
-            // SPM builds map materials into display lists from a stack GXTexObj reused for every
-            // material, so the shared host twin (keyed by that stack address) would give every recorded
-            // load the same texture identity. Recorded loads get a permanent host object per image.
-            GXLoadTexObj(PersistentDlTexObj(meta, wrapS, wrapT, minFilter, magFilter, maxAnisoSafe, size),
-                         (GXTexMapID)tid);
-        } else if (!canSkipHostLoad) {
-            GXLoadTexObj(obj, (GXTexMapID)tid);
-        }
+        GetTexObjMetaForWrite(oa, meta) = meta;
+        plan.needsInit = needsInit;
+        plan.tlutChanged = tlutChanged;
+        plan.textureDataUploaded = textureDataUploaded;
+        plan.isPalette = isPalette;
+        plan.meta = meta;
+        plan.bound = newBound;
+        // SPM builds map materials into display lists from a stack GXTexObj reused for every
+        // material, so the shared host twin (keyed by that stack address) would give every recorded
+        // load the same texture identity. Recorded loads get a permanent host object per image.
+        plan.spmPersistent = SpmAuroraDlRecording() && !isPalette;
+        plan.obj = plan.spmPersistent
+                       ? PersistentDlTexObj(meta, wrapS, wrapT, minFilter, magFilter, maxAnisoSafe, size)
+                       : obj;
+        plan.kind = TexLoadPlan::kLoad;
+        NoteTexObjTracked(plan.obj);
     } catch (const std::exception& ex) {
         if (s_hostExceptionLogCount++ < 64) {
             RT_LOGF(RT_TAG_GX,
                     "GXLoadTexObj rejected reason=host-exception (%s) oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
                     ex.what(), oa, tid, meta.format, meta.width, meta.height, meta.dataAddr);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     } catch (...) {
         if (s_hostExceptionLogCount++ < 64) {
             RT_LOGF(RT_TAG_GX,
                     "GXLoadTexObj rejected reason=host-exception-unknown oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
                     oa, tid, meta.format, meta.width, meta.height, meta.dataAddr);
         }
-        BindUnloadableTexturePlaceholder(tid);
-        return;
+        plan.kind = TexLoadPlan::kPlaceholder;
+        return plan;
     }
+    return plan;
+}
+
+// Repeated loads. A plan that changed nothing it read - the object's slot metadata, the guest struct's bytes (equal to
+// the slot's shadow, so the metadata lookup took its fast path) and the host object, each the same before and after -
+// is a function of those and of what PlanTexLoad checks below (the map id's range, SPM's list recording; the format,
+// size and address checks and the host pointer follow from the metadata). A later load of the same object finding the
+// same three gets the same plan again, and the writes the full path would make are of values already there: the
+// slot's metadata and guest shadow, an interval patch with nothing to move, tracked pages already marked (sticky).
+// So it returns the remembered plan. Vanilla Training: 125 of 134 deferred texture loads a frame are such repeats
+// (the same materials every frame; the other 9, objects re-initialized that frame). Guest thread, under
+// g_texObjGuard, like the table it reads.
+//
+// Each object's plan is remembered on its own slot (TexObjSlot::planMemo), so no object evicts another's: a
+// direct-mapped table of 256 entries remembered only 72 of the 134 (the rest lost to collisions at half load).
+struct GxTexPlanMemo {
+    bool valid = false;
+    uint64_t shadow[4] = {};  // the guest struct's bytes (and the slot's shadow)
+    TexObjMeta meta{};        // the slot's metadata
+    GXTexObj host{};          // the host object's bytes
+    TexLoadPlan plan{};
+};
+namespace {
+// GX_TEXPLAN_CHECK=1: a remembered plan is also made the full way and compared (the plan, and the inputs it leaves).
+const bool s_texPlanCheck = [] {
+    const char* v = std::getenv("GX_TEXPLAN_CHECK");
+    return v != nullptr && v[0] == '1';
+}();
+uint64_t s_texPlanJobs = 0, s_texPlanRemembered = 0, s_texPlanChecked = 0, s_texPlanCheckBad = 0;  // guest thread
+
+// The guest struct's bytes as gx_objects.cpp's ReadTexObjShadow reads them (the slot's guestShadow form).
+bool ReadGuestTexObjBytes(uint32_t addr, uint64_t (&out)[4]) noexcept {
+    try {
+        out[0] = Memory::Read64(addr + 0x00);
+        out[1] = Memory::Read64(addr + 0x08);
+        out[2] = Memory::Read64(addr + 0x10);
+        out[3] = Memory::Read64(addr + 0x18);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+bool SameWords(const uint64_t (&a)[4], const uint64_t (&b)[4]) {
+    return ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3])) == 0;
+}
+// Every field, floats by their bits (a NaN or a signed zero must not compare as another value).
+bool SameSamplerBits(const GxTextureBindingContract::SamplerState& a, const GxTextureBindingContract::SamplerState& b) {
+    const auto bits = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return u;
+    };
+    return a.dataAddr == b.dataAddr && a.width == b.width && a.height == b.height && a.format == b.format &&
+           a.wrapS == b.wrapS && a.wrapT == b.wrapT && a.tlut == b.tlut && a.minFilter == b.minFilter &&
+           a.magFilter == b.magFilter && bits(a.minLod) == bits(b.minLod) && bits(a.maxLod) == bits(b.maxLod) &&
+           bits(a.lodBias) == bits(b.lodBias) && a.maxAniso == b.maxAniso && a.biasClamp == b.biasClamp &&
+           a.edgeLod == b.edgeLod && a.mipmap == b.mipmap;
+}
+bool SameMetaBits(const TexObjMeta& a, const TexObjMeta& b) {
+    return SameSamplerBits(a, b) && a.userData == b.userData && a.needsUpload == b.needsUpload;
+}
+bool SamePlanBits(const TexLoadPlan& a, const TexLoadPlan& b) {  // check mode
+    return a.kind == b.kind && a.needsInit == b.needsInit && a.tlutChanged == b.tlutChanged &&
+           a.textureDataUploaded == b.textureDataUploaded && a.isPalette == b.isPalette &&
+           a.spmPersistent == b.spmPersistent && SameMetaBits(a.meta, b.meta) && SameSamplerBits(a.bound, b.bound) &&
+           a.bound.objAddr == b.bound.objAddr && a.obj == b.obj;
+}
+// What a plan reads of the object, taken before and after it.
+struct TexPlanInputs {
+    bool valid = false;  // a slot with a constructed host object, the guest bytes equal to its shadow
+    uint64_t shadow[4] = {};
+    TexObjMeta meta{};
+    GXTexObj host{};
+    GXTexObj* hostPtr = nullptr;
+};
+TexPlanInputs TakeTexPlanInputs(const TexObjSlot* slot, uint32_t oa) {
+    TexPlanInputs in;
+    uint64_t guest[4];
+    if (slot == nullptr || !slot->hasGuestShadow || !slot->host || !slot->host->constructed ||
+        !ReadGuestTexObjBytes(oa, guest) || !SameWords(guest, slot->guestShadow)) {
+        return in;
+    }
+    in.valid = true;
+    std::memcpy(in.shadow, guest, sizeof guest);
+    in.meta = *slot;
+    in.hostPtr = slot->host->PublicPtr();
+    std::memcpy(&in.host, in.hostPtr, sizeof(GXTexObj));
+    return in;
+}
+}  // namespace
+
+// remember: a deferred draw's load (GX_HLE_PlanTexLoadForJob). An inline load (GX__LoadTexObj_HLE) never repeats so:
+// its GXLoadTexObj writes the map's register ids into the host object, so its next plan finds other host bytes.
+static TexLoadPlan PlanTexLoad(uint32_t oa, uint32_t tid, bool remember = false) {
+    if (!remember) return PlanTexLoadFull(oa, tid);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
+    ++s_texPlanJobs;
+    if (tid >= g_boundTexMaps.size() || SpmAuroraDlRecording()) return PlanTexLoadFull(oa, tid);
+    const TexObjSlot* slot = FindTexObjSlotForPlan(oa);
+    GxTexPlanMemo* memo = slot != nullptr ? slot->planMemo : nullptr;
+    const TexPlanInputs before = TakeTexPlanInputs(slot, oa);
+    if (before.valid && memo != nullptr && memo->valid && before.hostPtr == memo->plan.obj &&
+        SameWords(before.shadow, memo->shadow) && SameMetaBits(before.meta, memo->meta) &&
+        std::memcmp(&before.host, &memo->host, sizeof(GXTexObj)) == 0) {
+        ++s_texPlanRemembered;
+        if (s_texPlanCheck) {
+            const TexLoadPlan full = PlanTexLoadFull(oa, tid);
+            const TexObjSlot* after = FindTexObjSlotForPlan(oa);
+            const TexPlanInputs left = TakeTexPlanInputs(after, oa);
+            const bool same = SamePlanBits(full, memo->plan) && after == slot && left.valid &&
+                              left.hostPtr == before.hostPtr && SameWords(left.shadow, before.shadow) &&
+                              SameMetaBits(left.meta, before.meta) &&
+                              std::memcmp(&left.host, &before.host, sizeof(GXTexObj)) == 0;
+            ++s_texPlanChecked;
+            if (!same && s_texPlanCheckBad++ < 20) {
+                RT_LOGF(RT_TAG_GX, "[texplan] remembered plan MISMATCH oa=0x%08X tid=%u\n", oa, tid);
+            }
+        }
+        return memo->plan;
+    }
+    TexLoadPlan plan = PlanTexLoadFull(oa, tid);
+    if (memo != nullptr) memo->valid = false;
+    if (before.valid && plan.kind == TexLoadPlan::kLoad && !plan.needsInit && !plan.tlutChanged &&
+        !plan.textureDataUploaded && !plan.spmPersistent && plan.obj == before.hostPtr) {
+        const TexObjSlot* after = FindTexObjSlotForPlan(oa);
+        const TexPlanInputs left = TakeTexPlanInputs(after, oa);
+        if (after == slot && left.valid && left.hostPtr == before.hostPtr && SameWords(left.shadow, before.shadow) &&
+            SameMetaBits(left.meta, before.meta) && std::memcmp(&left.host, &before.host, sizeof(GXTexObj)) == 0) {
+            if (slot->planMemo == nullptr) slot->planMemo = new GxTexPlanMemo;
+            memo = slot->planMemo;
+            memo->valid = true;
+            std::memcpy(memo->shadow, before.shadow, sizeof memo->shadow);
+            memo->meta = before.meta;
+            memo->host = before.host;
+            memo->plan = plan;
+        }
+    }
+    return plan;
+}
+
+// The per-thread half: loads obj (the plan's host object, or a copy of it) into map tid unless this thread's binding of
+// the map makes it redundant. False where the load ends without its guest writes: nothing to do, or the placeholder
+// bound (a rejected load, or a host exception here).
+static bool RunTexLoadPlan(const TexLoadPlan& plan, uint32_t oa, uint32_t tid, GXTexObj* obj) {
+    if (plan.kind == TexLoadPlan::kNothing) return false;
+    if (plan.kind == TexLoadPlan::kPlaceholder) {
+        BindUnloadableTexturePlaceholder(tid);
+        return false;
+    }
+    const TexObjMeta& meta = plan.meta;
+    const bool isPalette = plan.isPalette;
+    try {
+        const BoundTexInfo& oldBound = g_boundTexMaps[tid];
+        const bool canSkipHostLoad = GxTextureBindingContract::CanSkipHostLoad(
+            oldBound, plan.bound, plan.needsInit, plan.tlutChanged, plan.textureDataUploaded);
+
+        g_boundTexMaps[tid] = plan.bound;
+        if (SpmDumpFrame()) {
+            RT_LOGF(RT_TAG_GX, "[drawdump] loadtex map %u oa 0x%08X data 0x%08X %ux%u fmt 0x%X pal %d tlut %u skip %d init %d up %d\n", tid, oa,
+                    meta.dataAddr, meta.width, meta.height, meta.format, isPalette ? 1 : 0, meta.tlut, canSkipHostLoad ? 1 : 0,
+                    plan.needsInit ? 1 : 0, plan.textureDataUploaded ? 1 : 0);
+        }
+        if (SpmAuroraDlRecording()) {
+            static int s_texLog = 0;
+            if (s_texLog++ < 60) RT_LOGF(RT_TAG_GX, "[spmdl] recorded tex load map %u data 0x%08X %ux%u fmt 0x%X pal %d\n", tid, meta.dataAddr, meta.width, meta.height, meta.format, isPalette ? 1 : 0);
+        }
+        if (plan.spmPersistent || !canSkipHostLoad) {
+            GXLoadTexObj(obj, (GXTexMapID)tid);
+        }
+    } catch (const std::exception& ex) {
+        if (s_texLoadExceptionLogCount++ < 64) {
+            RT_LOGF(RT_TAG_GX,
+                    "GXLoadTexObj rejected reason=host-exception (%s) oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
+                    ex.what(), oa, tid, meta.format, meta.width, meta.height, meta.dataAddr);
+        }
+        BindUnloadableTexturePlaceholder(tid);
+        return false;
+    } catch (...) {
+        if (s_texLoadExceptionLogCount++ < 64) {
+            RT_LOGF(RT_TAG_GX,
+                    "GXLoadTexObj rejected reason=host-exception-unknown oa=0x%08X tid=%u fmt=0x%X %ux%u data=0x%08X\n",
+                    oa, tid, meta.format, meta.width, meta.height, meta.dataAddr);
+        }
+        BindUnloadableTexturePlaceholder(tid);
+        return false;
+    }
+    return true;
+}
+
+static void WriteTexLoadGuestEffects() {
     try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) { Memory::Write32(gd + 0x5FCu, Memory::Read32(gd + 0x5FCu) | 1u); Memory::Write16(gd + 2, 0); } } catch (...) {}
 }
+
+extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
+    G3D_REC_HLE(g3dn::kRecLoadTexObj, oa, tid);
+    const TexLoadPlan plan = PlanTexLoad(oa, tid);
+    if (!RunTexLoadPlan(plan, oa, tid, plan.obj)) return;
+    WriteTexLoadGuestEffects();
+}
 PPC_NATIVE_OVERRIDE_VOID(801f2fb0, GX__LoadTexObj_HLE, (uint32_t oa, uint32_t tid), (oa, tid));
+
+// A deferred native draw's texture load (g3d_native.cpp), as GX__LoadTexObj_HLE in two places. The game thread, when it
+// records the load: the table half, the guest writes (where the inline load makes them: a load that reaches Aurora; a
+// host exception in the worker's GXLoadTexObj, which skips them inline, is not foreseen here, none expected), and
+// Aurora's register shadow of the map as that GXLoadTexObj leaves it (this thread's SU flush reads it); the plan
+// carries a copy of the host object (the game thread may rebuild the object before the worker loads it). The draw
+// worker: the per-thread half with that copy.
+extern "C" void GXShadowSetTexMap(const GXTexObj* obj, uint32_t map);  // aurora GXTexture.cpp
+struct TexLoadJobPlan {
+    TexLoadPlan plan;
+    GXTexObj obj;
+};
+extern "C" size_t GX_HLE_TexLoadPlanBytes() { return sizeof(TexLoadJobPlan); }
+extern "C" void GX_HLE_PlanTexLoadForJob(uint32_t oa, uint32_t tid, void* out) {
+    TexLoadJobPlan job{};
+    job.plan = PlanTexLoad(oa, tid, /*remember=*/true);
+    if (job.plan.kind == TexLoadPlan::kLoad) {
+        job.obj = *job.plan.obj;
+        GXShadowSetTexMap(&job.obj, tid);
+        WriteTexLoadGuestEffects();
+    } else if (job.plan.kind == TexLoadPlan::kPlaceholder) {
+        GXShadowSetTexMap(UnloadableTexturePlaceholder(), tid);
+    }
+    job.plan.obj = nullptr;
+    std::memcpy(out, &job, sizeof job);
+}
+extern "C" void GX_HLE_RunTexLoadPlan(const void* in, uint32_t oa, uint32_t tid) {
+    TexLoadJobPlan job;
+    std::memcpy(&job, in, sizeof job);
+    RunTexLoadPlan(job.plan, oa, tid, &job.obj);
+}
+
+// The stats line (g3d_native.cpp G3dNativeLogStats): per frame. Guest thread.
+extern "C" void GX_HLE_LogTexPlanStats(double frames) {
+    if (frames <= 0 || s_texPlanJobs == 0) return;
+    RT_LOGF(RT_TAG_VI, "gx texture plans (deferred draws): %.1f/frame, remembered %.1f/frame, full %.1f/frame; "
+            "checked %.1f/frame (GX_TEXPLAN_CHECK=1), %llu mismatches\n",
+            s_texPlanJobs / frames, s_texPlanRemembered / frames, (s_texPlanJobs - s_texPlanRemembered) / frames,
+            s_texPlanChecked / frames, static_cast<unsigned long long>(s_texPlanCheckBad));
+    s_texPlanJobs = s_texPlanRemembered = s_texPlanChecked = 0;
+}
 
 // GXLoadTexObjPreLoaded(obj, region, id): the map id is the THIRD argument; the region (r4) only
 // describes TMEM placement, which Aurora does not model.
@@ -679,7 +963,7 @@ PPC_NATIVE_OVERRIDE_VOID(801f2e4c, GX__LoadTexObjPreLoaded_HLE, (uint32_t oa, ui
 // ============================================================================
 
 extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp, uint32_t hp, uint32_t fp, uint32_t wsp, uint32_t wtp, uint32_t mp) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     TexObjMeta meta;
     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
         RT_LOGF(RT_TAG_GX, "GXGetTexObjAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
@@ -692,7 +976,7 @@ extern "C" void GX__GetTexObjAll_80170bf8(uint32_t oa, uint32_t dp, uint32_t wp,
 }
 
 extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_t mafp, uint32_t milp, uint32_t malp, uint32_t lbp, uint32_t bcp, uint32_t elp, uint32_t map) {
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     TexObjMeta meta;
     if (!TryGetOrExtractTexObjMeta(oa, meta)) {
         RT_LOGF(RT_TAG_GX, "GXGetTexObjLODAll: failed to get metadata for GXTexObj @0x%08X\n", oa);
@@ -710,7 +994,7 @@ extern "C" void GX__GetTexObjLODAll_80170cbc(uint32_t oa, uint32_t mifp, uint32_
 // ============================================================================
 
 extern "C" void GX__InitTlutObj_HLE(uint32_t oa, uint32_t da, uint32_t f, uint32_t e) {
-    std::lock_guard<std::mutex> guard(g_tlutObjMutex); GXTlutObj* obj = CreateHostTlutObj(oa); TlutObjMeta& meta = GetTlutObjMeta(oa);
+    std::lock_guard<GuestThreadGuard> guard(g_tlutObjGuard); GXTlutObj* obj = CreateHostTlutObj(oa); TlutObjMeta& meta = GetTlutObjMeta(oa);
     if (meta.dataAddr != CanonicalizeGxMainRamAddress(da) || meta.format != f || meta.entries != (u16)e) NoteTlutObjRangeChangedLocked();
     meta.dataAddr=CanonicalizeGxMainRamAddress(da); meta.format=f; meta.entries=(u16)e; meta.dirty=false;
     // Fill the guest struct's hardware layout like the SDK does, so GXLoadTlut's inline-object path below reads this
@@ -721,22 +1005,26 @@ extern "C" void GX__InitTlutObj_HLE(uint32_t oa, uint32_t da, uint32_t f, uint32
     // then takes GetHostTlutObj's soft-fail path and gets a fresh empty object
     // instead of aurora reading entries*2 bytes off an unvalidated pointer.
     if (!ValidateTlutData(oa, meta)) return;
+    // Aurora digests the palette under a write generation it takes on another thread: marked here, where the host
+    // object gets its data (gx_guest_write.h g_trackedPages; also PlanTlutLoad's rebuild).
+    GxGuestWrite::NoteTrackedRange(da, static_cast<uint32_t>((u16)e) * 2u);
     GXInitTlutObj(obj, GuestToHostPtr(da), (GXTlutFmt)f, (u16)e); MarkHostTlutObjConstructed(oa);
 }
 PPC_NATIVE_OVERRIDE_VOID(801f3004, GX__InitTlutObj_HLE, (uint32_t oa, uint32_t da, uint32_t f, uint32_t e), (oa, da, f, e));
 
-extern "C" void GX__LoadTlut_HLE(uint32_t oa, uint32_t tl) {
-    // A TLUT object the game built without GXInitTlutObj (Brawl's NW4R G3D fills it inline): read the hardware
-    // layout {u32 tlut (format in bits 10-11), u32 loadTlut0 (address >> 5), u16 numEntries}.
-    // The hardware layout carries the LOADTLUT0 register id (0x64) in loadTlut0's top byte (GXInitTlutObj above
-    // writes the same layout). A reused object is rebuilt when its contents change.
+// A TLUT object the game built without GXInitTlutObj (Brawl's NW4R G3D fills it inline): read the hardware layout
+// {u32 tlut (format in bits 10-11), u32 loadTlut0 (address >> 5), u16 numEntries}. The hardware layout carries the
+// LOADTLUT0 register id (0x64) in loadTlut0's top byte (GXInitTlutObj above writes the same layout). A reused object
+// is rebuilt when its contents change: GX__InitTlutObj_HLE, which writes guest memory, so a deferred native draw
+// (g3d_native.cpp) runs this on the game thread when it records the load, and its replay finds the object current.
+extern "C" void GX_HLE_PrepareTlut(uint32_t oa) {
     if (oa != 0 && (Memory::Read32(oa + 4) >> 24) == 0x64u) {
         const uint32_t format = (Memory::Read32(oa) >> 10) & 3u;
         const uint32_t data = (Memory::Read32(oa + 4) & 0xFFFFFFu) << 5;
         const uint32_t entries = Memory::Read16(oa + 8);
         bool current = false;
         {
-            std::lock_guard<std::mutex> guard(g_tlutObjMutex);
+            std::lock_guard<GuestThreadGuard> guard(g_tlutObjGuard);
             const auto it = g_TlutObjMeta.find(oa);
             current = it != g_TlutObjMeta.end() && it->second.dataAddr == CanonicalizeGxMainRamAddress(data) &&
                       it->second.format == format && it->second.entries == entries;
@@ -745,13 +1033,57 @@ extern "C" void GX__LoadTlut_HLE(uint32_t oa, uint32_t tl) {
             GX__InitTlutObj_HLE(oa, data, format, entries);
         }
     }
+}
+
+// GXLoadTlut's table half (guest thread: g_tlutObjGuard): the object rebuilt where the guest changed it, then the host
+// object to load; null for an invalid TLUT index (logged; no load and no guest write).
+static GXTlutObj* PlanTlutLoad(uint32_t oa, uint32_t tl) {
+    GX_HLE_PrepareTlut(oa);
     if (SpmDumpFrame()) {
         auto it = g_TlutObjMeta.find(oa);
         RT_LOGF(RT_TAG_GX, "[drawdump] loadtlut oa 0x%08X slot %u known %d data 0x%08X n %u fmt %u\n", oa, tl, it != g_TlutObjMeta.end() ? 1 : 0,
                 it != g_TlutObjMeta.end() ? it->second.dataAddr : 0u, it != g_TlutObjMeta.end() ? it->second.entries : 0u,
                 it != g_TlutObjMeta.end() ? it->second.format : 0u);
-    } std::lock_guard<std::mutex> guard(g_tlutObjMutex); if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return; } auto metaIt = g_TlutObjMeta.find(oa); if (metaIt != g_TlutObjMeta.end() && metaIt->second.dirty) { if (ValidateTlutData(oa, metaIt->second)) { GXTlutObj* rebuild = CreateHostTlutObj(oa); GXInitTlutObj(rebuild, GuestToHostPtr(metaIt->second.dataAddr), (GXTlutFmt)metaIt->second.format, metaIt->second.entries); MarkHostTlutObjConstructed(oa); } metaIt->second.dirty = false; } GXTlutObj* obj = GetHostTlutObj(oa); GXLoadTlut(obj, (GXTlut)tl); try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {} }
+    } std::lock_guard<GuestThreadGuard> guard(g_tlutObjGuard); if (tl >= kMaxTluts) { RT_LOGF(RT_TAG_GX, "GXLoadTlut: invalid TLUT index %u (oa=0x%08X)\n", tl, oa); return nullptr; } auto metaIt = g_TlutObjMeta.find(oa); if (metaIt != g_TlutObjMeta.end() && metaIt->second.dirty) { if (ValidateTlutData(oa, metaIt->second)) { GXTlutObj* rebuild = CreateHostTlutObj(oa); GxGuestWrite::NoteTrackedRange(metaIt->second.dataAddr, static_cast<uint32_t>(metaIt->second.entries) * 2u); GXInitTlutObj(rebuild, GuestToHostPtr(metaIt->second.dataAddr), (GXTlutFmt)metaIt->second.format, metaIt->second.entries); MarkHostTlutObjConstructed(oa); } metaIt->second.dirty = false; }
+    return GetHostTlutObj(oa);
+}
+
+static void WriteTlutLoadGuestEffects() {
+    try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) Memory::Write16(gd + 2, 0); } catch (...) {}
+}
+
+extern "C" void GX__LoadTlut_HLE(uint32_t oa, uint32_t tl) {
+    G3D_REC_HLE(g3dn::kRecLoadTlut, oa, tl);
+    GXTlutObj* obj = PlanTlutLoad(oa, tl);
+    if (obj == nullptr) return;
+    GXLoadTlut(obj, (GXTlut)tl);
+    WriteTlutLoadGuestEffects();
+}
 PPC_NATIVE_OVERRIDE_VOID(801f302c, GX__LoadTlut_HLE, (uint32_t oa, uint32_t tl), (oa, tl));
+
+// A deferred native draw's TLUT load (g3d_native.cpp), as GX__LoadTexObj's job pair above: the game thread plans it and
+// makes its guest write when it records it, the plan carrying a copy of the host object; the draw worker loads the copy.
+// Aurora's texture-replacement palette mirror, when on, is producer state of its own (g3d_native.cpp keeps such loads
+// on the game thread).
+struct TlutLoadJobPlan {
+    bool load;
+    GXTlutObj obj;
+};
+extern "C" size_t GX_HLE_TlutLoadPlanBytes() { return sizeof(TlutLoadJobPlan); }
+extern "C" void GX_HLE_PlanTlutLoadForJob(uint32_t oa, uint32_t tl, void* out) {
+    TlutLoadJobPlan job{};
+    if (GXTlutObj* obj = PlanTlutLoad(oa, tl)) {
+        job.load = true;
+        job.obj = *obj;
+        WriteTlutLoadGuestEffects();
+    }
+    std::memcpy(out, &job, sizeof job);
+}
+extern "C" void GX_HLE_RunTlutLoadPlan(const void* in, uint32_t tl) {
+    TlutLoadJobPlan job;
+    std::memcpy(&job, in, sizeof job);
+    if (job.load) GXLoadTlut(&job.obj, (GXTlut)tl);
+}
 
 // ============================================================================
 // Texture Invalidation and Coordinate Control
@@ -775,7 +1107,7 @@ extern "C" void GX__SetTexCoordBias_801711fc(uint32_t c, uint32_t se, uint32_t t
 extern "C" void GX__InitTexObjData_SPM(uint32_t oa, uint32_t da) {
     const uint32_t canonical = CanonicalizeGxMainRamAddress(da);
     {
-        std::lock_guard<std::mutex> guard(g_texObjMutex);
+        std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
         if (g_TexObjMeta.find(oa) != g_TexObjMeta.end()) {  // else extracted from the guest struct on load
             TexObjMeta& meta = GetTexObjMeta(oa);
             meta.dataAddr = canonical;

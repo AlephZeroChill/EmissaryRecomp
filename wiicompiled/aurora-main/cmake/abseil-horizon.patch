@@ -1,0 +1,52 @@
+--- a/absl/base/internal/sysinfo.cc
++++ b/absl/base/internal/sysinfo.cc
+@@ -461,6 +461,14 @@
+   return reinterpret_cast<pid_t>(thread);
+ }
+ 
++#elif defined(__SWITCH__)
++
++// libnx's pthread_t is a pointer.
++pid_t GetTID() {
++  const auto self = reinterpret_cast<uintptr_t>(pthread_self());
++  return static_cast<pid_t>(self ^ (self >> 32));
++}
++
+ #else
+ 
+ // Fallback implementation of `GetTID` using `pthread_self`.
+--- a/absl/base/internal/thread_identity.cc
++++ b/absl/base/internal/thread_identity.cc
+@@ -85,7 +85,7 @@
+                   reclaimer);
+ 
+ #if defined(__wasi__) || defined(__EMSCRIPTEN__) || defined(__MINGW32__) || \
+-    defined(__hexagon__)
++    defined(__hexagon__) || defined(__SWITCH__)
+   // Emscripten, WASI and MinGW pthread implementations does not support
+   // signals. See
+   // https://kripken.github.io/emscripten-site/docs/porting/pthreads.html for
+--- a/absl/debugging/internal/elf_mem_image.h
++++ b/absl/debugging/internal/elf_mem_image.h
+@@ -35,7 +35,7 @@
+ #if defined(__ELF__) && !defined(__OpenBSD__) && !defined(__QNX__) && \
+     !defined(__native_client__) && !defined(__asmjs__) &&             \
+     !defined(__wasm__) && !defined(__HAIKU__) && !defined(__sun) &&   \
+-    !defined(__VXWORKS__) && !defined(__hexagon__)
++    !defined(__VXWORKS__) && !defined(__hexagon__) && !defined(__SWITCH__)
+ #define ABSL_HAVE_ELF_MEM_IMAGE 1
+ #endif
+ 
+--- a/absl/time/internal/cctz/src/time_zone_libc.cc
++++ b/absl/time/internal/cctz/src/time_zone_libc.cc
+@@ -71,6 +71,10 @@
+   const bool is_dst = tm.tm_isdst > 0;
+   return tzname[is_dst];
+ }
++#elif defined(__SWITCH__)
++// newlib's struct tm has no tm_gmtoff/tm_zone; Horizon's libc runs in UTC.
++auto tm_gmtoff(const std::tm&) -> long { return 0; }
++auto tm_zone(const std::tm&) -> const char* { return "UTC"; }
+ #elif defined(__VXWORKS__)
+ // Uses the globals: 'timezone' and 'tzname'.
+ auto tm_gmtoff(const std::tm& tm) -> decltype(timezone + 0) {

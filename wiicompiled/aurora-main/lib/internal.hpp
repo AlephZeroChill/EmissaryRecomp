@@ -122,10 +122,11 @@ auto underlying(T value) -> std::underlying_type_t<T> {
 
 #define UNIMPLEMENTED() FATAL("UNIMPLEMENTED: {}", __FUNCTION__)
 
-namespace wgpu { class CommandBuffer; }
+namespace aurora::gpu { class Encoder; }
 
 namespace aurora {
-void submit_staging_commands(const wgpu::CommandBuffer& commands);
+// Submits a mid-frame staging batch (a capacity split) in queue order with the frame worker's submits.
+void submit_staging_commands(gpu::Encoder&& commands);
 extern AuroraConfig g_config;
 extern uint32_t g_sdlCustomEventsStart;
 extern char g_gameName[4];
@@ -134,6 +135,11 @@ extern char g_gameName[4];
 // wait_for_frame_worker_sealed() joins only SEALED, which is what the FIFO drain uses.
 void wait_for_frame_worker() noexcept;
 std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept;
+// Whether wait_for_frame_worker_sealed() would return at once (the GX thread drops its renderer lock only to wait).
+bool frame_worker_sealed() noexcept;
+// Runs the runtime's frame-worker wait callback (guest alarm/retrace pump) on the calling producer thread. The GX
+// thread (gx_worker.hpp) never runs it: it would run guest code there; its own waits skip it, sync() calls this.
+void run_frame_worker_wait_callback() noexcept;
 bool wait_for_frame_worker_for(std::chrono::microseconds timeout) noexcept;
 std::recursive_mutex& renderer_gpu_mutex() noexcept;
 

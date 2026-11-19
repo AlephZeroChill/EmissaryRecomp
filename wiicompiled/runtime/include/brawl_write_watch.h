@@ -17,7 +17,10 @@ class WriteWatch {
     struct Span {uint32_t guest;size_t size,packed;};
     std::vector<Span> spans;
     std::map<uint32_t,std::unique_ptr<BrawlDirtyMemory::Page>> owned;
-    std::vector<std::pair<uint32_t,BrawlDirtyMemory::Page*>> scanPages;
+    // A tracked 64 KiB page's marks: its Page, or under MKW_LEAN_MEMORY its 1024-byte slice of the flat lean map,
+    // which has no touched byte (touched == nullptr: the page is always scanned).
+    struct ScanPage {uint32_t index;std::atomic<uint8_t>* touched;std::atomic<uint8_t>* blocks;};
+    std::vector<ScanPage> scanPages;
     static constexpr size_t PagesPerBatch=4;
     std::vector<std::vector<uint32_t>> scanResults;
     std::vector<uint32_t> capturedKeys;
@@ -58,6 +61,9 @@ public:
             // MEM1/MEM2 physical/cached/uncached aliases share the same mark.
             const uint32_t canonical=uint32_t(addr)&0x3fffffffu;
             auto& page=owned[canonical>>16];
+#if MKW_LEAN_MEMORY  // the marks live in BrawlDirtyMemory::leanBlocks at the canonical offset: no Page, no aliases
+            (void)page;
+#else
             if(!page)page=std::make_unique<BrawlDirtyMemory::Page>();
             BrawlDirtyMemory::pages[uint32_t(addr)>>16]=page.get();
             if(canonical<0x20000000u) {
@@ -65,14 +71,26 @@ public:
                 BrawlDirtyMemory::pages[(canonical|0x80000000u)>>16]=page.get();
                 BrawlDirtyMemory::pages[(canonical|0xc0000000u)>>16]=page.get();
             }
+#endif
         }
         scanPages.clear();
-        for(const auto& [index,page]:owned)scanPages.emplace_back(index,page.get());
+        for(const auto& [index,page]:owned) {
+#if MKW_LEAN_MEMORY
+            static_assert(sizeof(std::atomic<uint8_t>)==1,"dirty marks must be byte sized");
+            scanPages.push_back({index,nullptr,
+                reinterpret_cast<std::atomic<uint8_t>*>(BrawlDirtyMemory::leanBlocks+(size_t(index)<<10))});
+#else
+            scanPages.push_back({index,&page->touched,page->blocks});
+#endif
+        }
         scanResults.resize((scanPages.size()+PagesPerBatch-1)/PagesPerBatch);
     }
     // Capture consumes all marks. Enable after the initial base image; later
     // save/restore boundaries need no second walk over clean tracking pages.
     void Enable(){
+#if MKW_LEAN_MEMORY  // lean stores mark at all times: drop what the base image already holds
+        for(const auto& page:scanPages)std::memset(static_cast<void*>(page.blocks),0,1024);
+#endif
         BrawlDirtyMemory::active.store(true,std::memory_order_relaxed);
         resetNs=0;
     }
@@ -80,9 +98,11 @@ public:
         const auto start=std::chrono::steady_clock::now();
         // Writers are quiescent here. Capture already cleared consumed pages;
         // an exchange would still issue a locked write for every clean page.
-        for(auto& [index,p]:owned)if(p->touched.load(std::memory_order_relaxed)) {
-            for(auto& block:p->blocks)block.store(0,std::memory_order_relaxed);
-            p->touched.store(0,std::memory_order_relaxed);
+        for(const auto& page:scanPages) {
+            if(!page.touched) {std::memset(static_cast<void*>(page.blocks),0,1024);continue;}
+            if(!page.touched->load(std::memory_order_relaxed))continue;
+            for(size_t i=0;i<1024;++i)page.blocks[i].store(0,std::memory_order_relaxed);
+            page.touched->store(0,std::memory_order_relaxed);
         }
         BrawlDirtyMemory::active.store(true,std::memory_order_relaxed);
         resetNs=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
@@ -108,12 +128,12 @@ public:
           const size_t begin=batch*PagesPerBatch;
           const size_t end=std::min(begin+PagesPerBatch,scanPages.size());
           auto spanCursor=spans.begin();
-          if(begin<end)spanCursor=std::lower_bound(spans.begin(),spans.end(),uint64_t(scanPages[begin].first)<<16,
+          if(begin<end)spanCursor=std::lower_bound(spans.begin(),spans.end(),uint64_t(scanPages[begin].index)<<16,
               [](const Span& span,uint64_t address){return uint64_t(span.guest)+span.size<=address;});
           for(size_t pageNumber=begin;pageNumber<end;++pageNumber) {
-            const auto [pageIndex,page]=scanPages[pageNumber];
+            const auto [pageIndex,touched,blocks]=scanPages[pageNumber];
             ++examined;
-            if(!page->touched.load(std::memory_order_relaxed))continue;
+            if(touched && !touched->load(std::memory_order_relaxed))continue;
             const uint64_t pageStart=uint64_t(pageIndex)<<16;
             while(spanCursor!=spans.end() && uint64_t(spanCursor->guest)+spanCursor->size<=pageStart)++spanCursor;
             // Interior pages have one constant physical-to-packed offset.
@@ -125,7 +145,7 @@ public:
                 throw std::runtime_error("dirty span outside packed memory");
             for(size_t first=0;first<1024;first+=64) {
                 uint8_t marks[64];uint64_t words[8];
-                std::memcpy(marks,page->blocks+first,sizeof(marks));examined+=sizeof(marks);
+                std::memcpy(marks,static_cast<const void*>(blocks+first),sizeof(marks));examined+=sizeof(marks);
                 std::memcpy(words,marks,sizeof(words));
                 if(!(words[0]|words[1]|words[2]|words[3]|words[4]|words[5]|words[6]|words[7]))continue;
                 for(size_t wordIndex=0;wordIndex<8;++wordIndex) {
@@ -134,7 +154,7 @@ public:
                     const size_t byte=std::countr_zero(word)/8;
                     word&=~(uint64_t{0xff}<<(byte*8));
                     const size_t i=wordIndex*8+byte;
-                    page->blocks[first+i].store(0,std::memory_order_relaxed);
+                    blocks[first+i].store(0,std::memory_order_relaxed);
                     if(interior) {
                         const uint32_t key=uint32_t(packedStart/64+first+i);
                         if(dirty.empty() || dirty.back()!=key)dirty.push_back(key);
@@ -157,7 +177,7 @@ public:
                   }
                 }
             }
-            page->touched.store(0,std::memory_order_relaxed);
+            if(touched)touched->store(0,std::memory_order_relaxed);
         }
           scanResults[batch]=std::move(dirty);
           }

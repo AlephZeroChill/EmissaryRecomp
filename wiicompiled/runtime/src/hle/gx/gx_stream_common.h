@@ -365,19 +365,32 @@ struct AuroraVtxPublishOptions {
     int fmtLoopLast;
 };
 
-inline void PublishAuroraVtxState(GXVtxFmt fmt, const AuroraVtxPublishOptions& options) {
+// One call each to the SDK's list forms, GXSetVtxDescv and GXSetVtxAttrFmtv: the same attributes in the same order
+// as one GXSetVtxDesc / GXSetVtxAttrFmt per attribute, so the same register shadow and dirty bits (the normal-type
+// bits follow the final descriptors either way). Every raw GXBegin publishes here (effects draw with one per
+// emitter): 40-odd Aurora calls each, two producer checks apiece, were most of their cost.
+}  // namespace GxStream
+// The vertex-state carry's rewrite log (gx_fifo.cpp): a publish while the state is pending, with which of its entries
+// came from parts this thread rewrote (the rest are replayed from the state the jobs left).
+void GxCarryLogPublish(GXVtxFmt fmt, const GXVtxDescList* descs, int n, const GXVtxAttrFmtList* fmts, int m);
+namespace GxStream {
+
+// The lists a publication sends (descs and fmts each end with their NULL entry; n and m count the others).
+inline void BuildAuroraVtxPublishLists(GXVtxFmt fmt, const AuroraVtxPublishOptions& options, GXVtxDescList (&descs)[27],
+                                       int& n, GXVtxAttrFmtList (&fmts)[27], int& m) {
+    n = 0;
     for (int attr = 0; attr < 26; ++attr) {
         if (!options.includeNbt && attr == GX_VA_NBT) {
             continue;
         }
-        const GXAttr gxAttr = static_cast<GXAttr>(attr);
         GXAttrType type = g_hleGxState.vtxDesc[attr];
         if (type == GX_INDEX8 || type == GX_INDEX16) {
             type = GX_DIRECT;
         }
-        GXSetVtxDesc(gxAttr, type);
+        descs[n++] = GXVtxDescList{static_cast<GXAttr>(attr), type};
     }
-
+    descs[n] = GXVtxDescList{GX_VA_NULL, GX_NONE};
+    m = 0;
     for (int attr = options.fmtLoopFirst; attr <= options.fmtLoopLast; ++attr) {
         if (!options.includeNbt && attr == GX_VA_NBT) {
             continue;
@@ -387,8 +400,19 @@ inline void PublishAuroraVtxState(GXVtxFmt fmt, const AuroraVtxPublishOptions& o
             continue;
         }
         const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];
-        GXSetVtxAttrFmt(fmt, gxAttr, f.cnt, f.type, f.frac);
+        fmts[m++] = GXVtxAttrFmtList{gxAttr, f.cnt, f.type, f.frac};
     }
+    fmts[m] = GXVtxAttrFmtList{GX_VA_NULL, GX_POS_XY, GX_U8, 0};
+}
+
+inline void PublishAuroraVtxState(GXVtxFmt fmt, const AuroraVtxPublishOptions& options) {
+    GXVtxDescList descs[27];
+    GXVtxAttrFmtList fmts[27];
+    int n = 0, m = 0;
+    BuildAuroraVtxPublishLists(fmt, options, descs, n, fmts, m);
+    GXSetVtxDescv(descs);
+    if (m > 0) GXSetVtxAttrFmtv(fmt, fmts);
+    if (__builtin_expect(t_gxVtxPending, 0) && !g3dn::g_recOn) GxCarryLogPublish(fmt, descs, n, fmts, m);
 }
 
 } // namespace GxStream

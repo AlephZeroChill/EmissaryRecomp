@@ -18,47 +18,47 @@ extern "C" uint32_t OSSystemCall();
 extern "C" int32_t memset_zero_32(int32_t address);
 extern "C" void OS_HLE_ProcessAlarms(int maxToProcess);
 
-extern "C" uint32_t PPC_Mcrxr(uint32_t crField);
-extern "C" uint32_t PPC_ReadSpr(uint32_t spr);
-extern "C" void PPC_WriteSpr(uint32_t spr, uint32_t value);
-extern "C" uint32_t PPC_CrSetBit(uint32_t bitIndex, uint32_t value);
-extern "C" uint32_t PPC_CrLogical(uint32_t op, uint32_t bt, uint32_t ba, uint32_t bb);
-extern "C" uint32_t PPC_Mcrf(uint32_t dstField, uint32_t srcField);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mcrxr(uint32_t crField);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_ReadSpr(uint32_t spr);
+extern "C" MKW_GUEST_OP_CC void PPC_WriteSpr(uint32_t spr, uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_CrSetBit(uint32_t bitIndex, uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_CrLogical(uint32_t op, uint32_t bt, uint32_t ba, uint32_t bb);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mcrf(uint32_t dstField, uint32_t srcField);
 
 // Time base helpers (PowerPC 'mftb' / 'mftbu') - declared so generated code can call them.
-extern "C" uint32_t PPC_Mftb();
-extern "C" uint32_t PPC_Mftbu();
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mftb();
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mftbu();
 
 // Carry helpers used by translated arithmetic that depends on XER[CA].
-extern "C" uint32_t PPC_UpdateCarryAdd(uint32_t lhs, uint32_t rhs, uint32_t carryIn);
-extern "C" uint32_t PPC_UpdateCarrySub(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_UpdateCarryShiftRight(uint32_t value, uint32_t shift);
-extern "C" uint32_t PPC_GetCarry();
-extern "C" uint32_t PPC_Addo(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Addco(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Addeo(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Addmeo(uint32_t value);
-extern "C" uint32_t PPC_Addzeo(uint32_t value);
-extern "C" uint32_t PPC_Subfo(uint32_t subtrahend, uint32_t minuend);
-extern "C" uint32_t PPC_Subfco(uint32_t subtrahend, uint32_t minuend);
-extern "C" uint32_t PPC_Subfeo(uint32_t subtrahend, uint32_t minuend);
-extern "C" uint32_t PPC_Subfmeo(uint32_t value);
-extern "C" uint32_t PPC_Subfzeo(uint32_t value);
-extern "C" uint32_t PPC_Nego(uint32_t value);
-extern "C" uint32_t PPC_Mullwo(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Divwo(uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Divwuo(uint32_t lhs, uint32_t rhs);
-extern "C" void PPC_Lswi(uint32_t rD, uint32_t addr, uint32_t byteCount);
-extern "C" void PPC_Lswx(uint32_t rD, uint32_t addr);
-extern "C" void PPC_Stswi(uint32_t rS, uint32_t addr, uint32_t byteCount);
-extern "C" void PPC_Stswx(uint32_t rS, uint32_t addr);
-extern "C" uint32_t PPC_Lwarx(uint32_t addr);
-extern "C" uint32_t PPC_Stwcx(uint32_t addr, uint32_t value);
-extern "C" uint32_t PPC_Mcrfs(uint32_t dstField, uint32_t srcField);
-extern "C" uint32_t PPC_Eciwx(uint32_t addr);
-extern "C" void PPC_Ecowx(uint32_t addr, uint32_t value);
-extern "C" void PPC_TrapWord(uint32_t trapOptions, uint32_t lhs, uint32_t rhs);
-extern "C" uint32_t PPC_Cntlzw(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_UpdateCarryAdd(uint32_t lhs, uint32_t rhs, uint32_t carryIn);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_UpdateCarrySub(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_UpdateCarryShiftRight(uint32_t value, uint32_t shift);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_GetCarry();
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Addo(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Addco(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Addeo(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Addmeo(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Addzeo(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Subfo(uint32_t subtrahend, uint32_t minuend);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Subfco(uint32_t subtrahend, uint32_t minuend);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Subfeo(uint32_t subtrahend, uint32_t minuend);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Subfmeo(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Subfzeo(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Nego(uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mullwo(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Divwo(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Divwuo(uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC void PPC_Lswi(uint32_t rD, uint32_t addr, uint32_t byteCount);
+extern "C" MKW_GUEST_OP_CC void PPC_Lswx(uint32_t rD, uint32_t addr);
+extern "C" MKW_GUEST_OP_CC void PPC_Stswi(uint32_t rS, uint32_t addr, uint32_t byteCount);
+extern "C" MKW_GUEST_OP_CC void PPC_Stswx(uint32_t rS, uint32_t addr);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Lwarx(uint32_t addr);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Stwcx(uint32_t addr, uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Mcrfs(uint32_t dstField, uint32_t srcField);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Eciwx(uint32_t addr);
+extern "C" MKW_GUEST_OP_CC void PPC_Ecowx(uint32_t addr, uint32_t value);
+extern "C" MKW_GUEST_OP_CC void PPC_TrapWord(uint32_t trapOptions, uint32_t lhs, uint32_t rhs);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_Cntlzw(uint32_t value);
 
 MKW_PPC_FORCE_INLINE uint32_t PPC_CntlzwInline(uint32_t value)
 {
@@ -66,10 +66,10 @@ MKW_PPC_FORCE_INLINE uint32_t PPC_CntlzwInline(uint32_t value)
 }
 
 // Byte-reverse helpers (PowerPC 'lwbrx' / 'stwbrx' / 'lhbrx' / 'sthbrx')
-extern "C" uint32_t PPC_LoadWordByteReverse(uint32_t addr);
-extern "C" void PPC_StoreWordByteReverse(uint32_t addr, uint32_t value);
-extern "C" uint32_t PPC_LoadHalfwordByteReverse(uint32_t addr);
-extern "C" void PPC_StoreHalfwordByteReverse(uint32_t addr, uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_LoadWordByteReverse(uint32_t addr);
+extern "C" MKW_GUEST_OP_CC void PPC_StoreWordByteReverse(uint32_t addr, uint32_t value);
+extern "C" MKW_GUEST_OP_CC uint32_t PPC_LoadHalfwordByteReverse(uint32_t addr);
+extern "C" MKW_GUEST_OP_CC void PPC_StoreHalfwordByteReverse(uint32_t addr, uint32_t value);
 
 template <typename T>
 inline int32_t CompareUnsigned(T a, T b) {

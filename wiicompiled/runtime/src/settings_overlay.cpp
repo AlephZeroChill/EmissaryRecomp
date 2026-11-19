@@ -1678,7 +1678,11 @@ void UpdateBootShaderState() {
     }
     const uint32_t queued = aurora_get_queued_pipeline_count();
     g_bootShaderNotice |= queued > kBootShaderNoticeThreshold;
-    if (queued == 0 || now - g_bootShaderWaitStart > kBootShaderWaitLimit) {
+    // A scripted run (BRAWL_PAD_SCRIPT) does not wait for the prewarm: under Ryujinx it has taken minutes, the title
+    // keeps running behind the card meanwhile, and its idle timer starts the attract movie (which polls no pad, so
+    // the script's clock stops). Pipelines then compile on demand; measurements use the steady state after.
+    static const bool scripted = std::getenv("BRAWL_PAD_SCRIPT") != nullptr;
+    if (scripted || queued == 0 || now - g_bootShaderWaitStart > kBootShaderWaitLimit) {
         g_bootShadersReady.store(true, std::memory_order_release);
         // The title card then waits for a press (UpdateStartupPress); scripted test runs go straight on.
         if (std::getenv("NSMBW_INPUT_SCRIPT") != nullptr || std::filesystem::exists("input_script.txt")) {
@@ -2149,6 +2153,15 @@ bool StartupScreenVisible() noexcept {
     return !g_busyLabel.empty() || !g_strapInputAccepted.load(std::memory_order_acquire) ||
            !g_bootShadersReady.load(std::memory_order_acquire) ||
            g_presentedFrame < g_startupDismissFrame.load(std::memory_order_relaxed);
+}
+
+const char* StartupScreenReason() noexcept {
+    static char reason[160];
+    std::snprintf(reason, sizeof reason, "busy='%s' accepted=%d shadersReady=%d queued=%u presented=%llu dismissAt=%llu",
+                  g_busyLabel.c_str(), g_strapInputAccepted.load() ? 1 : 0, g_bootShadersReady.load() ? 1 : 0,
+                  aurora_get_queued_pipeline_count(), static_cast<unsigned long long>(g_presentedFrame),
+                  static_cast<unsigned long long>(g_startupDismissFrame.load()));
+    return reason;
 }
 
 void NotifyStrapInputAccepted() noexcept {

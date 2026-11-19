@@ -2,7 +2,7 @@
 
 #ifdef AURORA_ENABLE_GX
 #include "imgui.hpp"
-#include "webgpu/gpu.hpp"
+#include "gpu/gpu.hpp"
 #endif
 #include "input.hpp"
 #include "internal.hpp"
@@ -200,7 +200,7 @@ void resize_swapchain() noexcept {
     SDL_SetRenderScale(g_renderer, size.scale, size.scale);
   }
 #ifdef AURORA_ENABLE_GX
-  webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height);
+  gpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height);
 #endif
 }
 
@@ -230,12 +230,6 @@ bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
     break;
   case SDL_EVENT_WINDOW_RESTORED:
     g_backgrounded.store(false, std::memory_order_relaxed);
-    break;
-  // NSMBW: a phone app is killed, never shut down, so the pipelines compiled while playing are
-  // saved for the next launch when it leaves the screen (Dawn's device is internally locked).
-  case SDL_EVENT_WILL_ENTER_BACKGROUND:
-  case SDL_EVENT_TERMINATING:
-    webgpu::serialize_pipeline_caches();
     break;
 #endif
   default:

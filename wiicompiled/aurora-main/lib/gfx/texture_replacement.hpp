@@ -8,6 +8,9 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uint16_t entries) noexcept;
 void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept;
+// load_tlut does work (producer state of its own, keyed by object address): a TLUT load must stay on the producer
+// thread then (the runtime's deferred native draws, hle/g3d_native.cpp). Constant after init.
+bool tlut_mirror_active() noexcept;
 std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept;
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept;
 // New Super Paper Bros.: the button prompt set for the controller in use (0 xbox, 1 playstation, 2 nintendo,

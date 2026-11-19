@@ -34,5 +34,34 @@ inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
 #define MKW_PPC_ALWAYS_INLINE_BODY __attribute__((always_inline))
 #define MKW_PPC_COLD __attribute__((cold))
 
+// MKW_OUTLINE_GUEST_OPS=1 (opt-in; Clang, lean memory, exact floats): the guest operations translated code repeats at
+// every site (lean stores, exact single-precision loads/stores/arithmetic, compares into CR) and their cold fallbacks
+// are out-of-line calls with Clang's preserve_all convention, MKW_GUEST_OP_CC. The callee saves every register it
+// touches, XMM/vector ones included, so a call site is its argument moves and the call: no spill of the caller's live
+// values (x86-64 has no callee-saved XMM registers, so a plain call spilled every live float). Each operation is the
+// same code as before, compiled once with the same floating-point options (src/guest_ops_outlined.cpp): results are
+// bit-identical; translated code shrinks. Off by default: the game thread ran ~11% more cycles per frame with it on
+// (vanilla Training, Battlefield: 13.62M vs 12.14M), so smaller code is not faster code here.
+#ifndef MKW_OUTLINE_GUEST_OPS
+#define MKW_OUTLINE_GUEST_OPS 0
+#endif
+#if MKW_OUTLINE_GUEST_OPS
+#define MKW_GUEST_OP_CC __attribute__((preserve_all))
+#else
+#define MKW_GUEST_OP_CC
+#endif
+
 
 using MkwStateFreeResult2 = uint64_t __attribute__((ext_vector_type(2)));
+
+// MKW_EABI_REGS register-passing entries with two results (r3/r4/f1/f2 in that order, FPRs as their raw bits):
+// two integers, so SysV x86-64 returns them in rax:rdx.
+struct MkwEabiPair {
+    uint64_t first;
+    uint64_t second;
+};
+
+// Three or four results: returned through memory (the caller's frame), as CpuContext would have carried them.
+struct MkwEabiQuad {
+    uint64_t v[4];
+};

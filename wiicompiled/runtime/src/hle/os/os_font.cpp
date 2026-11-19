@@ -16,7 +16,26 @@
 namespace {
 constexpr uint32_t kOsFontEncodeAnsi = 0;  // OS_FONT_ENCODE_ANSI: NTSC-U / PAL consoles
 constexpr uint32_t kOsFontEncodeSjis = 1;  // OS_FONT_ENCODE_SJIS: Japanese consoles
-uint32_t g_fontEncode = kOsFontEncodeAnsi;  // SMNE01 is a North American game
+// Brawl keeps the encoding in guest memory, where its translated font code reads it too: a u16 at r13-0x5A40, 0xFFFF
+// until first asked, and beside it the string parser its font routines call (r13-0x3D70): 0x801DC7C0 (SJIS/ANSI), or
+// 0x801DC8BC (UTF) once an encoding 3-5 is set (OSGetFontEncode 0x801DC2C4, OSSetFontEncode 0x801DC318).
+constexpr uint32_t kFontEncodeAddr = 0x8059E9E0u;  // r13-0x5A40
+constexpr uint32_t kFontParserAddr = 0x805A06B0u;  // r13-0x3D70
+constexpr uint32_t kFontParserSjisAnsi = 0x801DC7C0u;
+constexpr uint32_t kFontParserUtf = 0x801DC8BCu;
+
+// The encoding, set on first use as the SDK does, except that its source - the VI DTV select bit on an NTSC console,
+// ANSI otherwise - is answered with ANSI: RSBE01 is a North American game, and that bit marks a Japanese console.
+uint32_t CurrentFontEncode()
+{
+    uint16_t encode = Memory::Read16(kFontEncodeAddr);
+    if (encode == 0xFFFFu) {
+        encode = kOsFontEncodeAnsi;
+        Memory::Write16(kFontEncodeAddr, encode);
+        Memory::Write32(kFontParserAddr, kFontParserSjisAnsi);
+    }
+    return encode;
+}
 
 void LogOnce(bool& logged, const char* message)
 {
@@ -27,21 +46,22 @@ void LogOnce(bool& logged, const char* message)
 }
 } // namespace
 
-// OSGetFontEncode (NSMBW 0x801B00A0): the current system-font encoding, ANSI unless the game set one.
+// OSGetFontEncode (Brawl 0x801DC2C4): the current system-font encoding.
 extern "C" uint32_t OSGetFontEncode_HLE()
 {
     static bool logged = false;
     LogOnce(logged, "OSGetFontEncode: reporting the configured encoding (no VI DTV register read)");
-    return g_fontEncode;
+    return CurrentFontEncode();
 }
 PPC_NATIVE_OVERRIDE(801DC2C4, OSGetFontEncode_HLE, uint32_t, (), ());
 
-// OSSetFontEncode (NSMBW 0x801B00F0): store a valid encoding and return the previous one.
+// OSSetFontEncode (Brawl 0x801DC318): store an encoding 0-5 (3-5 also select the UTF parser) and return the previous one.
 extern "C" uint32_t OSSetFontEncode_HLE(uint32_t encode)
 {
-    const uint32_t previous = g_fontEncode;
-    if (encode == kOsFontEncodeAnsi || encode == kOsFontEncodeSjis) {
-        g_fontEncode = encode;
+    const uint32_t previous = CurrentFontEncode();
+    if (encode <= 5) {
+        Memory::Write16(kFontEncodeAddr, static_cast<uint16_t>(encode));
+        if (encode >= 3) Memory::Write32(kFontParserAddr, kFontParserUtf);
     }
     return previous;
 }
@@ -82,7 +102,7 @@ extern "C" uint32_t OSGetFontTexel_HLE(uint32_t string, uint32_t image, int32_t 
         if (widthPtr != 0) Memory::Write32(widthPtr, 0);
         const uint8_t c = Memory::Read8(string);
         if (c == 0) return string;
-        const bool lead = g_fontEncode == kOsFontEncodeSjis && ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC));
+        const bool lead = CurrentFontEncode() == kOsFontEncodeSjis && ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC));
         return string + (lead ? 2u : 1u);
     } catch (const Memory::AccessViolation&) {
         return string;

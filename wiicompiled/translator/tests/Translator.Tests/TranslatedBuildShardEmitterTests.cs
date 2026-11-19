@@ -56,6 +56,61 @@ public sealed class TranslatedBuildShardEmitterTests
     }
 
     [Fact]
+    public void NativeBodyMarkerRoutesTheWrapperAndKeepsTheBodyAndStaticCalls()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"translator-native-body-{Guid.NewGuid():N}");
+        var functions = Path.Combine(root, "functions");
+        var native = Path.Combine(root, "runtime", "src");
+        var output = Path.Combine(root, "out");
+        Directory.CreateDirectory(functions);
+        Directory.CreateDirectory(native);
+        try
+        {
+            const string caller = """
+                #include "abi_bridge.h"
+                extern "C" void func_80001000(CpuContext* MKW_RESTRICT ctx) {
+                    InvokeDirectCpu<0x80005000u>(ctx);
+                }
+                // RECOMP_REGISTRATION base 0x80001000 func_80001000 preserves=true fpr_mask=0x00000000
+                """;
+            const string target = """
+                #include "abi_bridge.h"
+                extern "C" void func_80005000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = 5;
+                }
+                // RECOMP_REGISTRATION base 0x80005000 func_80005000 preserves=true fpr_mask=0x00000000
+                """;
+            Write(Path.Combine(functions, "func_80001000.cpp"), caller);
+            Write(Path.Combine(functions, "func_80005000.cpp"), target);
+            // A marker in a comment is not one.
+            Write(Path.Combine(native, "native.cpp"),
+                "MKW_NATIVE_BODY(0x80005000u, Native_80005000);\n// MKW_NATIVE_BODY(0x80001000u, Commented);\n");
+            var metadataPath = Path.Combine(root, "base_output.json");
+            BaseTranslationOutputMetadataFile.WriteIfChangedAtomic(metadataPath,
+                BaseTranslationOutputMetadata.Create([
+                    Metadata("func_80001000.cpp", 0x80001000u, caller),
+                    Metadata("func_80005000.cpp", 0x80005000u, target)
+                ], TranslationQualityMetadata.Clean, "native-body"));
+            TranslatedBuildShardEmitter.Emit(new TranslatedBuildShardOptions(
+                metadataPath, functions, output, native, BaseShardCount: 1, RegistrationShardCount: 1));
+            var shard = File.ReadAllText(Assert.Single(Directory.GetFiles(
+                Path.Combine(output, "base_common"), "shard_*.cpp")));
+            Assert.Contains("extern \"C\" void Native_80005000(CpuContext* ctx);", shard);
+            Assert.Contains("[[clang::musttail]] return Native_80005000(ctx);", shard);
+            Assert.Contains("extern \"C\" void func_80005000_body(CpuContext* MKW_RESTRICT ctx)", shard);
+            Assert.Contains("ctx->gpr[3] = 5;", shard);
+            Assert.Contains("[[clang::musttail]] return func_80001000_body(ctx);", shard);
+            Assert.DoesNotContain("Commented", shard);
+            // Not a registration: callers keep the static call into the (guarded) wrapper.
+            Assert.Contains("MKW_STATIC_TRANSLATED_CALL(0x80005000u, func_80005000, ctx);", shard);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public void RemainingWeightPartitionDoesNotCreateOversizedTailBin()
     {
         var weights = Enumerable.Repeat(300L, 10).ToArray();

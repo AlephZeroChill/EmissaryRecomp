@@ -112,6 +112,9 @@ extern "C" int32_t NANDInit_HLE(void) {
 
     // NAND home directory buffer: s_homeDir (NSMBW 0x80522780, 0x40 bytes)
     WriteGuestNandPath(0x804ED040, CurrentNandDataDir());
+    // Brawl's NANDInit then makes it the current directory too (strcpy into 0x8047C120, "/" until then), which the
+    // translated NAND code resolves relative paths against.
+    WriteGuestNandPath(0x8047C120, CurrentNandDataDir());
 
     // Mark NAND as initialized: s_libState = 2 (NSMBW 0x8056E030)
     Memory::Write32(0x805A0BA8, 2);
@@ -159,49 +162,9 @@ extern "C" int32_t NANDOpen_HLE(uint32_t pathPtr, uint32_t fileInfoPtr, uint32_t
     if (const auto result = NandCheckSystemSaveRead("NANDOpen", hostPath, mode))
         return *result;
 
-    // Existing-file write opens go through a shadow copy seeded from the original, so a
-    // crash between NANDWrite and NANDClose cannot leave a torn file (the game patches
-    // sub-ranges, e.g. ghost saves at a non-zero offset). New files still create in place.
-    if ((mode == 2 || mode == 3) && PathExists(hostPath) && !IsDirectory(hostPath)) {
-        if (IsHostPathOpen(hostPath)) {
-            // Another live handle already refers to this file. A shadow would hide the
-            // writes from that handle, so stay in place for this open.
-            LogNandWarning("NANDOpen", "WARNING: '%s' already has a live handle, writing in place",
-                           HostPathText(hostPath).c_str());
-        } else {
-            const std::filesystem::path tempPath = SafeTempPathFor(hostPath);
-            if (DiscardStaleSafeTemp(tempPath)) {
-                std::error_code ec;
-                std::filesystem::copy_file(hostPath, tempPath,
-                                           std::filesystem::copy_options::overwrite_existing, ec);
-                if (ec) {
-                    LogNandWarning("NANDOpen", "WARNING: could not seed shadow '%s' (%s), writing in place",
-                                   HostPathText(tempPath).c_str(), ec.message().c_str());
-                    NandRemove(tempPath);
-                } else {
-                    FILE* shadow = NandFopen(tempPath, "r+b");
-                    if (!shadow) {
-                        LogNandWarning("NANDOpen", "WARNING: could not open shadow '%s', writing in place",
-                                       HostPathText(tempPath).c_str());
-                        NandRemove(tempPath);
-                    } else {
-                        const int32_t shadowFd = AllocateFd(tempPath, shadow, static_cast<int32_t>(mode));
-                        {
-                            std::lock_guard<std::mutex> lock(g_fdMutex);
-                            auto it = g_fileHandles.find(shadowFd);
-                            if (it != g_fileHandles.end()) {
-                                it->second.safeCommitPath = hostPath;
-                            }
-                        }
-                        Memory::Write32(fileInfoPtr, static_cast<uint32_t>(shadowFd));
-                        Memory::Write8(fileInfoPtr + 0x8a, NAND_OPEN_FLAG_OPEN);
-                        return NAND_RESULT_OK;
-                    }
-                }
-            }
-        }
-    }
-
+    // Write opens write the file in place, as a Wii does. (A shadow copy of the whole file on every write open made
+    // Brawl copy its 14.6 MB collect.vff 11 times from boot to a match, 161 MB on the game thread, for 2 KB of writes:
+    // its VFF library opens the file read/write for every access.)
     const char* fopenMode = "rb";
     if (mode == 1) fopenMode = "rb";
     else if (mode == 2) fopenMode = "r+b";

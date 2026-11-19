@@ -125,12 +125,29 @@ public sealed partial class CxxLinearCodeGenerator
             var liveness = GuestFlagLivenessAnalyzer.Analyze(function, cfg, context, GuestFlagState.All);
             var fusedCompareSites = new HashSet<(string Block, int Index)>();
 
+            // MKW_FLAG_DIAG=1: why single-bit CR branches stay unfused (printed by the CLI after translation).
+            var diagNoExit = FlagDiagEnabled
+                ? GuestFlagLivenessAnalyzer.Analyze(function, cfg, context, GuestFlagState.None)
+                : null;
             {
                 foreach (var block in function.Blocks)
                 {
-                    if (!TryPlanCompareBranchFusion(
-                            function, cfg, block, liveness.LiveOut[block.Label], types,
-                            out var compare, out var compareBlock, out var compareIndex))
+                    var planned = TryPlanCompareBranchFusion(
+                        function, cfg, block, liveness.LiveOut[block.Label], types,
+                        out var compare, out var compareBlock, out var compareIndex);
+                    if (diagNoExit is not null && block.Instructions.Count != 0 &&
+                        block.Instructions[^1] is IrBranch diagBranch &&
+                        TryParseSingleCrBitTest(diagBranch, out var diagField, out _, out _))
+                    {
+                        System.Threading.Interlocked.Increment(ref FlagDiagBranches);
+                        if (planned) System.Threading.Interlocked.Increment(ref FlagDiagFused);
+                        else if (!liveness.LiveOut[block.Label].HasCrField(diagField))
+                            System.Threading.Interlocked.Increment(ref FlagDiagOther);
+                        else if (!diagNoExit.LiveOut[block.Label].HasCrField(diagField))
+                            System.Threading.Interlocked.Increment(ref FlagDiagLiveOnlyViaReturn);
+                        else System.Threading.Interlocked.Increment(ref FlagDiagLiveViaCall);
+                    }
+                    if (!planned)
                     {
                         continue;
                     }
@@ -221,6 +238,9 @@ public sealed partial class CxxLinearCodeGenerator
     private static bool IsXerDestination(string? destination) =>
         !string.IsNullOrWhiteSpace(destination) &&
         GetRegisterBaseName(destination!).Equals("xer", StringComparison.OrdinalIgnoreCase);
+
+    public static readonly bool FlagDiagEnabled = Environment.GetEnvironmentVariable("MKW_FLAG_DIAG") == "1";
+    public static long FlagDiagBranches, FlagDiagFused, FlagDiagOther, FlagDiagLiveOnlyViaReturn, FlagDiagLiveViaCall;
 
     /// <summary>
     /// How many basic blocks back the compare feeding a branch is searched. Compare/branch pairs are adjacent

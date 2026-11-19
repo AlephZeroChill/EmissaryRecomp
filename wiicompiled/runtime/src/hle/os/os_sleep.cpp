@@ -19,6 +19,7 @@
 #include "timebase_contract.h"
 #include "runtime_log.h"
 #include "os_internal.h"
+#include "guest_thread_guard.h"
 
 namespace {
 // Sleep deadlines live on the virtual timeline in deterministic mode (see det_clock.h), so a
@@ -30,12 +31,14 @@ std::chrono::steady_clock::time_point SleepClockNow()
 } // namespace
 
 namespace OsHleInternal {
-std::mutex gSleepTimerMutex;
+// Guest-thread state (guest_thread_guard.h): the scheduler, OSSleepTicks, OSResumeThread and save states (a helper
+// coroutine) all run on the guest CPU's thread. ~70 lock/unlock pairs a frame in P+ Training as mutexes.
+GuestThreadGuard gSleepTimerGuard{"gSleepTimerGuard"};
 std::vector<SleepTimerEntry> gSleepTimers;
 
 void CancelSleepTimer(uint32_t threadPtr)
 {
-    std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+    std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
     std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
         return entry.threadPtr == threadPtr;
     });
@@ -43,7 +46,7 @@ void CancelSleepTimer(uint32_t threadPtr)
 
 uint64_t NextSleepTimerTicks()
 {
-    std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+    std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
     uint64_t next = DetClock::kNever;
     for (const SleepTimerEntry& entry : gSleepTimers) {
         next = std::min(next, DetClock::TicksAtOrAfter(entry.deadline));
@@ -53,7 +56,7 @@ uint64_t NextSleepTimerTicks()
 
 bool SleepTimerIsPending(uint32_t threadPtr)
 {
-    std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+    std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
     for (const SleepTimerEntry& entry : gSleepTimers) {
         if (entry.threadPtr == threadPtr) {
             return true;
@@ -65,18 +68,18 @@ bool SleepTimerIsPending(uint32_t threadPtr)
 // Threads with an outstanding OSSleepTicks park (timer armed, wake not yet delivered). If one ends
 // up park-shaped with no pending timer, the reconciler in ProcessSleepTimers heals it; nothing
 // outside this set is ever force-started.
-std::mutex gOutstandingParkMutex;
+GuestThreadGuard gOutstandingParkGuard{"gOutstandingParkGuard"};
 std::unordered_set<uint32_t> gOutstandingParks;
 
 void MarkParkOutstanding(uint32_t threadPtr)
 {
-    std::lock_guard<std::mutex> lock(gOutstandingParkMutex);
+    std::lock_guard<GuestThreadGuard> lock(gOutstandingParkGuard);
     gOutstandingParks.insert(threadPtr);
 }
 
 void ClearOutstandingPark(uint32_t threadPtr)
 {
-    std::lock_guard<std::mutex> lock(gOutstandingParkMutex);
+    std::lock_guard<GuestThreadGuard> lock(gOutstandingParkGuard);
     gOutstandingParks.erase(threadPtr);
 }
 
@@ -87,7 +90,7 @@ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
     const auto duration = TimeBaseContract::TicksToDuration(ticks);
     const auto deadline = SleepClockNow() + duration;
 
-    std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+    std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
     std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
         return entry.threadPtr == threadPtr;
     });
@@ -114,7 +117,7 @@ bool ProcessSleepTimers(CpuContext* cpu)
         SleepTimerEntry timer{0, {}};
         bool found = false;
         {
-            std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+            std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
             for (auto it = gSleepTimers.begin(); it != gSleepTimers.end(); ++it) {
                 if (it->deadline <= now) {
                     timer = *it;
@@ -144,7 +147,7 @@ bool ProcessSleepTimers(CpuContext* cpu)
         const int32_t countAtFire =
             static_cast<int32_t>(Memory::Read32(threadPtr + kThreadSuspendOffset));
         if (stateAtFire == kThreadStateRunning) {
-            std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+            std::lock_guard<GuestThreadGuard> lock(gSleepTimerGuard);
             bool present = false;
             for (const SleepTimerEntry& entry : gSleepTimers) {
                 if (entry.threadPtr == threadPtr) {
@@ -195,7 +198,7 @@ bool ProcessSleepTimers(CpuContext* cpu)
 
         std::vector<uint32_t> outstanding;
         {
-            std::lock_guard<std::mutex> lock(gOutstandingParkMutex);
+            std::lock_guard<GuestThreadGuard> lock(gOutstandingParkGuard);
             outstanding.assign(gOutstandingParks.begin(), gOutstandingParks.end());
         }
         // Decide who to heal under the lock, but resume OUTSIDE it: the resume

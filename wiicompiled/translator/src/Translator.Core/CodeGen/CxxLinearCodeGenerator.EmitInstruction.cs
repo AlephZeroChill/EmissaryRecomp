@@ -126,7 +126,7 @@ public sealed partial class CxxLinearCodeGenerator
                     // A translate-time-constant address outside the MMIO window (gather-pipe already handled
                     // above) always takes the flat helper's plain-store arm, so the runtime MMIO test is provably dead.
                     var provenRamStore =
-                        TryGetKnownEffectiveAddress(store.Address, knownConstants, out var knownStoreAddress) &&
+                        TryGetKnownEffectiveAddress(store, store.Address, knownConstants, out var knownStoreAddress) &&
                         IsProvenRamStore(knownStoreAddress, store.SizeBytes);
                     string StoreHelper(int sizeBytes, bool isFloat) => provenRamStore
                         ? FlatWriteRamHelper(Bits(sizeBytes), isFloat)
@@ -165,7 +165,17 @@ public sealed partial class CxxLinearCodeGenerator
                     var start = RemapAddress(
                         new IrAddress(resolve.Base.RegisterName!, resolve.MinOffset),
                         types, localConstants, linkedAddressRemap);
-                    sb.AppendLine($"{pad}{resolve.Destination} = MemoryInline::ResolveRangeHost({start}, 0, {resolve.Length}u, {(resolve.NeedsWriteAccess ? "true" : "false")});");
+                    // MKW_LEAN_RANGES: segment ranges (memory_access.h, ResolveSegmentRange) and their accessors. A write
+                    // range off a proven stack address (the proof TryEmitStackStore uses) skips the policy byte, as
+                    // FlatStoreRam does: ResolveSegmentStackRange.
+                    if (LeanRanges && resolve.NeedsWriteAccess &&
+                        stackFacts.TryResolve(resolve, new IrAddress(resolve.Base.RegisterName!, resolve.MinOffset), out _))
+                    {
+                        sb.AppendLine($"{pad}{resolve.Destination} = MemoryInline::ResolveSegmentStackRange({start}, 0, {resolve.Length}u);");
+                        break;
+                    }
+                    var resolver = LeanRanges ? "ResolveSegmentRange" : "ResolveRangeHost";
+                    sb.AppendLine($"{pad}{resolve.Destination} = MemoryInline::{resolver}({start}, 0, {resolve.Length}u, {(resolve.NeedsWriteAccess ? "true" : "false")});");
                 }
                 break;
             case IrResolvedLoad load:
@@ -175,7 +185,7 @@ public sealed partial class CxxLinearCodeGenerator
                     var isFloatDest = (destType is ValueRepresentation pt && pt.IsFloat) || IsFloatRegister(load.Destination);
                     var address = RemapAddress(load.OriginalAddress, types, localConstants, linkedAddressRemap);
                     var helper = isFloatDest ? $"Float{Bits(load.SizeBytes)}" : Bits(load.SizeBytes).ToString();
-                    sb.AppendLine($"{pad}{dest} = MemoryInline::ReadResolved{helper}({load.Range}, {load.RangeOffset}u, {address});");
+                    sb.AppendLine($"{pad}{dest} = MemoryInline::{(LeanRanges ? "SegRead" : "ReadResolved")}{helper}({load.Range}, {load.RangeOffset}u, {address});");
                     if (IsFloatRegister(load.Destination))
                         localPaired[GetRegisterBaseName(load.Destination)] = false;
                 }
@@ -191,7 +201,7 @@ public sealed partial class CxxLinearCodeGenerator
                     var address = RemapAddress(store.OriginalAddress, types, localConstants, linkedAddressRemap);
                     var helper = isFloatStore ? $"Float{Bits(store.SizeBytes)}" : Bits(store.SizeBytes).ToString();
                     var value = isFloatStore || store.SizeBytes == 4 ? srcExpr : $"static_cast<uint{Bits(store.SizeBytes)}_t>({srcExpr})";
-                    sb.AppendLine($"{pad}MemoryInline::WriteResolved{helper}({store.Range}, {store.RangeOffset}u, {address}, {value});");
+                    sb.AppendLine($"{pad}MemoryInline::{(LeanRanges ? "SegWrite" : "WriteResolved")}{helper}({store.Range}, {store.RangeOffset}u, {address}, {value});");
                 }
                 break;
             case IrResolvedPsqLoad load:
@@ -221,7 +231,7 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     var helper = store.KnownGqr.HasValue
                         ? "PPC_PsqStKnownResolvedInline"
-                        : "PPC_PsqStResolvedInline";
+                        : _segmentPsqStores ? "PPC_PsqStSegmentInline" : "PPC_PsqStResolvedInline";
                     var known = store.KnownGqr.HasValue ? $", 0x{store.KnownGqr.Value:X8}u" : string.Empty;
                     var template = $"<{store.W}u, {store.I}u{known}>";
                     var value = ToPairedFloatExpression(store.Source, types, localPaired);
@@ -246,10 +256,17 @@ public sealed partial class CxxLinearCodeGenerator
                     var secondFloat = IsFloat(pair.SecondDestination);
                     var firstAddress = RemapAddress(pair.FirstOriginalAddress, types, localConstants, linkedAddressRemap);
                     var secondAddress = RemapAddress(pair.SecondOriginalAddress, types, localConstants, linkedAddressRemap);
+                    var readPrefix = LeanRanges ? "SegRead" : "ReadResolved";
                     var pairHelper = pair.ElementSizeBytes == 2
-                        ? $"MemoryInline::ReadResolvedPair16({pair.Range}, {pair.RangeOffset}u)"
-                        : $"MemoryInline::ReadResolvedPair32({pair.Range}, {pair.RangeOffset}u)";
-                    string FastValue(string member, bool isFloat) => isFloat ? $"PpcBitCastToFloatInline(resolved_pair.{member})" : $"resolved_pair.{member}";
+                        ? $"MemoryInline::{readPrefix}Pair16({pair.Range}, {pair.RangeOffset}u)"
+                        : $"MemoryInline::{readPrefix}Pair32({pair.Range}, {pair.RangeOffset}u)";
+                    // A float word is an lfs: the exact widening (FlatReadFloat32Body), which a float->double
+                    // conversion is not under host DAZ (FPSCR[NI]). Segment pairs always take this arm.
+                    string FastValue(string member, bool isFloat) => !isFloat
+                        ? $"resolved_pair.{member}"
+                        : LeanRanges
+                            ? $"PpcBitCastToDoubleInline(PpcConvertToDoubleBitsInline(resolved_pair.{member}))"
+                            : $"PpcBitCastToFloatInline(resolved_pair.{member})";
                     string SlowHelper(bool isFloat) => isFloat ? $"Float{Bits(pair.ElementSizeBytes)}" : Bits(pair.ElementSizeBytes).ToString();
                     var firstMember = pair.Descending ? "second" : "first";
                     var secondMember = pair.Descending ? "first" : "second";
@@ -261,8 +278,8 @@ public sealed partial class CxxLinearCodeGenerator
                     sb.AppendLine($"{pad}        {ToDestination(pair.FirstDestination, types)} = {FastValue(firstMember, firstFloat)};");
                     sb.AppendLine($"{pad}        {ToDestination(pair.SecondDestination, types)} = {FastValue(secondMember, secondFloat)};");
                     sb.AppendLine($"{pad}    }} else {{");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.FirstDestination, types)} = MemoryInline::ReadResolved{SlowHelper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress});");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.SecondDestination, types)} = MemoryInline::ReadResolved{SlowHelper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress});");
+                    sb.AppendLine($"{pad}        {ToDestination(pair.FirstDestination, types)} = MemoryInline::{readPrefix}{SlowHelper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress});");
+                    sb.AppendLine($"{pad}        {ToDestination(pair.SecondDestination, types)} = MemoryInline::{readPrefix}{SlowHelper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress});");
                     sb.AppendLine($"{pad}    }}");
                     sb.AppendLine($"{pad}}}");
                     if (IsFloatRegister(pair.FirstDestination)) localPaired[GetRegisterBaseName(pair.FirstDestination)] = false;
@@ -284,9 +301,13 @@ public sealed partial class CxxLinearCodeGenerator
                     var secondFloat = IsFloat(pair.SecondSource);
                     var first = Source(pair.FirstSource);
                     var second = Source(pair.SecondSource);
-                    string Raw(string value, bool isFloat) => isFloat
-                        ? $"PpcBitCastToU32Inline(static_cast<float>({value}))"
-                        : $"static_cast<uint32_t>({value})";
+                    // A float word is an stfs: Gekko's narrowing (ConvertPpcDoubleToSingleBits), not the host's rounding
+                    // cast, for a value left in double precision. Segment pairs always store through this arm.
+                    string Raw(string value, bool isFloat) => !isFloat
+                        ? $"static_cast<uint32_t>({value})"
+                        : LeanRanges
+                            ? $"MemoryInline::ConvertPpcDoubleToSingleBits({value})"
+                            : $"PpcBitCastToU32Inline(static_cast<float>({value}))";
                     var lowSource = pair.Descending ? second : first;
                     var highSource = pair.Descending ? first : second;
                     var lowFloat = pair.Descending ? secondFloat : firstFloat;
@@ -296,15 +317,16 @@ public sealed partial class CxxLinearCodeGenerator
                         : $"((static_cast<uint64_t>({Raw(lowSource, lowFloat)}) << 32) | {Raw(highSource, highFloat)})";
                     var firstAddress = RemapAddress(pair.FirstOriginalAddress, types, localConstants, linkedAddressRemap);
                     var secondAddress = RemapAddress(pair.SecondOriginalAddress, types, localConstants, linkedAddressRemap);
+                    var writePrefix = LeanRanges ? "SegWrite" : "WriteResolved";
                     var fast = pair.ElementSizeBytes == 2
-                        ? $"MemoryInline::WriteResolvedPair16({pair.Range}, {pair.RangeOffset}u, {packed})"
-                        : $"MemoryInline::WriteResolvedPair32({pair.Range}, {pair.RangeOffset}u, {packed})";
+                        ? $"MemoryInline::{writePrefix}Pair16({pair.Range}, {pair.RangeOffset}u, {packed})"
+                        : $"MemoryInline::{writePrefix}Pair32({pair.Range}, {pair.RangeOffset}u, {packed})";
                     string Helper(bool isFloat) => isFloat ? $"Float{Bits(pair.ElementSizeBytes)}" : Bits(pair.ElementSizeBytes).ToString();
                     var firstOffset = pair.Descending ? pair.RangeOffset + pair.ElementSizeBytes : pair.RangeOffset;
                     var secondOffset = pair.Descending ? pair.RangeOffset : pair.RangeOffset + pair.ElementSizeBytes;
                     sb.AppendLine($"{pad}if (!{fast}) {{");
-                    sb.AppendLine($"{pad}    MemoryInline::WriteResolved{Helper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress}, {first});");
-                    sb.AppendLine($"{pad}    MemoryInline::WriteResolved{Helper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress}, {second});");
+                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress}, {first});");
+                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress}, {second});");
                     sb.AppendLine($"{pad}}}");
                 }
                 break;
@@ -357,8 +379,21 @@ public sealed partial class CxxLinearCodeGenerator
                         EmitNormalizeGuestCallFloatReturn(call.Target, sb, pad, localPaired, guestAbiProvider);
                         break;
                     }
+                    // MKW_EABI_REGS register-passing call. Same exclusions as the state-free form: paired-single
+                    // argument/return normalization and LR-continuation sites rewrite CpuContext directly.
+                    if (_activeResidency is not null && !usesStateFreeCall &&
+                        _eabiVariants?.TryGetValue(addr, out var calleeVariant) == true &&
+                        argumentNormalization.Length == 0 &&
+                        !resumesThroughLinkRegister &&
+                        !modOverridableCallTargets.Contains(addr) &&
+                        !IsGuestPairedScalarFloatReturn(guestAbiProvider, call.Target))
+                    {
+                        EmitEabiVariantCall(sb, pad, bufferBaseLength, calleeVariant!, guestAbiContracts.GetValueOrDefault(addr));
+                        EmitNormalizeGuestCallFloatReturn(call.Target, sb, pad, localPaired, guestAbiProvider);
+                        break;
+                    }
                     var boundarySync = usesStateFreeCall || argumentNormalization.Length != 0
-                        ? ResidencyBoundarySync.Full
+                        ? ResidencyBoundarySync.Full.WithEabiPreservation(guestAbiContracts.GetValueOrDefault(addr))
                         : ResolveDirectCallBoundarySync(addr, guestAbiContracts, modOverridableCallTargets);
                     if (!boundarySync.IsFull &&
                         IsGuestPairedScalarFloatReturn(guestAbiProvider, call.Target))
@@ -368,8 +403,12 @@ public sealed partial class CxxLinearCodeGenerator
                         // the callee contract does not mention it.
                         boundarySync = boundarySync.WithFpr(1);
                     }
-                    AppendFlush(sb, pad, boundarySync);
+                    // Unconditional on both sides: the state-free arms below only touch CpuContext, and the reload
+                    // after them runs on every path (LR-continuation bodies get no flush plan at all).
+                    AppendFlush(sb, pad, boundarySync, unconditional: true);
                     sb.Append(argumentNormalization);
+                    // Only the resident path (EmitResidentStateFreeCall) takes MKW_LEAN_CALLS: this context-spelled form
+                    // is also the input the state-free clone rewriter recognizes by its if/else shape, so it keeps it.
                     if (usesStateFreeCall)
                     {
                         sb.AppendLine($"{pad}if ({StateFreeAvailabilityCondition(addr, stateFreeAbiContracts, stateFreeCallSymbols)}) {{");
@@ -421,7 +460,7 @@ public sealed partial class CxxLinearCodeGenerator
                             sb.AppendLine($"{fallbackPad}if (TranslatedFunctionRegistry::FindByAddressPtr(ctx->lr) != nullptr) {{");
                             sb.AppendLine($"{fallbackPad}    InvokeIndirectCpu(ctx->lr, ctx);");
                             sb.AppendLine($"{fallbackPad}}}");
-                            sb.AppendLine($"{fallbackPad}return;");
+                            sb.AppendLine($"{fallbackPad}{ReturnStatement(fromContext: true)}");
                         }
                         if (localFallthroughLr.HasValue)
                         {
@@ -430,16 +469,16 @@ public sealed partial class CxxLinearCodeGenerator
                         break;
                     }
                     EmitNormalizeGuestCallFloatReturn(call.Target, sb, pad, localPaired, guestAbiProvider);
-                    AppendReload(sb, pad, boundarySync);
+                    AppendReload(sb, pad, boundarySync, unconditional: true);
                 }
                 else if (IsGuestCallTarget(call.Target))
                 {
                     var targetSymbol = FormatSymbol(call.Target);
-                    AppendFlush(sb, pad);
+                    AppendFlush(sb, pad, ResidencyBoundarySync.Full, unconditional: true);
                     EmitNormalizeGuestCallFloatArguments(call.Target, call.Arguments, sb, pad, localPaired, guestAbiProvider);
                     sb.AppendLine($"{pad}{targetSymbol}(ctx);");
                     EmitNormalizeGuestCallFloatReturn(call.Target, sb, pad, localPaired, guestAbiProvider);
-                    AppendReload(sb, pad);
+                    AppendReload(sb, pad, ResidencyBoundarySync.Full.WithEabiPreservation(null), unconditional: true);
                 }
                 else
                 {
@@ -472,14 +511,25 @@ public sealed partial class CxxLinearCodeGenerator
                     // Helpers can implicitly touch guest state through CpuContext (PPC_Stwcx writes CR0, PPC_Lswi
                     // writes GPRs, OSSystemCall is a full boundary). Resident locals can't observe that, so the
                     // cataloged effect becomes a mini boundary: flush what it may read, reload what it may write.
+                    var helperEffect = AnalyzeGuestHelperEffect(call);
                     var helperSync = _activeResidency is not null
-                        ? ResidencyBoundarySync.FromHelperEffect(AnalyzeGuestHelperEffect(call))
+                        ? ResidencyBoundarySync.FromHelperEffect(helperEffect)
                         : null;
+                    // MKW_EABI_REGS: an uncataloged (complete-boundary) helper is not trusted with this body's
+                    // nonvolatiles' CpuContext copies, which may be stale; it does not change them either.
+                    if (helperSync is not null && helperEffect.BoundaryFlags.HasFlag(GuestCallBoundaryFlags.RequiresCompleteContext))
+                        helperSync = helperSync.WithEabiPreservation(null);
                     if (helperSync is not null && !helperSync.IsEmpty)
                     {
-                        AppendFlush(sb, pad, helperSync);
+                        AppendFlush(sb, pad, helperSync, unconditional: true);
                     }
-                    var callExpr = $"{FormatSymbol(call.Target)}({string.Join(", ", args)})";
+                    // The fused single family with a single-precision C (multiplier) skips C's 25-bit rounding
+                    // (CxxLinearCodeGenerator.SingleFpr.cs).
+                    var callSymbol = FusedSingleTargets.Contains(call.Target) && call.Arguments.Count == 3 &&
+                                     IsSingleFprOperand(call.Arguments[1], localPaired)
+                        ? FormatSymbol(call.Target) + "SingleC"
+                        : FormatSymbol(call.Target);
+                    var callExpr = $"{callSymbol}({string.Join(", ", args)})";
                     if (!string.IsNullOrWhiteSpace(call.Destination))
                     {
                         sb.AppendLine(IsPairedProducerTarget(call.Target)
@@ -496,7 +546,7 @@ public sealed partial class CxxLinearCodeGenerator
                         // value in the local; reloading it from CpuContext would
                         // clobber that result with stale state.
                         var reloadSync = ExcludeDestinationFromReload(helperSync, call.Destination);
-                        AppendReload(sb, pad, reloadSync);
+                        AppendReload(sb, pad, reloadSync, unconditional: true);
                     }
                 }
                 if (!string.IsNullOrWhiteSpace(call.Destination) && IsFloatRegister(call.Destination))
@@ -507,9 +557,13 @@ public sealed partial class CxxLinearCodeGenerator
             case IrIndirectCall icall:
                 {
                     var indirectTarget = ToExpression(icall.Target, types);
-                    AppendFlush(sb, pad);
-                    sb.AppendLine($"{pad}InvokeIndirectCpu({indirectTarget}, ctx);");
-                    AppendReload(sb, pad);
+                    // Full reload: an indirect callee need not follow the ABI. P+ switches Gecko code lists by
+                    // changing r15; reloading only volatiles left a stale r15 local and BOOST.GCT never ran.
+                    // MKW_EABI_REGS (vanilla only) trusts the EABI here as well.
+                    var indirectSync = GuestEabi.Enabled ? ResidencyBoundarySync.EabiUnknownCall : ResidencyBoundarySync.Full;
+                    AppendFlush(sb, pad, indirectSync, unconditional: true);
+                    sb.AppendLine($"{pad}MKW_INDIRECT_CALL({indirectTarget}, ctx);");
+                    AppendReload(sb, pad, indirectSync, unconditional: true);
                     // f1 is the conventional scalar floating-point return.
                     // Do not retag the other volatile FPRs: a callee that leaves
                     // one untouched also leaves its packed payload untouched.
@@ -523,8 +577,9 @@ public sealed partial class CxxLinearCodeGenerator
                     // and this frame never observes registers again, so the
                     // locals must not be written back afterwards.
                     AppendFlush(sb, pad);
-                    sb.AppendLine($"{pad}InvokeIndirectJump({jumpTarget}, ctx);");
-                    sb.AppendLine($"{pad}return;");
+                    EmitVariantIndirectJumpCheck(sb, pad, jumpTarget, currentLabel);
+                    sb.AppendLine($"{pad}MKW_INDIRECT_JUMP({jumpTarget}, ctx);");
+                    sb.AppendLine($"{pad}{ReturnStatement(fromContext: true)}");
                 }
                 break;
             case IrComment comment:
@@ -588,7 +643,7 @@ public sealed partial class CxxLinearCodeGenerator
         RepresentationEnvironment types,
         StackAddressFacts stackFacts)
     {
-        if (!stackFacts.TryResolve(load.Address, out _))
+        if (!stackFacts.TryResolve(load, load.Address, out _))
         {
             return false;
         }
@@ -618,7 +673,7 @@ public sealed partial class CxxLinearCodeGenerator
         RepresentationEnvironment types,
         StackAddressFacts stackFacts)
     {
-        if (!stackFacts.TryResolve(store.Address, out _))
+        if (!stackFacts.TryResolve(store, store.Address, out _))
         {
             return false;
         }
@@ -716,12 +771,18 @@ public sealed partial class CxxLinearCodeGenerator
         sb.AppendLine($"{pad}}}");
     }
 
+    /// <summary>
+    /// The translate-time-constant address <paramref name="at"/> accesses, when its base is a known constant there:
+    /// not where the base is read across a guest call that may have changed it (CallClobberedValues).
+    /// </summary>
     private static bool TryGetKnownEffectiveAddress(
+        IrInstruction at,
         IrAddress address,
         IReadOnlyDictionary<string, uint> knownConstants,
         out uint effectiveAddress)
     {
-        if (knownConstants.TryGetValue(address.Base, out var baseAddress))
+        if (!CallClobberedValues.IsStaleUse(at, address.Base) &&
+            knownConstants.TryGetValue(address.Base, out var baseAddress))
         {
             effectiveAddress = unchecked(baseAddress + (uint)address.Offset);
             return true;

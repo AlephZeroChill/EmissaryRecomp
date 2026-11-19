@@ -1,5 +1,6 @@
 // CPU-only interpreter test support. Unexpected graphics or online calls fail.
 #include "brawl_rollback.h"
+#include "guest_float_abi.h"
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "recomp_mod_loader.h"
@@ -11,6 +12,10 @@
 #include <cstdlib>
 #include <ostream>
 #include <string_view>
+
+// No translated functions here, so no float ABI facts (the generated table, guest_float_abi.h).
+extern "C" const uint32_t g_mkwGuestFloatAbiCount = 0u;
+extern "C" const MkwGuestFloatAbi g_mkwGuestFloatAbi[1] = {};
 
 bool g_suppressSehReporting = false;
 thread_local jmp_buf* g_sehJumpTarget = nullptr;
@@ -55,6 +60,8 @@ void UpdateSystem(CpuContext*, GuestFunction) { std::abort(); }
 void SeedCrossplayStage() { std::abort(); }
 bool DrivesLoop() { std::abort(); }
 void AnchorPads() { std::abort(); }
+LoopCallAction LoopCall(CpuContext*, uint32_t) { std::abort(); }
+void LoopCallDone(uint32_t) { std::abort(); }
 }
 extern "C" void GX_HLE_FIFO_Write8(uint8_t) { std::abort(); }
 extern "C" void GX_HLE_FIFO_Write16(uint16_t) { std::abort(); }

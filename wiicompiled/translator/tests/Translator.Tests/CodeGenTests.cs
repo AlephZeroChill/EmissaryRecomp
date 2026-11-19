@@ -1418,7 +1418,7 @@ public class CodeGenTests
             types);
         Assert.Contains("switch (static_cast<uint32_t>(r3))", jumpTableCode, StringComparison.Ordinal);
         Assert.Contains("case 0x80008100u:", jumpTableCode, StringComparison.Ordinal);
-        Assert.Contains("InvokeIndirectJump(r3, ctx);", jumpTableCode, StringComparison.Ordinal);
+        Assert.Contains("MKW_INDIRECT_JUMP(r3, ctx);", jumpTableCode, StringComparison.Ordinal);
 
         var implicitReturnFunction = new IrFunction(
             "implicit_return_case",

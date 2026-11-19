@@ -3,26 +3,22 @@
 #include "efb_ram_encoder.hpp"
 #include "tex_copy_conv.hpp"
 #include "../internal.hpp"
-#include "../webgpu/gpu.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <string>
+#include <optional>
 #include <unordered_map>
 #include <vector>
-
-#include <magic_enum.hpp>
 
 namespace aurora::gfx::efb_ram {
 namespace {
 
 Module Log("aurora::gfx::efb_ram");
 
-using webgpu::g_device;
-using webgpu::g_instance;
+using gpu::g_device;
 
 // A CPU-consumed EFB copy this small is the lens-flare occlusion probe (4x4 Z24X8, 64 bytes).
 // Resolving it synchronously stalls the producer and kills interpolation, so read it back async.
@@ -42,15 +38,26 @@ struct PendingCopy {
   GXTexFmt format = GX_TF_RGBA8;
   TextureHandle texture;
   TextureHandle nativeTexture;
-  Range nativeBlitUniform;
-  uint64_t nativeUniformEpoch = 0;
 };
 
 struct Download {
   PendingCopy copy;
-  wgpu::Buffer buffer;
+  gpu::TransferBuffer buffer;
   uint32_t bytesPerRow = 0;
   uint64_t bufferSize = 0;
+};
+
+// A submit's fence, shared by every readback recorded on that submit.
+struct SharedFence {
+  SDL_GPUFence* fence = nullptr;
+  explicit SharedFence(SDL_GPUFence* fence) noexcept : fence(fence) {}
+  SharedFence(const SharedFence&) = delete;
+  SharedFence& operator=(const SharedFence&) = delete;
+  ~SharedFence() {
+    if (fence != nullptr && g_device != nullptr) {
+      SDL_ReleaseGPUFence(g_device, fence);
+    }
+  }
 };
 
 enum class AsyncState : uint8_t {
@@ -62,11 +69,14 @@ enum class AsyncState : uint8_t {
 // One readback per destination address, reused for that destination's lifetime: the probe hits
 // the same buffer every frame, so pooling avoids a per-frame allocation.
 struct AsyncSlot {
-  wgpu::Buffer buffer;
+  gpu::TransferBuffer buffer;
   TextureHandle nativeTexture;
+  // The texture read back, held from encode until after_submit records its download.
+  TextureHandle source;
+  std::shared_ptr<SharedFence> fence;
   uint64_t bufferSize = 0;
   uint32_t bytesPerRow = 0;
-  // Latched at encode time and read by the map callback.
+  // Latched at encode time and read when the readback completes.
   void* dest = nullptr;
   GXTexFmt format = GX_TF_RGBA8;
   uint32_t width = 0;
@@ -89,20 +99,22 @@ std::vector<PendingCopy> g_asyncSealed;
 std::mutex g_asyncMutex;
 std::unordered_map<void*, AsyncSlot> g_asyncSlots;
 uint32_t g_asyncMapsInFlight = 0;
-uint64_t g_asyncGeneration = 1;
 
-uint32_t align_to(uint32_t value, uint32_t alignment) noexcept { return (value + alignment - 1) & ~(alignment - 1); }
+// The shared blit shader clamps Y to flags.z/w; preserve the full source.
+constexpr std::array<float, 12> NativeBlitUniform{
+    0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 64.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f,
+};
 
 // An internally scaled copy cannot be read back directly, so blit it down to native-resolution
-// RGBA8 first. Pushes a uniform, so it must run while the staging buffers are still mapped.
+// RGBA8 first.
 void ensure_native_texture(PendingCopy& pending, TextureHandle* cache = nullptr) noexcept {
   if (pending.texture->size.width == pending.width && pending.texture->size.height == pending.height) {
     return;
   }
-  if (pending.nativeTexture && pending.nativeUniformEpoch == staging_epoch()) return;
   if (pending.nativeTexture) {
-    // Keep the texture; its old staging range belongs to a submitted batch.
-  } else if (cache != nullptr && *cache && (*cache)->size.width == pending.width &&
+    return;
+  }
+  if (cache != nullptr && *cache && (*cache)->size.width == pending.width &&
       (*cache)->size.height == pending.height) {
     pending.nativeTexture = *cache;
   } else {
@@ -111,93 +123,82 @@ void ensure_native_texture(PendingCopy& pending, TextureHandle* cache = nullptr)
       *cache = pending.nativeTexture;
     }
   }
-  // The shared blit shader clamps Y to flags.z/w; preserve the full source.
-  const std::array nativeBlitUniform{
-      0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 64.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f,
-  };
-  pending.nativeBlitUniform = push_uniform(nativeBlitUniform);
-  pending.nativeUniformEpoch = staging_epoch();
 }
 
-void encode_native_blit(const wgpu::CommandEncoder& encoder, const PendingCopy& pending) noexcept {
+void encode_native_blit(gpu::Encoder& enc, const PendingCopy& pending) noexcept {
   const tex_copy_conv::ConvRequest blitRequest{
       .fmt = GX_TF_RGBA8,
-      .srcView = pending.texture->sampleTextureView,
-      .uniformRange = pending.nativeBlitUniform,
+      .src = pending.texture->texture,
+      .uniformRange = {0, sizeof(NativeBlitUniform)},
       .dst = pending.nativeTexture,
       .sampleFilter = pending.format == GX_TF_Z16 || pending.format == GX_TF_Z24X8
                           ? tex_copy_conv::SampleFilter::Nearest
                           : tex_copy_conv::SampleFilter::Linear,
   };
-  tex_copy_conv::blit(encoder, blitRequest);
+  tex_copy_conv::blit(enc, reinterpret_cast<const uint8_t*>(NativeBlitUniform.data()), blitRequest);
 }
 
 HostPixelOrder texture_pixel_order(const TextureHandle& texture) noexcept {
-  return texture->format == wgpu::TextureFormat::BGRA8Unorm ? HostPixelOrder::BGRA : HostPixelOrder::RGBA;
+  return texture->format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM ? HostPixelOrder::BGRA : HostPixelOrder::RGBA;
 }
 
-void complete_async_slot(void* dest, uint64_t generation, wgpu::MapAsyncStatus status,
-                         wgpu::StringView message) noexcept {
-  std::lock_guard lock{g_asyncMutex};
-  if (generation != g_asyncGeneration) return;
-  const auto it = g_asyncSlots.find(dest);
-  if (it == g_asyncSlots.end()) {
-    return;
-  }
-  auto& slot = it->second;
-  if (slot.state != AsyncState::MapPending) return;
+const TextureHandle& readback_texture(const PendingCopy& pending) noexcept {
+  return pending.nativeTexture ? pending.nativeTexture : pending.texture;
+}
+
+// Called with g_asyncMutex held, once the slot's fence has signaled.
+void complete_async_slot(AsyncSlot& slot) noexcept {
+  slot.fence.reset();
   if (g_asyncMapsInFlight > 0) --g_asyncMapsInFlight;
-  if (status == wgpu::MapAsyncStatus::Success) {
-    const auto* pixels = static_cast<const uint8_t*>(slot.buffer.GetConstMappedRange(0, slot.bufferSize));
-    if (pixels != nullptr) {
-      // Writes guest RAM from the event-queue thread while the guest may be reading it. The only
-      // consumer min/maxes depth for a fade factor, so a torn tile just mixes two frames' depths.
-      const size_t outputSize = encoded_size(slot.format, slot.width, slot.height);
-      if (slot.strideWidth > slot.width) {
-        // A patch: encode it on its own, then lay each row of blocks into the wider texture.
-        std::vector<uint8_t> patch(outputSize);
-        if (encode(patch.data(), outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth,
-                   slot.hostHeight, slot.bytesPerRow, slot.order)) {
-          const size_t rowBytes = encoded_size(slot.format, slot.width, 1);
-          const size_t pitch = encoded_size(slot.format, slot.strideWidth, 1);
-          const size_t rows = rowBytes != 0 ? outputSize / rowBytes : 0;
-          auto* out = static_cast<uint8_t*>(slot.dest);
-          for (size_t row = 0; row < rows; ++row) {
-            std::memcpy(out + row * pitch, patch.data() + row * rowBytes, rowBytes);
-          }
-          if (rows != 0) {
-            notify_guest_write(slot.dest, (rows - 1) * pitch + rowBytes);
-          }
+  const auto* pixels = static_cast<const uint8_t*>(SDL_MapGPUTransferBuffer(g_device, slot.buffer->handle, false));
+  if (pixels == nullptr) {
+    Log.warn("Async EFB RAM readback mapping failed: {}", SDL_GetError());
+  } else {
+    // Writes guest RAM from the frame worker while the guest may be reading it. The only
+    // consumer min/maxes depth for a fade factor, so a torn tile just mixes two frames' depths.
+    const size_t outputSize = encoded_size(slot.format, slot.width, slot.height);
+    if (slot.strideWidth > slot.width) {
+      // A patch: encode it on its own, then lay each row of blocks into the wider texture.
+      std::vector<uint8_t> patch(outputSize);
+      if (encode(patch.data(), outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth,
+                 slot.hostHeight, slot.bytesPerRow, slot.order)) {
+        const size_t rowBytes = encoded_size(slot.format, slot.width, 1);
+        const size_t pitch = encoded_size(slot.format, slot.strideWidth, 1);
+        const size_t rows = rowBytes != 0 ? outputSize / rowBytes : 0;
+        auto* out = static_cast<uint8_t*>(slot.dest);
+        for (size_t row = 0; row < rows; ++row) {
+          std::memcpy(out + row * pitch, patch.data() + row * rowBytes, rowBytes);
         }
-      } else {
-        if (!encode(slot.dest, outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth,
-                    slot.hostHeight, slot.bytesPerRow, slot.order)) {
-          Log.error("Failed to encode async EFB RAM copy format=0x{:x} size={}x{}",
-                    static_cast<unsigned>(slot.format), slot.width, slot.height);
+        if (rows != 0) {
+          notify_guest_write(slot.dest, (rows - 1) * pitch + rowBytes);
         }
-        // Guest RAM written from outside the embedder, so nothing bumps its write generation and a
-        // texture cached over this range would keep its digest.
-        notify_guest_write(slot.dest, outputSize);
       }
+    } else {
+      if (!encode(slot.dest, outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth,
+                  slot.hostHeight, slot.bytesPerRow, slot.order)) {
+        Log.error("Failed to encode async EFB RAM copy format=0x{:x} size={}x{}",
+                  static_cast<unsigned>(slot.format), slot.width, slot.height);
+      }
+      // Guest RAM written from outside the embedder, so nothing bumps its write generation and a
+      // texture cached over this range would keep its digest.
+      notify_guest_write(slot.dest, outputSize);
     }
-    slot.buffer.Unmap();
-  } else if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
-    Log.warn("Async EFB RAM readback mapping failed {}: {}", magic_enum::enum_name(status), message);
+    SDL_UnmapGPUTransferBuffer(g_device, slot.buffer->handle);
   }
   slot.state = AsyncState::Idle;
 }
 
-// Runs the completion callbacks for maps whose GPU work has finished. Must not
-// be called while g_asyncMutex is held: complete_async_slot takes it.
+// Completes the readbacks whose GPU work has finished. Never blocks. Must not be called while
+// g_asyncMutex is held.
 void drain_async_events() noexcept {
-  {
-    std::lock_guard lock{g_asyncMutex};
-    if (g_asyncMapsInFlight == 0) {
-      return;
-    }
+  std::lock_guard lock{g_asyncMutex};
+  if (g_asyncMapsInFlight == 0) {
+    return;
   }
-  if (g_instance) {
-    g_instance.ProcessEvents();
+  for (auto& [dest, slot] : g_asyncSlots) {
+    if (slot.state == AsyncState::MapPending && slot.fence && SDL_QueryGPUFence(g_device, slot.fence->fence)) {
+      complete_async_slot(slot);
+    }
   }
 }
 
@@ -265,13 +266,6 @@ bool has_pending(void* dest) noexcept {
 }
 
 bool prepare_downloads(void* dest) {
-  uint64_t copies = 0;
-  for (const auto& pending : g_pending) {
-    if (dest != nullptr && pending.dest != dest) continue;
-    if (pending.texture->size.width != pending.width || pending.texture->size.height != pending.height) ++copies;
-  }
-  // Reserve all copies, even already-prepared ones: a split retires their ranges.
-  ensure_staging_space({0, copies * staging_uniform_bytes(48), 0, 0});
   bool found = false;
   for (auto& pending : g_pending) {
     if (dest != nullptr && pending.dest != dest) continue;
@@ -281,7 +275,7 @@ bool prepare_downloads(void* dest) {
   return found;
 }
 
-void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest) noexcept {
+void encode_downloads(gpu::Encoder& enc, void* dest) noexcept {
   if (!g_downloads.empty()) {
     Log.fatal("Attempted to encode new EFB RAM downloads before completing the previous batch");
   }
@@ -295,83 +289,64 @@ void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest) noexcept 
     PendingCopy pending = std::move(*it);
     it = g_pending.erase(it);
     if (pending.nativeTexture) {
-      encode_native_blit(encoder, pending);
+      encode_native_blit(enc, pending);
     }
-    const auto& texture = pending.nativeTexture ? pending.nativeTexture : pending.texture;
-    const uint32_t bytesPerRow = align_to(texture->size.width * 4, 256);
-    const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture->size.height;
-    const wgpu::BufferDescriptor descriptor{
-        .label = "GX EFB RAM copy readback",
-        .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
-        .size = bufferSize,
-    };
-    auto buffer = g_device.CreateBuffer(&descriptor);
-    const wgpu::TexelCopyTextureInfo source{
-        .texture = texture->texture,
-        .mipLevel = 0,
-        .origin = {0, 0, 0},
-        .aspect = wgpu::TextureAspect::All,
-    };
-    const wgpu::TexelCopyBufferInfo destination{
-        .layout =
-            wgpu::TexelCopyBufferLayout{
-                .offset = 0,
-                .bytesPerRow = bytesPerRow,
-                .rowsPerImage = texture->size.height,
-            },
-        .buffer = buffer,
-    };
-    encoder.CopyTextureToBuffer(&source, &destination, &texture->size);
-    g_downloads.push_back({
-        .copy = std::move(pending),
-        .buffer = std::move(buffer),
-        .bytesPerRow = bytesPerRow,
-        .bufferSize = bufferSize,
-    });
+    g_downloads.push_back({.copy = std::move(pending)});
   }
 }
 
+// The caller has submitted the encoder holding the copies' blits; the downloads go on a command
+// buffer of their own, submitted after it, whose fence covers them.
 bool complete_downloads() noexcept {
+  if (g_downloads.empty()) {
+    return true;
+  }
   bool success = true;
+  gpu::Encoder enc;
+  if (!enc) {
+    g_downloads.clear();
+    return false;
+  }
   for (auto& download : g_downloads) {
-    // WaitAny may time out before Dawn delivers cancellation. The callback must
-    // own its result rather than retaining references to this stack frame.
-    struct MapResult {
-      std::mutex mutex;
-      wgpu::MapAsyncStatus status = wgpu::MapAsyncStatus::CallbackCancelled;
-      std::string message;
-    };
-    const auto result = std::make_shared<MapResult>();
-    const auto future =
-        download.buffer.MapAsync(wgpu::MapMode::Read, 0, download.bufferSize, wgpu::CallbackMode::WaitAnyOnly,
-                                 [result](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-                                   std::lock_guard lock{result->mutex};
-                                   result->status = status;
-                                   if (message.data != nullptr) {
-                                     size_t length = 0;
-                                     while (length < 512 && length < message.length && message.data[length] != '\0') {
-                                       ++length;
-                                     }
-                                     result->message.assign(message.data, length);
-                                   }
-                                 });
-    const auto waitStatus = g_instance.WaitAny(future, 5000000000);
-    wgpu::MapAsyncStatus mapStatus;
-    std::string mapMessage;
-    {
-      std::lock_guard lock{result->mutex};
-      mapStatus = result->status;
-      mapMessage = result->message;
+    const auto& texture = readback_texture(download.copy);
+    const uint32_t bytesPerRow = texture->size.width * 4;
+    const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture->size.height;
+    download.buffer = gpu::create_transfer_buffer(false, static_cast<uint32_t>(bufferSize));
+    if (!download.buffer) {
+      continue;
     }
-    if (waitStatus != wgpu::WaitStatus::Success || mapStatus != wgpu::MapAsyncStatus::Success) {
-      Log.error("EFB RAM readback failed wait={} map={} message={}", magic_enum::enum_name(waitStatus),
-                magic_enum::enum_name(mapStatus), mapMessage);
+    download.bytesPerRow = bytesPerRow;
+    download.bufferSize = bufferSize;
+    gpu::download_from_texture(enc, *texture->texture, 0, 0, texture->size.width, texture->size.height,
+                               *download.buffer, 0, texture->size.width);
+  }
+  SDL_GPUFence* fence = enc.submit_with_fence();
+  if (fence == nullptr) {
+    Log.error("EFB RAM readback submit failed: {}", SDL_GetError());
+    g_downloads.clear();
+    return false;
+  }
+  const bool waited = SDL_WaitForGPUFences(g_device, true, &fence, 1);
+  SDL_ReleaseGPUFence(g_device, fence);
+  if (!waited) {
+    Log.error("EFB RAM readback wait failed: {}", SDL_GetError());
+    g_downloads.clear();
+    return false;
+  }
+
+  for (auto& download : g_downloads) {
+    if (!download.buffer) {
+      Log.error("EFB RAM readback buffer creation failed");
       success = false;
       continue;
     }
-
-    const auto* pixels = static_cast<const uint8_t*>(download.buffer.GetConstMappedRange(0, download.bufferSize));
-    const auto& readbackTexture = download.copy.nativeTexture ? download.copy.nativeTexture : download.copy.texture;
+    const auto* pixels = static_cast<const uint8_t*>(SDL_MapGPUTransferBuffer(g_device, download.buffer->handle, false));
+    if (pixels == nullptr) {
+      Log.error("EFB RAM readback mapping failed: {}", SDL_GetError());
+      success = false;
+      continue;
+    }
+    const auto& readbackTexture = readback_texture(download.copy);
     const auto order = texture_pixel_order(readbackTexture);
     const size_t outputSize = encoded_size(download.copy.format, download.copy.width, download.copy.height);
     if (!encode(download.copy.dest, outputSize, download.copy.format, download.copy.width, download.copy.height, pixels,
@@ -381,7 +356,7 @@ bool complete_downloads() noexcept {
       success = false;
     }
     notify_guest_write(download.copy.dest, outputSize);
-    download.buffer.Unmap();
+    SDL_UnmapGPUTransferBuffer(g_device, download.buffer->handle);
   }
   g_downloads.clear();
   return success;
@@ -405,7 +380,7 @@ void seal_async_downloads() noexcept {
   g_asyncPending.clear();
 }
 
-void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
+void encode_async_downloads(gpu::Encoder& enc) noexcept {
   if (g_asyncSealed.empty()) {
     return;
   }
@@ -425,39 +400,19 @@ void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
       continue;
     }
     if (pending.nativeTexture) {
-      encode_native_blit(encoder, pending);
+      encode_native_blit(enc, pending);
     }
-    const auto& texture = pending.nativeTexture ? pending.nativeTexture : pending.texture;
-    const uint32_t bytesPerRow = align_to(texture->size.width * 4, 256);
+    const auto& texture = readback_texture(pending);
+    const uint32_t bytesPerRow = texture->size.width * 4;
     const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture->size.height;
     if (!slot.buffer || slot.bufferSize != bufferSize) {
-      const wgpu::BufferDescriptor descriptor{
-          .label = "GX EFB RAM async readback",
-          .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
-          .size = bufferSize,
-      };
-      slot.buffer = g_device.CreateBuffer(&descriptor);
+      slot.buffer = gpu::create_transfer_buffer(false, static_cast<uint32_t>(bufferSize));
       slot.bufferSize = bufferSize;
     }
     if (!slot.buffer) {
       continue;
     }
-    const wgpu::TexelCopyTextureInfo source{
-        .texture = texture->texture,
-        .mipLevel = 0,
-        .origin = {0, 0, 0},
-        .aspect = wgpu::TextureAspect::All,
-    };
-    const wgpu::TexelCopyBufferInfo destination{
-        .layout =
-            wgpu::TexelCopyBufferLayout{
-                .offset = 0,
-                .bytesPerRow = bytesPerRow,
-                .rowsPerImage = texture->size.height,
-            },
-        .buffer = slot.buffer,
-    };
-    encoder.CopyTextureToBuffer(&source, &destination, &texture->size);
+    slot.source = texture;
     slot.bytesPerRow = bytesPerRow;
     slot.dest = pending.dest;
     slot.format = pending.format;
@@ -472,36 +427,47 @@ void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
   g_asyncSealed.clear();
 }
 
+// The frame's encoder (with any native blits) is submitted; record this frame's readbacks on one
+// command buffer after it, whose fence tells drain_async_events when the slots may be mapped.
 void after_submit() noexcept {
-  struct PendingMap {
-    void* dest;
-    wgpu::Buffer buffer;
-    uint64_t bufferSize;
-    uint64_t generation;
-  };
-  std::vector<PendingMap> pendingMaps;
   {
     std::lock_guard lock{g_asyncMutex};
+    std::vector<AsyncSlot*> recorded;
+    std::optional<gpu::Encoder> enc;
     for (auto& [dest, slot] : g_asyncSlots) {
       if (slot.state != AsyncState::CopySubmitted) {
         continue;
       }
-      slot.state = AsyncState::MapPending;
-      ++g_asyncMapsInFlight;
-      pendingMaps.push_back({dest, slot.buffer, slot.bufferSize, g_asyncGeneration});
+      if (!enc) {
+        enc.emplace();
+      }
+      if (!*enc || !slot.source) {
+        slot.source.reset();
+        slot.state = AsyncState::Idle;
+        continue;
+      }
+      gpu::download_from_texture(*enc, *slot.source->texture, 0, 0, slot.hostWidth, slot.hostHeight, *slot.buffer, 0,
+                                 slot.hostWidth);
+      slot.source.reset();
+      recorded.push_back(&slot);
+    }
+    if (enc && *enc) {
+      SDL_GPUFence* fence = enc->submit_with_fence();
+      const auto shared = fence != nullptr ? std::make_shared<SharedFence>(fence) : nullptr;
+      for (auto* slot : recorded) {
+        if (!shared) {
+          slot->state = AsyncState::Idle;
+          continue;
+        }
+        slot->fence = shared;
+        slot->state = AsyncState::MapPending;
+        ++g_asyncMapsInFlight;
+      }
     }
   }
 
-  for (const auto& pending : pendingMaps) {
-    pending.buffer.MapAsync(wgpu::MapMode::Read, 0, pending.bufferSize, wgpu::CallbackMode::AllowSpontaneous,
-                            [dest = pending.dest, generation = pending.generation](wgpu::MapAsyncStatus status,
-                                                                                 wgpu::StringView message) {
-                              complete_async_slot(dest, generation, status, message);
-                            });
-  }
-
-  // Nothing else pumps the WebGPU event queue on this thread, so a completed map would sit
-  // unharvested with its slot busy. ProcessEvents does not block.
+  // Nothing else harvests completed readbacks on this thread, so a finished one would sit with its
+  // slot busy. Querying the fences does not block.
   drain_async_events();
 }
 
@@ -510,12 +476,9 @@ void abort_async() noexcept { g_asyncSealed.clear(); }
 void shutdown() noexcept {
   cancel();
   g_asyncSealed.clear();
-  // Retire callbacks before releasing buffers, and release outside their mutex:
-  // destruction may itself deliver an AllowSpontaneous cancellation callback.
   decltype(g_asyncSlots) retiredSlots;
   {
     std::lock_guard lock{g_asyncMutex};
-    ++g_asyncGeneration;
     retiredSlots.swap(g_asyncSlots);
     g_asyncMapsInFlight = 0;
   }

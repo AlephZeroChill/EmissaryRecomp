@@ -1,5 +1,6 @@
 #pragma once
 #include "memory.h"
+#include "hz_perf.h"
 #include "ppc_runtime.h"
 #include "system_bridge.h"
 #include "game_graphics_options.h"
@@ -24,16 +25,42 @@ inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx);
 // Guest code patching (Gecko codes, Syriinge hooks): every translated function opens with MKW_GUEST_CODE_GUARD,
 // one byte per function (indexed by the translator's guest_code_guard table); a function whose guest code changed at
 // run time runs in the interpreter instead (guest_code_patch.cpp).
-extern "C" uint8_t g_mkwGuestCodePatched[];
+// The translator opens each public entry as a wrapper: the guard, then a tail call of the function's body
+// (func_X_body). The table is hidden (one rip-relative compare, no GOT load) and RunPatched takes ctx first (it stays
+// in its argument register), so a wrapper is a compare, a conditional tail jump to the body, and a two-instruction
+// patched arm.
+extern "C" __attribute__((visibility("hidden"))) uint8_t g_mkwGuestCodePatched[];
 namespace GuestCodePatch {
-void RunPatched(uint32_t address, CpuContext* ctx);
+void RunPatched(CpuContext* ctx, uint32_t address);
+void (*ContinuationAt(uint32_t address))(CpuContext*);  // guest_code_patch.h: the code variant entered at address
 }
 #define MKW_GUEST_CODE_GUARD(index, address)                    \
     do {                                                        \
         if (__builtin_expect(g_mkwGuestCodePatched[index], 0)) { \
-            GuestCodePatch::RunPatched(address, ctx);           \
+            GuestCodePatch::RunPatched(ctx, address);           \
             return;                                             \
         }                                                       \
+    } while (false)
+
+// A hand-written body for a translated function, declared at file scope: `MKW_NATIVE_BODY(0x801EC1B8u, Native);`.
+// The translator scans runtime/src for it and makes func_X's wrapper tail-call `symbol` instead of func_X_body (after
+// the guard above), so static, direct, indirect and interpreter calls all reach the native at the translated call's
+// cost. func_X_body stays: the native's fallback for inputs it does not handle, and its differential-test reference.
+#define MKW_NATIVE_BODY(address, symbol) extern "C" void symbol(CpuContext* ctx)
+
+// Native hooks with guest fallback: a function the translator lists (TranslatedBuildShardEmitter, nativeHook) calls
+// g_mkwNativeHook[slot] after its guard, so a mod's patch of the function still wins. A hook returning true handled
+// the call as the guest code would have: it may use the stack below r1 and the volatile registers the translated
+// function writes, and leaves the non-volatile registers and the caller's frames as they were; false (or no hook)
+// runs the translated body. Slot 0: nw4r::g3d::DrawResMdlDirectly (hle/g3d_native.cpp).
+using MkwNativeHookFn = bool (*)(CpuContext*);
+extern "C" __attribute__((visibility("hidden"))) MkwNativeHookFn g_mkwNativeHook[4];
+#define MKW_NATIVE_HOOK(slot)                                                     \
+    do {                                                                          \
+        if (const MkwNativeHookFn mkwHook = g_mkwNativeHook[slot];                \
+            __builtin_expect(mkwHook != nullptr, 0) && mkwHook(ctx)) {            \
+            return;                                                               \
+        }                                                                         \
     } while (false)
 
 // Persistent per-thread CPU context used across translated function calls.
@@ -303,11 +330,16 @@ struct KnownTypedNativeCpuCall {
 
 #include "native_cpu_calls.inc"
 
-// Direct-mapped thread-local memo in front of the sorted registry lookup every bctrl performs;
-// a miss just re-runs the sorted lookup. 512 entries (12 KiB) covers the per-frame indirect
-// working set while staying L1/L2 resident, unlike 4096 which would thrash L2. Must stay a
-// power of two, the index masks with (size - 1).
-inline constexpr size_t kIndirectDispatchCacheEntries = 512;
+// Direct-mapped thread-local memo in front of the sorted registry lookup; since the per-site inline caches
+// (indirect_call_site.h) only their slow paths reach it, with P+ Training's many polymorphic sites. 2048 entries
+// (32 KiB per memo): the 512 before missed often enough to keep the generated table's search at ~0.9% of the game
+// thread (P+ Training profile). Indexed by the top bits of a multiplicative hash (the low bits of the
+// product only mix the low bits of the address). Must stay a power of two.
+inline constexpr unsigned kIndirectDispatchCacheBits = 11;
+inline constexpr size_t kIndirectDispatchCacheEntries = size_t{1} << kIndirectDispatchCacheBits;
+MKW_PPC_FORCE_INLINE size_t IndirectDispatchMemoIndex(uint32_t address) {
+    return ((address >> 2) * 2654435761u) >> (32 - kIndirectDispatchCacheBits);
+}
 
 // Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
 // thread-static init epoch check on every bctrl (same as g_currentCpuContext in ppc_runtime.h).
@@ -340,8 +372,7 @@ public:
             return FindByAddressPtrSlow(address);
         }
 
-        auto& cached = g_indirectResolvedDispatchMemo[
-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+        auto& cached = g_indirectResolvedDispatchMemo[IndirectDispatchMemoIndex(address)];
         if (cached.valid && cached.address == address) {
             return cached.info;
         }
@@ -360,8 +391,7 @@ public:
             return nullptr;
         }
 
-        auto& cached = g_indirectRawDispatchMemo[
-            ((address >> 2) * 2654435761u) & (kIndirectDispatchCacheEntries - 1)];
+        auto& cached = g_indirectRawDispatchMemo[IndirectDispatchMemoIndex(address)];
         if (cached.valid && cached.address == address) {
             return cached.record;
         }
@@ -493,14 +523,46 @@ inline void DispatchKnownTranslatedCpuTargetStatic(CpuContext* cpu) {
     RuntimeCrash::FatalMissingGuestTarget(target, cpu);
 }
 
-// Guest code without a translation (code a mod placed in memory, or an address the translation missed) runs in
-// the interpreter; only a target that is not guest memory at all is fatal.
+// The code variant of a mod's code without a base translation (a replacement module or plugin linked in place, as a
+// build captured it: guest_code_patch.cpp), when guest memory still holds its words: runs it and returns true.
+inline bool RunCodeVariantAt(uint32_t target, CpuContext* cpu) {
+    const auto variant = GuestCodePatch::ContinuationAt(target);
+    if (variant == nullptr) return false;
+    if (TryGetCpuContext() != cpu) {
+        CpuContextScope scope(cpu);
+        variant(cpu);
+    } else {
+        variant(cpu);
+    }
+    return true;
+}
+
+// Guest code without a translation (code a mod placed in memory, or an address the translation missed) runs its code
+// variant or in the interpreter; only a target that is not guest memory at all is fatal.
 inline void RunUntranslatedOrFail(uint32_t target, CpuContext* cpu) {
+    if (RunCodeVariantAt(target, cpu)) return;
     if (PpcInterpreter::Enabled() && PpcInterpreter::CanRun(target)) {
         PpcInterpreter::Run(cpu, target);
         return;
     }
     ReportMissingCpuTarget(target, cpu);
+}
+
+// Code variants only (CxxLinearCodeGenerator emits it before an indirect jump's dispatch: a bctr without recognized
+// targets, or a jump table's unlisted case). A target inside the variant's own code (ownCode: start/end pairs, its
+// decoded runs with small gaps closed) that is no entry of anything (the variant itself, a translated function, a code
+// variant continuation) means the translation missed a jump target: a jump table cut short.
+// Dispatching would run the interpreter from the middle of the function with a stale lr; stop with a report instead.
+inline void CheckVariantIndirectJump(uint32_t target, CpuContext* cpu, uint32_t variant, uint32_t block,
+                                     const uint32_t* ownCode, uint32_t rangeCount) {
+    for (uint32_t i = 0; i < rangeCount; ++i) {
+        if (target - ownCode[2 * i] >= ownCode[2 * i + 1] - ownCode[2 * i]) continue;
+        if (target == variant || TranslatedFunctionRegistry::FindByAddressPtr(target) != nullptr ||
+            GuestCodePatch::ContinuationAt(target) != nullptr) {
+            return;
+        }
+        RuntimeCrash::FatalVariantJumpIntoItself(variant, block, target, cpu);
+    }
 }
 
 template <uint32_t Target>
@@ -601,6 +663,61 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
     RunUntranslatedOrFail(Target, cpu);
 }
 
+// OSDisableInterrupts / OSEnableInterrupts / OSRestoreInterrupts (~900 call sites, called thousands of times a frame):
+// their published winner is always the native override (hle/os/os_interrupt.cpp, PPC_NATIVE_OVERRIDE), reached through
+// the registry, DispatchKnownTranslatedCpuTargetStatic and AbiRawCpuThunk. These call it directly with what that thunk
+// does: arguments from r3, the int32 result into r3. The natives read and write only guest memory and the host
+// interrupt flag, never the context's registers, so no context scope or register guard is involved either way.
+extern "C" int32_t OS__DisableInterrupts_HLE();
+extern "C" int32_t OS__EnableInterrupts_HLE();
+extern "C" int32_t OS__RestoreInterrupts_HLE(int32_t level);
+template <>
+inline void InvokeDirectCpu<0x801DCF10u>(CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    cpu->gpr[3] = static_cast<uint32_t>(OS__DisableInterrupts_HLE());
+}
+template <>
+inline void InvokeDirectCpu<0x801DCF24u>(CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    cpu->gpr[3] = static_cast<uint32_t>(OS__EnableInterrupts_HLE());
+}
+template <>
+inline void InvokeDirectCpu<0x801DCF38u>(CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    cpu->gpr[3] = static_cast<uint32_t>(OS__RestoreInterrupts_HLE(static_cast<int32_t>(cpu->gpr[3])));
+}
+
+// OSLockMutex / OSUnlockMutex (hle/os/os_scheduler.cpp, PPC_NATIVE_OVERRIDE_VOID, always the published winner): the
+// generic path (TryDispatchResolvedCpuTarget) wraps every native call in a copy-out/copy-back of r14-r31 and of the
+// non-volatile FPRs (a native's default write mask), ~70 memory operations per call. These two natives write only r3
+// of the context (the mutex handed to OSSleepThread / OSWakeupThread); a thread switch inside them saves and restores
+// the whole register file, so the guards restore what is already there. The execution-address and context scopes are
+// kept as that path makes them.
+extern "C" void OSLockMutex_HLE(CpuContext* ctx);
+extern "C" void OSUnlockMutex_HLE(CpuContext* ctx);
+template <>
+inline void InvokeDirectCpu<0x801DEBB4u>(CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(0x801DEBB4u);
+    if (TryGetCpuContext() != cpu) {
+        CpuContextScope scope(cpu);
+        OSLockMutex_HLE(cpu);
+        return;
+    }
+    OSLockMutex_HLE(cpu);
+}
+template <>
+inline void InvokeDirectCpu<0x801DEC90u>(CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(0x801DEC90u);
+    if (TryGetCpuContext() != cpu) {
+        CpuContextScope scope(cpu);
+        OSUnlockMutex_HLE(cpu);
+        return;
+    }
+    OSUnlockMutex_HLE(cpu);
+}
+
 // Indirect jump (bctr without link) - used for switch tables.
 inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
     // Use the caller's context, not the persistent global context!
@@ -619,7 +736,8 @@ inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
         }
     }
     
-    // A tail jump into untranslated code (a mod's) runs in the interpreter like a call would.
+    // A tail jump into untranslated code (a mod's) runs its code variant or in the interpreter like a call would.
+    if (RunCodeVariantAt(target, cpu)) return;
     if (PpcInterpreter::Enabled() && PpcInterpreter::CanRun(target) &&
         TranslatedFunctionRegistry::FindByAddressPtr(target & ~3u) == nullptr) {
         PpcInterpreter::Run(cpu, target);
@@ -656,6 +774,7 @@ inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
 }
 
 inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+    HZ_EXCLUSIVE_PAUSE_IF_ACTIVE();  // HLE calling guest code: that time is the guest's, not the HLE function's
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
     if (target == 0) {
         ReportMissingCpuTarget(target, cpu);
@@ -753,6 +872,7 @@ public:
 template <auto Target>
 struct AbiRawCpuThunk {
     static void Invoke(CpuContext* cpu) {
+        HZ_EXCLUSIVE(kHzHleTicks);
         if constexpr (std::is_invocable_v<decltype(Target), CpuContext*>) {
             (void)Target(cpu);
         } else {
@@ -810,3 +930,5 @@ public:
 
 #define REGISTER_NATIVE_FUNCTION_AS(address, fn, pretty_name) \
     static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_named_, __COUNTER__)(address, pretty_name, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)
+
+#include "indirect_call_site.h"

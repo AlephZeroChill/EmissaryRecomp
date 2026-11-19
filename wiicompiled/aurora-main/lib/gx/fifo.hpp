@@ -6,14 +6,27 @@
 
 namespace aurora::gx::fifo {
 
+// A thread_local with a constant initializer, declared so: other translation units then access it directly instead
+// of through a TLS wrapper call that checks for a dynamic initializer (every GX_WRITE_* touches the buffer below).
+#ifndef AURORA_TLS_CONSTINIT
+#if defined(__clang__)
+#define AURORA_TLS_CONSTINIT [[clang::require_constant_initialization]]
+#elif defined(__GNUC__) && __GNUC__ >= 10
+#define AURORA_TLS_CONSTINIT __constinit
+#else
+#define AURORA_TLS_CONSTINIT
+#endif
+#endif
+
 namespace detail {
-extern uint8_t* sBufferData;
-extern uint32_t sBufferSize;
-extern uint32_t sBufferCapacity;
-extern bool sInDisplayList;
-extern uint8_t* sDlBuffer;
-extern uint32_t sDlSize;
-extern uint32_t sDlWritePos;
+// Per producer thread: the game thread's, and a draw worker's (gx_worker.hpp deferred jobs) while it fills a job.
+AURORA_TLS_CONSTINIT extern thread_local uint8_t* sBufferData;
+AURORA_TLS_CONSTINIT extern thread_local uint32_t sBufferSize;
+AURORA_TLS_CONSTINIT extern thread_local uint32_t sBufferCapacity;
+AURORA_TLS_CONSTINIT extern thread_local bool sInDisplayList;
+AURORA_TLS_CONSTINIT extern thread_local uint8_t* sDlBuffer;
+AURORA_TLS_CONSTINIT extern thread_local uint32_t sDlSize;
+AURORA_TLS_CONSTINIT extern thread_local uint32_t sDlWritePos;
 } // namespace detail
 
 void init();

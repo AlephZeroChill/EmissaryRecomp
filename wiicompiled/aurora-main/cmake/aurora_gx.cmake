@@ -13,6 +13,7 @@ add_library(aurora_gx STATIC
         lib/gfx/texture_replacement.cpp
         lib/gx/command_processor.cpp
         lib/gx/fifo.cpp
+        lib/gx/gx_worker.cpp
         lib/gx/frame_interpolation.cpp
         lib/gx/gx.cpp
         lib/gx/pipeline.cpp
@@ -43,5 +44,4 @@ add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
 target_link_libraries(aurora_gx PUBLIC aurora::core xxhash)
-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map dawn::webgpu_dawn sqlite3 $<$<BOOL:${TRACY_ENABLE}>:TracyClient> PNG::PNG)
-target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map $<$<BOOL:${TRACY_ENABLE}>:TracyClient> PNG::PNG)

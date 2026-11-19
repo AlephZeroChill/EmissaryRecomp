@@ -210,7 +210,7 @@ public sealed partial class CxxLinearCodeGenerator
 
         void RecordDirectStackStore(IrStore store, InstructionSite site)
         {
-            if (!stackFacts.TryResolve(store.Address, out var offset))
+            if (!stackFacts.TryResolve(store, store.Address, out var offset))
                 return;
             stackAccesses.Add(new StackAccess(site, offset, store.SizeBytes));
             if (store.SizeBytes == 8 && store.Source.Kind == "register" &&
@@ -222,7 +222,7 @@ public sealed partial class CxxLinearCodeGenerator
 
         void RecordDirectStackLoad(IrLoad load, InstructionSite site)
         {
-            if (!stackFacts.TryResolve(load.Address, out var offset))
+            if (!stackFacts.TryResolve(load, load.Address, out var offset))
                 return;
             stackAccesses.Add(new StackAccess(site, offset, load.SizeBytes));
             if (load.SizeBytes == 8 && TryParseNonvolatileFpr(load.Destination, out var fpr))
@@ -328,7 +328,7 @@ public sealed partial class CxxLinearCodeGenerator
                     when candidate.SizeBytes == 8 &&
                          TryParseNonvolatileFpr(candidate.Destination, out var loadFpr) &&
                          loadFpr == psq.Fpr &&
-                         stackFacts.TryResolve(candidate.Address, out var loadOffset) &&
+                         stackFacts.TryResolve(candidate, candidate.Address, out var loadOffset) &&
                          loadOffset == psq.Offset - 8:
                     load = candidate;
                     return true;
@@ -445,7 +445,7 @@ public sealed partial class CxxLinearCodeGenerator
         }
 
         if (call.Arguments.Count < (isStore ? 4 : 3) ||
-            !stackFacts.TryResolve(call.Arguments[0], out var offset))
+            !stackFacts.TryResolve(call, call.Arguments[0], out var offset))
         {
             return false;
         }

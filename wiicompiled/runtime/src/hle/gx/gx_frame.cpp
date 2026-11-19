@@ -30,7 +30,7 @@ void EndDisplayListRecording() {
 
 void WriteDisplayListData(uint32_t val, uint32_t sizeBytes) {
     GxDisplayListState& dl = g_dlRecordState;
-    if (!dl.active || dl.base == 0 || dl.size == 0 || dl.writePtr == 0) {
+    if (t_gxDrawWorker || !dl.active || dl.base == 0 || dl.size == 0 || dl.writePtr == 0) {  // gx_internal.h
         return;
     }
     try {
@@ -87,7 +87,11 @@ void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout) {
     ++s_beginExpiredLogCount;
 }
 
+// The game thread before deferring a native draw (hle/g3d_native.cpp): the frame its replay draws into is active.
+extern "C" void GX_HLE_EnsureFrameActive() { EnsureAuroraFrameActive(); }
+
 void EnsureAuroraFrameActive() {
+    if (t_gxDrawWorker) return;  // the game thread made sure of it before deferring the draw
     if (!g_auroraFrameActive.load(std::memory_order_acquire)) {
         BeginNextAuroraFrameWithRetry();
     }

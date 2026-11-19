@@ -39,6 +39,9 @@ inline uint32_t PpcStorePsqFloatBitsInline(uint32_t value)
 
 inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if MKW_FAST_FLOAT  // ppc_isa_float.h: no per-lane sNaN quieting (or, for stores, denormal flushing)
+    return value;
+#endif
 #if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
@@ -58,6 +61,9 @@ inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
 
 inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if MKW_FAST_FLOAT
+    return value;
+#endif
 #if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
@@ -98,6 +104,9 @@ inline __m128i PpcPsqSwapPairBytesInline(__m128i lanes)
 // Lane-local sNaN quieting; identical rule to PpcLoadPairPsqFloatBitsPackedInline.
 inline __m128i PpcLoadPairPsqFloatBitsLanesInline(__m128i lanes)
 {
+#if MKW_FAST_FLOAT
+    return lanes;
+#endif
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i nanMask = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7F800000));
     return _mm_or_si128(lanes, _mm_and_si128(nanMask, _mm_set1_epi32(0x00400000)));
@@ -107,6 +116,9 @@ inline __m128i PpcLoadPairPsqFloatBitsLanesInline(__m128i lanes)
 // PpcStorePairPsqFloatBitsPackedInline.
 inline __m128i PpcStorePairPsqFloatBitsLanesInline(__m128i lanes)
 {
+#if MKW_FAST_FLOAT
+    return lanes;
+#endif
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i subnormalMask = _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000));
     const __m128i nanMask = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7F800000));
@@ -141,9 +153,17 @@ inline double PpcLoadPairPsqFloatFromHostInline(const uint8_t* host)
 }
 
 // packed FPR double -> host, guard already proven by the caller.
+// The bytes alone, for a lean segment write range (memory_access.h, ResolveSegmentRange), which marked them already.
+inline void PpcStorePairPsqFloatBytesToHostInline(uint8_t* host, double value);
+
 inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
 {
     BrawlDirtyMemory::MarkHost(host,8);
+    PpcStorePairPsqFloatBytesToHostInline(host, value);
+}
+
+inline void PpcStorePairPsqFloatBytesToHostInline(uint8_t* host, double value)
+{
 #if defined(__x86_64__)
     const __m128i lanes = PpcStorePairPsqFloatBitsLanesInline(
         _mm_castps_si128(PpcPsToM128Inline(value)));
@@ -193,6 +213,10 @@ inline float PpcDequantizePsqInline(SignedType value, uint32_t scale)
 template <typename T>
 inline T PpcReadUnpairedPsqInline(uint32_t addr)
 {
+#if MKW_LEAN_MEMORY
+    using U = std::conditional_t<sizeof(T) == 1, uint8_t, std::conditional_t<sizeof(T) == 2, uint16_t, uint32_t>>;
+    return static_cast<T>(MemoryInline::FlatLoad<U>(addr));
+#endif
     if constexpr (sizeof(T) == 1)
     {
         return static_cast<T>(Memory::Read8(addr));
@@ -210,6 +234,18 @@ inline T PpcReadUnpairedPsqInline(uint32_t addr)
 template <typename T>
 inline std::pair<T, T> PpcReadPairPsqInline(uint32_t addr)
 {
+#if MKW_LEAN_MEMORY
+    if constexpr (sizeof(T) == 1) {
+        const uint16_t packed = MemoryInline::FlatLoad<uint16_t>(addr);
+        return { static_cast<T>(packed >> 8), static_cast<T>(packed) };
+    } else if constexpr (sizeof(T) == 2) {
+        const uint32_t packed = MemoryInline::FlatLoad<uint32_t>(addr);
+        return { static_cast<T>(packed >> 16), static_cast<T>(packed) };
+    } else {
+        const uint64_t packed = MemoryInline::FlatLoad<uint64_t>(addr);
+        return { static_cast<T>(packed >> 32), static_cast<T>(packed) };
+    }
+#endif
     if constexpr (sizeof(T) == 1)
     {
         const uint16_t packed = Memory::Read16(addr);
@@ -230,6 +266,11 @@ inline std::pair<T, T> PpcReadPairPsqInline(uint32_t addr)
 template <typename T>
 inline void PpcWriteUnpairedPsqInline(uint32_t addr, T value)
 {
+#if MKW_LEAN_MEMORY
+    using U = std::conditional_t<sizeof(T) == 1, uint8_t, std::conditional_t<sizeof(T) == 2, uint16_t, uint32_t>>;
+    MemoryInline::FlatStore<U>(addr, static_cast<U>(value));
+    return;
+#endif
     if constexpr (sizeof(T) == 1)
     {
         Memory::Write8(addr, static_cast<uint8_t>(value));
@@ -247,6 +288,18 @@ inline void PpcWriteUnpairedPsqInline(uint32_t addr, T value)
 template <typename T>
 inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 {
+#if MKW_LEAN_MEMORY
+    if constexpr (sizeof(T) == 1)
+        MemoryInline::FlatStore<uint16_t>(addr, static_cast<uint16_t>((static_cast<uint16_t>(first) << 8) |
+                                                                      static_cast<uint8_t>(second)));
+    else if constexpr (sizeof(T) == 2)
+        MemoryInline::FlatStore<uint32_t>(addr, (static_cast<uint32_t>(static_cast<uint16_t>(first)) << 16) |
+                                                    static_cast<uint16_t>(second));
+    else
+        MemoryInline::FlatStore<uint64_t>(addr, (static_cast<uint64_t>(static_cast<uint32_t>(first)) << 32) |
+                                                    static_cast<uint32_t>(second));
+    return;
+#endif
     if constexpr (sizeof(T) == 1)
     {
         const uint16_t packed = (static_cast<uint16_t>(first) << 8) | static_cast<uint16_t>(second);
@@ -269,6 +322,9 @@ inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 // reading stale bytes, and unmapped pages commit on demand, same as MemoryInline::Flat* loads.
 MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
 {
+#if MKW_LEAN_MEMORY
+    return MemoryInline::LeanHost(addr);  // memory_access.h: loads need no check
+#endif
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
 #if MKW_FLAT_MEMORY
@@ -285,6 +341,12 @@ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr
 // executable, and unmapped pages still trap.
 MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
 {
+#if MKW_LEAN_MEMORY
+    // One policy byte per 64 KiB: an 8-byte pair can only straddle two chunks.
+    if (MemoryInline::LeanStoreNeedsPolicy(addr) || MemoryInline::LeanStoreNeedsPolicy(addr + 7u)) [[unlikely]]
+        return nullptr;
+    return MemoryInline::LeanHost(addr);
+#endif
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
     if (addr > UINT32_MAX - 7u) [[unlikely]]
@@ -412,7 +474,7 @@ inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
 // Preserve the complete memory/MMIO/executable-write behavior off the leaf
 // path. Keeping this out of line prevents those uncommon checks from being
 // replicated at every compile-time-known PSQ store.
-MKW_PPC_NO_INLINE inline void PpcStorePairPsqU8Scale61Fallback(
+MKW_PPC_NO_INLINE MKW_GUEST_OP_CC inline void PpcStorePairPsqU8Scale61Fallback(
     uint32_t addr, double value)
 {
     PPC_FPR fpr{};
@@ -430,6 +492,11 @@ MKW_PPC_NO_INLINE inline void PpcStorePairPsqU8Scale61Fallback(
 MKW_PPC_FORCE_INLINE void PpcStorePairPsqU8Scale61FastInline(
     uint32_t addr, double value)
 {
+#if MKW_LEAN_MEMORY
+    // The lean store: its policy test and rollback's dirty mark (the host write below marks nothing).
+    MemoryInline::FlatStore<uint16_t>(addr, PpcQuantizePairPsqU8Scale61PackedInline(value));
+    return;
+#endif
     uint8_t* host = nullptr;
     if (!MemoryInline::TryGetWritablePointerFast(addr, sizeof(uint16_t), host))
     {
@@ -444,6 +511,11 @@ MKW_PPC_FORCE_INLINE void PpcStorePairPsqU8Scale61FastInline(
 MKW_PPC_FORCE_INLINE void PpcStorePairPsqU8Scale61ResolvedInline(
     uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value)
 {
+#if MKW_LEAN_MEMORY
+    (void)resolvedHost; (void)offset;
+    PpcStorePairPsqU8Scale61FastInline(addr, value);  // a lean store at its own address (marks the dirty map)
+    return;
+#endif
     if (!resolvedHost)
     {
         PpcStorePairPsqU8Scale61Fallback(addr, value);
@@ -599,7 +671,7 @@ inline void PpcStorePairPsqQuantizedResolvedInline(uint8_t* resolvedHost, uint32
 
 inline void PpcStoreSinglePsqFloatResolvedInline(uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value)
 {
-    const uint32_t first = PpcConvertToSingleFTZInline(PpcBitCastToU64Inline(static_cast<double>(PpcGetPs0Inline(value))));
+    const uint32_t first = PpcPsqStoreSingleBitsInline(value);
     MemoryInline::WriteResolved32(resolvedHost, offset, addr, first);
 }
 
@@ -672,6 +744,9 @@ inline double PpcLoadPairPsqFloatStackInline(uint32_t addr)
 {
     // MemoryInline::ReadStack64's exact proof (TryGetPointerFast), then the
     // same Memory::Read64 fallback it uses on a miss.
+#if MKW_LEAN_MEMORY
+    return PpcLoadPairPsqFloatFromHostInline(MemoryInline::LeanHost(addr));
+#endif
     uint8_t* host = nullptr;
     if (MemoryInline::TryGetPointerFast(addr, sizeof(uint64_t), host)) [[likely]]
         return PpcLoadPairPsqFloatFromHostInline(host);
@@ -724,6 +799,15 @@ inline void PpcStorePairPsqFloatStackInline(uint32_t addr, double value)
 {
     // MemoryInline::WriteStack64's exact proof (WriteStackScalarFast ->
     // TryGetPointerFast), then the same Memory::Write64 fallback on a miss.
+#if MKW_LEAN_MEMORY
+    if (uint8_t* writable = PpcTryGetPsqWritableHostInline(addr)) [[likely]]
+    {
+        PpcStorePairPsqFloatToHostInline(writable, value);
+        return;
+    }
+    Memory::Write64(addr, PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value)));
+    return;
+#endif
     uint8_t* host = nullptr;
     if (MemoryInline::TryGetPointerFast(addr, sizeof(uint64_t), host)) [[likely]]
     {
@@ -791,14 +875,14 @@ inline void PpcStoreSinglePsqQuantizedStackInline(uint32_t addr, double value, u
 
 // Paired-Single helpers (psq_l / psq_st). w=0 loads/stores both ps0/ps1 (paired), w=1 only
 // ps0 (scalar); i is the GQR index (0-7) for quantization type and scale.
-extern "C" double PPC_PsqL(uint32_t addr, uint32_t w, uint32_t i);
-extern "C" void PPC_PsqSt(uint32_t addr, double value, uint32_t w, uint32_t i);
+extern "C" MKW_GUEST_OP_CC double PPC_PsqL(uint32_t addr, uint32_t w, uint32_t i);
+extern "C" MKW_GUEST_OP_CC void PPC_PsqSt(uint32_t addr, double value, uint32_t w, uint32_t i);
 
 // Cold generic body for psq_l. The complete quantization switch lives in one
 // out-of-line copy so PPC_PsqLInline's float fast path can be force-inlined at
 // guest call sites without spilling live registers around a call.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline double PPC_PsqLGeneric(uint32_t gqr, uint32_t addr)
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLGeneric(uint32_t gqr, uint32_t addr)
 {
     static_assert(W <= 1u, "psq load W must be 0 or 1");
     static_assert(I < 8u, "psq load GQR index must be 0..7");
@@ -972,7 +1056,7 @@ if constexpr (W == 0u) return PpcLoadPairPsqIntegerFastInline<int16_t>(addr, sca
 // wrapper's float path can be force-inlined at guest call sites without
 // spilling live registers around a call.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline double PPC_PsqLStackGeneric(uint32_t gqr, uint32_t addr)
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLStackGeneric(uint32_t gqr, uint32_t addr)
 {
     static_assert(W <= 1u, "psq stack load W must be 0 or 1");
     static_assert(I < 8u, "psq stack load GQR index must be 0..7");
@@ -1101,7 +1185,7 @@ if constexpr (W == 0u) return PpcLoadPairPsqIntegerStackInline<int16_t>(addr, sc
 // Cold generic body for psq_st. See PPC_PsqLGeneric: the full switch stays out
 // of line so the float fast path in PPC_PsqStInline can be force-inlined.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline void PPC_PsqStGeneric(uint32_t gqr, uint32_t addr, double value)
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStGeneric(uint32_t gqr, uint32_t addr, double value)
 {
     static_assert(W <= 1u, "psq store W must be 0 or 1");
     static_assert(I < 8u, "psq store GQR index must be 0..7");
@@ -1293,7 +1377,7 @@ if constexpr (W == 0u) PpcStorePairPsqQuantizedFastInline<int16_t>(addr, value, 
 // switch stays out of line so the float fast path in the hot wrapper below can
 // be force-inlined.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline void PPC_PsqStStackGeneric(uint32_t gqr, uint32_t addr, double value)
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStStackGeneric(uint32_t gqr, uint32_t addr, double value)
 {
     static_assert(W <= 1u, "psq stack store W must be 0 or 1");
     static_assert(I < 8u, "psq stack store GQR index must be 0..7");
@@ -1399,7 +1483,7 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStStackInline(uint32_t addr, double value)
 // ordinary native value. All architecturally valid quantization encodings are
 // handled directly; reserved encodings retain the generic helper's abort.
 template <uint32_t W, bool Stack>
-MKW_PPC_NO_INLINE MKW_PPC_COLD double PPC_PsqLStateFallback(uint32_t gqr, uint32_t addr);
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC double PPC_PsqLStateFallback(uint32_t gqr, uint32_t addr);
 
 extern template double PPC_PsqLStateFallback<0u, false>(uint32_t, uint32_t);
 extern template double PPC_PsqLStateFallback<0u, true>(uint32_t, uint32_t);
@@ -1436,7 +1520,7 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLStateInline(uint32_t gqr, uint32_t addr)
 }
 
 template <uint32_t W, bool Stack>
-MKW_PPC_NO_INLINE MKW_PPC_COLD void PPC_PsqStStateFallback(uint32_t gqr, uint32_t addr, double value);
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC void PPC_PsqStStateFallback(uint32_t gqr, uint32_t addr, double value);
 
 extern template void PPC_PsqStStateFallback<0u, false>(uint32_t, uint32_t, double);
 extern template void PPC_PsqStStateFallback<0u, true>(uint32_t, uint32_t, double);
@@ -1476,7 +1560,7 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStStateInline(uint32_t gqr, uint32_t addr, doub
 }
 
 template <uint32_t W>
-MKW_PPC_NO_INLINE MKW_PPC_COLD double PPC_PsqLResolvedStateFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC double PPC_PsqLResolvedStateFallback(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr);
 
 extern template double PPC_PsqLResolvedStateFallback<0u>(uint32_t, uint8_t*, uint32_t, uint32_t);
@@ -1518,7 +1602,7 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLResolvedStateInline(
 }
 
 template <uint32_t W>
-MKW_PPC_NO_INLINE MKW_PPC_COLD void PPC_PsqStResolvedStateFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC void PPC_PsqStResolvedStateFallback(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value);
 
 extern template void PPC_PsqStResolvedStateFallback<0u>(uint32_t, uint8_t*, uint32_t, uint32_t, double);
@@ -1615,7 +1699,7 @@ if constexpr (W == 0u) PpcStorePairPsqQuantizedStackInline<int16_t>(addr, value,
 // resolvedHost; the null case keeps its original PPC_PsqL behaviour in the
 // force-inlined wrapper below.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline double PPC_PsqLResolvedGeneric(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLResolvedGeneric(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr)
 {
     if constexpr (W == 0u) {
@@ -1663,7 +1747,7 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLResolvedInline(CpuContext* cpu, uint8_t* res
 }
 
 template <uint32_t W, uint32_t I, uint32_t GQR>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline double PPC_PsqLKnownResolvedFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLKnownResolvedFallback(
     uint32_t addr)
 {
     return PPC_PsqLKnownInline<W, I, GQR>(nullptr, addr);
@@ -1713,7 +1797,7 @@ if constexpr (W == 0u) return PpcLoadPairPsqIntegerResolvedInline<int16_t>(resol
 // resolvedHost; the null case keeps its original PPC_PsqSt behaviour in the
 // force-inlined wrapper below.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline void PPC_PsqStResolvedGeneric(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStResolvedGeneric(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value)
 {
     if constexpr (W == 0u) {
@@ -1765,8 +1849,35 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStResolvedInline(CpuContext* cpu, uint8_t* reso
     PPC_PsqStResolvedGeneric<W, I>(gqr, resolvedHost, offset, addr, value);
 }
 
+// psq_st off a lean segment write range (MKW_LEAN_RANGES; memory_access.h, ResolveSegmentRange): the range's resolve
+// tested the store policy and marked the dirty blocks, so the float encodings store their bytes without a mark of their
+// own. A null host (the range did not resolve) and the quantized encodings take PPC_PsqStResolvedInline's paths, which
+// do not rely on the range. Other memory models: PPC_PsqStResolvedInline.
+template <uint32_t W, uint32_t I>
+MKW_PPC_FORCE_INLINE void PPC_PsqStSegmentInline(CpuContext* cpu, uint8_t* resolvedHost,
+                                                 uint32_t offset, uint32_t addr, double value)
+{
+#if MKW_LEAN_MEMORY
+    if (resolvedHost != nullptr) [[likely]] {
+        const uint32_t gqr = cpu->gqr[I];
+        if constexpr (W == 0u) {
+            if ((gqr & 0xFFFFu) == 0x0000u) [[likely]] {
+                PpcStorePairPsqFloatBytesToHostInline(resolvedHost + offset, value);
+                return;
+            }
+        } else {
+            if ((gqr & 7u) == 0u) [[likely]] {
+                MemoryInline::SegWrite32(resolvedHost, offset, addr, PpcPsqStoreSingleBitsInline(value));
+                return;
+            }
+        }
+    }
+#endif
+    PPC_PsqStResolvedInline<W, I>(cpu, resolvedHost, offset, addr, value);
+}
+
 template <uint32_t W, uint32_t I, uint32_t GQR>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline void PPC_PsqStKnownResolvedFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStKnownResolvedFallback(
     uint32_t addr, double value)
 {
     PPC_PsqStKnownInline<W, I, GQR>(nullptr, addr, value);

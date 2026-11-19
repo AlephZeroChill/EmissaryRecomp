@@ -9,6 +9,26 @@
 
 struct CpuContext;
 
+// Code variants (generated: build_shards/base_dispatch/code_variants_*.cpp, from translate-recursive --code-variants):
+// translations of functions as a mod's fixed code patches leave them, hook bodies included. A patched function runs
+// its variant instead of the interpreter while guest memory holds exactly the words the variant was translated from:
+// guards [firstGuard, firstGuard + guardCount) of g_mkwCodeVariantGuards, each (start address, word count, index of
+// its first word in g_mkwCodeVariantWords). Empty in builds without variants.
+struct MkwCodeVariant {
+    uint32_t address;
+    void (*entry)(CpuContext*);
+    uint32_t firstGuard;
+    uint32_t guardCount;
+};
+extern "C" const uint32_t g_mkwCodeVariantCount;
+extern "C" const MkwCodeVariant g_mkwCodeVariants[];
+extern "C" const uint32_t g_mkwCodeVariantGuards[];
+extern "C" const uint32_t g_mkwCodeVariantWords[];
+// [start, end) pairs: memory outside translated code that variants were translated from (a code list's hook bodies);
+// write-trapped like guarded code once a mod patches code, so a change there re-checks the variants.
+extern "C" const uint32_t g_mkwCodeVariantRegionCount;
+extern "C" const uint32_t g_mkwCodeVariantRegions[];
+
 namespace GuestCodePatch {
 
 // Write-traps the translated code in [start, end); its current bytes are the pristine state.
@@ -28,7 +48,17 @@ void RecordPatch(uint32_t address, uint32_t value);
 // many times while a module loads, so its hooks are in place again before the module's prolog runs.
 void Reapply(uint32_t start, uint32_t end);
 bool Active();
-void RunPatched(uint32_t address, CpuContext* ctx);
+// After the code handler's first pass: functions holding baked words (BRAWL_BAKED_PATCHES) whose code now matches the
+// bake run translated from here on.
+void ReleaseBaked();
+void RunPatched(CpuContext* ctx, uint32_t address);
+// A code variant entered at `address` inside a function whose memory holds the words it was translated from (a plugin
+// loader's "call the original" stub branches to a replaced function's second instruction), else null. For the
+// interpreter's branches to addresses no translated function starts at.
+void (*ContinuationAt(uint32_t address))(CpuContext*);
+// The game linked a module in place over [start, end) (its bytes came from a file read, past the write trap): the code
+// variants with words there are checked against guest memory again before they next run.
+void ModuleLinkedInPlace(uint32_t start, uint32_t end);
 // BRAWL_INTERPRET=<hex start>-<hex end>: every translated function starting in that range runs in the interpreter, a
 // check of the interpreter against the translation on the unmodded game (same behaviour, only slower). Once the
 // function registry is final.

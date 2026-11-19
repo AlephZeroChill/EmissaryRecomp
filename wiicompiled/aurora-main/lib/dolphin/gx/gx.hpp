@@ -2,6 +2,8 @@
 
 #include "../../internal.hpp"
 #include "../../gx/gx.hpp"
+// API functions that touch decoded state (g_gxState) or the renderer directly call aurora::gx::worker::sync() first.
+#include "../../gx/gx_worker.hpp"
 
 // Defined once in GXAurora.cpp. The FATAL/CHECK/TRY macros resolve `Log` unqualified, so it stays
 // at global scope like the rest of this header's using-declarations.

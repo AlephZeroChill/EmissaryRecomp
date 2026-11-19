@@ -2,13 +2,11 @@
 
 #include "common.hpp"
 
-#include <webgpu/webgpu_cpp.h>
-
 namespace aurora::gfx::clear {
 struct DrawData {
   PipelineRef pipeline;
   Range uniformRange;
-  wgpu::Color color;
+  SDL_FColor color;
   float depth = 0.f;
   bool useScissor = false;
   ClipRect scissor{};
@@ -25,7 +23,6 @@ struct PipelineConfig {
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config);
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize,
-            PipelineRef& currentPipeline);
+gpu::GraphicsPipeline create_pipeline(const PipelineConfig& config);
+void render(const DrawData& data, const PassContext& ctx, PipelineRef& currentPipeline);
 } // namespace aurora::gfx::clear

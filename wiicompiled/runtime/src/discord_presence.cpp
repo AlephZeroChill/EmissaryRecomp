@@ -23,7 +23,9 @@
 #include <windows.h>
 #else
 #include <sys/socket.h>
+#if !defined(__SWITCH__)
 #include <sys/un.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -328,6 +330,11 @@ private:
         if (!ConnectionRetryAllowedLocked()) {
             return false;
         }
+#if defined(__SWITCH__)
+        // No Discord client runs on the console.
+        RecordFailedConnectionLocked();
+        return false;
+#else
         std::array<std::string, 5> roots{};
         size_t rootCount = 0;
         if (const char* runtimeDir = std::getenv("XDG_RUNTIME_DIR"); runtimeDir && *runtimeDir) {
@@ -370,6 +377,7 @@ private:
         }
         RecordFailedConnectionLocked();
         return false;
+#endif
     }
 
     bool WriteAllLocked(const uint8_t* data, size_t size) {

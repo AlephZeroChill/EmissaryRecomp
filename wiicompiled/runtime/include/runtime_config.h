@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>  // hzs: std::getenv (HZS_VANILLA)
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -169,11 +170,10 @@ inline bool IsSupportedResolutionMultiplier(float value) {
 inline bool IsSupportedGraphicsApi(std::string_view value) {
 #if defined(__APPLE__)
     static constexpr std::array<std::string_view, 2> values{"auto", "metal"};
-// only vulkan for linux
-#elif defined(__linux__)
-    static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
 #elif defined(_WIN32)
     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+#else  // only vulkan elsewhere
+    static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
 #endif
     return std::find(values.begin(), values.end(), value) != values.end();
 }
@@ -295,14 +295,39 @@ inline void EnsureConfigFile() {
               "# overlay_roots = [\"D:\\\\BrawlMods\"]\n";
 }
 
+// A missing section or key, or a value of another type, is nullopt. Checked rather than caught: most
+// settings are absent from a given file, and a throw per absent key is not free.
 template <typename T>
 inline std::optional<T> FindConfigValue(
     const toml::value& document, std::string_view section, std::string_view key) {
-    try {
-        return toml::find<T>(document, std::string(section), std::string(key));
-    } catch (const std::exception&) {
+    if (!document.is_table() || !document.contains(std::string(section))) {
         return std::nullopt;
     }
+    const toml::value& table = document.at(std::string(section));
+    if (!table.is_table() || !table.contains(std::string(key))) {
+        return std::nullopt;
+    }
+    const toml::value& value = table.at(std::string(key));
+    if constexpr (std::is_same_v<T, bool>) {
+        if (value.is_boolean()) return value.as_boolean();
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (value.is_floating()) return value.as_floating();
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+        if (value.is_integer()) return static_cast<int64_t>(value.as_integer());
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        if (value.is_string()) return value.as_string();
+    } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+        if (!value.is_array()) return std::nullopt;
+        std::vector<std::string> strings;
+        for (const toml::value& element : value.as_array()) {
+            if (!element.is_string()) return std::nullopt;
+            strings.push_back(element.as_string());
+        }
+        return strings;
+    } else {
+        static_assert(sizeof(T) == 0, "FindConfigValue: add a checked read for this type");
+    }
+    return std::nullopt;
 }
 
 inline std::optional<uint32_t> FindConfigUint(
@@ -1067,7 +1092,7 @@ inline bool SetFastMenus(bool value) {
 }
 // The launcher's "Vanilla (no mods)": no codes and no SD card, whatever UserData/SD holds.
 inline bool ModsVanilla() {
-    return ModsSdCodes() == "vanilla";
+    return ModsSdCodes() == "vanilla" || std::getenv("HZS_VANILLA") != nullptr;  // hzs: ZR at launch
 }
 
 inline bool NetworkEnabled(bool fallback = true) {

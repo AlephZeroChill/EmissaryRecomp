@@ -227,8 +227,8 @@ PPC_NATIVE_OVERRIDE_VOID(801F519C, GX__GetProjectionv_HLE, (uint32_t pa), (pa));
 // and never computes the box, so it read back empty and every character texture was 0x0 (invisible).
 // The box is computed here instead from the positions submitted between GXClearBoundingBox and
 // GXReadBoundingBox, transformed exactly like XF does: position matrix, projection, viewport.
-static float g_pnMtx[10][12] = {};
-static uint32_t g_currentPnMtx = 0;
+static thread_local float g_pnMtx[10][12] = {};  // per producer thread, as g_hleGxState
+static thread_local uint32_t g_currentPnMtx = 0;
 static uint32_t g_vertexPnMtx = 0xFFFFFFFFu;
 static bool g_bboxActive = false;
 static int32_t g_bbox[4] = {1023, 0, 1023, 0};  // left, right, top, bottom
@@ -277,17 +277,34 @@ void SpmBBoxPosition(const float* p, int count) {
     g_bbox[2] = std::min(g_bbox[2], iy); g_bbox[3] = std::max(g_bbox[3], iy);
 }
 
-extern "C" void GX__LoadPosMtxImm_HLE(uint32_t ma, uint32_t id) {
-    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma); float m[12];
-    SwapBeF32ArrayToHost(raw, m, 12);
-    if (id / 3u < 10u) std::memcpy(g_pnMtx[id / 3u], m, sizeof(m));
+// The immediate matrix loads from host floats: the HLE entries below after reading the guest matrix, and the replay of
+// a recorded native draw (g3d_native.cpp, G3D_NATIVE_ASYNC), which recorded the matrix by value.
+extern "C" void GX_HLE_LoadPosMtxImmHost(const float* m, uint32_t id) {
+    if (id / 3u < 10u) std::memcpy(g_pnMtx[id / 3u], m, 12 * sizeof(float));
     if (SpmDumpFrame()) RT_LOGF(RT_TAG_GX, "[drawdump] posmtx %u | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f\n", id,
                                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
-    GXLoadPosMtxImm((float(*)[4])m, id);
+    GXLoadPosMtxImm((float(*)[4])const_cast<float*>(m), id);
+}
+extern "C" void GX_HLE_LoadNrmMtxImmHost(const float* m, uint32_t id) {
+    GXLoadNrmMtxImm((float(*)[4])const_cast<float*>(m), id);
+}
+extern "C" void GX_HLE_LoadTexMtxImmHost(const float* m, uint32_t id, uint32_t t) {
+    GXLoadTexMtxImm(const_cast<float*>(m), id, (GXTexMtxType)t);
+}
+
+extern "C" void GX__LoadPosMtxImm_HLE(uint32_t ma, uint32_t id) {
+    uint32_t g3dRecPayload[13] = {id};
+    if (g3dn::g_recOn) g3dn::RecGuestWords(g3dRecPayload + 1, ma, 12);
+    g3dn::HleRec g3dRec(g3dn::kRecLoadPosMtxImm, g3dRecPayload, sizeof(g3dRecPayload));
+    if (g3dRec.skip) return;
+    const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma); float m[12];
+    SwapBeF32ArrayToHost(raw, m, 12);
+    GX_HLE_LoadPosMtxImmHost(m, id);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F51DC, GX__LoadPosMtxImm_HLE, (uint32_t ma, uint32_t id), (ma, id));
 
 extern "C" void GX__LoadPosMtxIndx_8017315c(uint32_t mi, uint32_t id) {
+    GX_HLE_MaterializeIfPending();  // reads the HLE vertex arrays (gx_internal.h, the vertex-state carry)
     const auto& arr=g_hleGxState.vtxArray[GX_POS_MTX_ARRAY];
     if(arr.base==0||arr.stride==0) return;
     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 48);
@@ -295,12 +312,17 @@ extern "C" void GX__LoadPosMtxIndx_8017315c(uint32_t mi, uint32_t id) {
 }
 
 extern "C" void GX__LoadNrmMtxImm_HLE(uint32_t ma, uint32_t id) {
+    uint32_t g3dRecPayload[13] = {id};
+    if (g3dn::g_recOn) g3dn::RecGuestWords(g3dRecPayload + 1, ma, 12);
+    g3dn::HleRec g3dRec(g3dn::kRecLoadNrmMtxImm, g3dRecPayload, sizeof(g3dRecPayload));
+    if (g3dRec.skip) return;
     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma, 48); float m[12];
-    SwapBeF32ArrayToHost(raw, m, 12); GXLoadNrmMtxImm((float(*)[4])m, id);
+    SwapBeF32ArrayToHost(raw, m, 12); GX_HLE_LoadNrmMtxImmHost(m, id);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F5258, GX__LoadNrmMtxImm_HLE, (uint32_t ma, uint32_t id), (ma, id));
 
 extern "C" void GX__LoadNrmMtxIndx3x3_801731e0(uint32_t mi, uint32_t id) {
+    GX_HLE_MaterializeIfPending();  // reads the HLE vertex arrays (gx_internal.h, the vertex-state carry)
     const auto& arr=g_hleGxState.vtxArray[GX_NRM_MTX_ARRAY];
     if(arr.base==0||arr.stride==0) return;
     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(arr.base+mi*arr.stride, 36);
@@ -317,10 +339,59 @@ extern "C" void GX__LoadNrmMtxIndx3x3_801731e0(uint32_t mi, uint32_t id) {
     }
 }
 
+// The XF packet GXLoadTexMtxImm writes for a guest matrix, built from its bytes: 0x10, the register word (Aurora's
+// address and count for the id and type), then the matrix words - big-endian in guest memory as in the FIFO (the
+// component path swaps them into host floats and Aurora's GX_WRITE_F32 swaps them back, by their bits). Only for the
+// ids and types Aurora accepts (its CHECKs stay on the component path) and a matrix in guest RAM. Effects particles
+// load texture matrices per particle (vanilla Training: ~70 loads a frame).
+static bool BuildTexMtxPacket(uint32_t ma, uint32_t id, uint32_t t, uint8_t (&packet)[53], uint32_t& size) {
+    if (t != static_cast<uint32_t>(GX_MTX3x4) && t != static_cast<uint32_t>(GX_MTX2x4)) return false;
+    uint32_t addr;
+    if (id >= GX_PTTEXMTX0 && id <= GX_PTIDENTITY) {
+        if (t != static_cast<uint32_t>(GX_MTX3x4)) return false;
+        addr = (id - GX_PTTEXMTX0) * 4 + 0x500;
+    } else if (id >= GX_TEXMTX0 && id <= GX_IDENTITY) {
+        addr = id * 4;
+    } else {
+        return false;
+    }
+    const uint32_t count = t == static_cast<uint32_t>(GX_MTX2x4) ? 8u : 12u;
+    const auto* src = static_cast<const uint8_t*>(GuestToHostPtr(ma, count * 4));
+    if (src == nullptr) return false;
+    const uint32_t reg = addr | ((count - 1) << 16);
+    packet[0] = 0x10;
+    packet[1] = static_cast<uint8_t>(reg >> 24);
+    packet[2] = static_cast<uint8_t>(reg >> 16);
+    packet[3] = static_cast<uint8_t>(reg >> 8);
+    packet[4] = static_cast<uint8_t>(reg);
+    std::memcpy(packet + 5, src, count * 4);
+    size = 5 + count * 4;
+    return true;
+}
+
 extern "C" void GX__LoadTexMtxImm_HLE(uint32_t ma, uint32_t id, uint32_t t) {
+    uint32_t g3dRecPayload[14] = {id, t};
+    const uint32_t g3dRecWords = t == (uint32_t)GX_MTX3x4 ? 12u : 8u;
+    if (g3dn::g_recOn) g3dn::RecGuestWords(g3dRecPayload + 2, ma, g3dRecWords);
+    g3dn::HleRec g3dRec(g3dn::kRecLoadTexMtxImm, g3dRecPayload, (2 + g3dRecWords) * 4);
+    if (g3dRec.skip) return;
+    uint8_t packet[53];
+    uint32_t packetSize = 0;
+    const int mode = GxRawPacketMode();  // gx_fifo.cpp GX_RAW_BEGIN: 2 checks the packet against the component path
+    const bool built = mode != 0 && BuildTexMtxPacket(ma, id, t, packet, packetSize);
+    if (built && mode == 1) {
+        GxAuroraFifoWrite(packet, packetSize);
+        if (!t_gxDrawWorker) ++g_gxTexMtxPackets;
+        return;
+    }
     size_t c=(t==(uint32_t)GX_MTX3x4)?12:8;
     const uint32_t* raw=(const uint32_t*)GuestToHostPtr(ma,c*4); float l[12]={};
-    SwapBeF32ArrayToHost(raw,l,c); GXLoadTexMtxImm(l, id, (GXTexMtxType)t);
+    SwapBeF32ArrayToHost(raw,l,c); GX_HLE_LoadTexMtxImmHost(l, id, t);
+    namespace d = aurora::gx::fifo::detail;
+    if (built && !d::sInDisplayList) {
+        GxNoteTexMtxPacketCheck(d::sBufferSize >= packetSize &&
+                                std::memcmp(d::sBufferData + d::sBufferSize - packetSize, packet, packetSize) == 0);
+    }
 }
 PPC_NATIVE_OVERRIDE_VOID(801F5304, GX__LoadTexMtxImm_HLE, (uint32_t ma, uint32_t id, uint32_t t), (ma, id, t));
 

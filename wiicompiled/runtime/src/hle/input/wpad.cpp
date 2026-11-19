@@ -68,12 +68,13 @@ extern "C" uint32_t WPADGetDpdSensitivity_HLE()
 }
 PPC_NATIVE_OVERRIDE(8021C930, WPADGetDpdSensitivity_HLE, uint32_t, (), ());
 
-// The emulated remotes always have their pointer camera on (KPAD pos comes from the right stick or mouse). The real
-// library function read WPAD's own channel state, which this HLE never sets, so SPM's arcade minigames (Mansion
-// Patrol, Forget Me Not) saw the pointer as off and ignored it (issue #35).
+// Pointer camera off: Brawl never turns it on. Its one live caller, gfPadSystem::create (0x80028D3C, channels 0-3),
+// asks only to switch an enabled camera off with WPADControlDpd, whose translated body would then run on the per-channel
+// control blocks (0x804F6810) that __wpadInitSub builds and the HLE'd WPADInit never calls. (The other caller, KPAD's
+// format callback 0x80228170, is installed only by KPADRead's own body, which KPAD__Read_HLE replaces.)
 extern "C" uint32_t WPADIsDpdEnabled_HLE()
 {
-    return 1;
+    return 0;
 }
 PPC_NATIVE_OVERRIDE(8021C938, WPADIsDpdEnabled_HLE, uint32_t, (), ());
 

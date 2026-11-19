@@ -58,9 +58,6 @@ if (_AURORA_EXCLUDE_HOST_HOMEBREW)
   message(STATUS "aurora: cross-architecture macOS build; ignoring host Homebrew prefixes")
 endif ()
 
-if (AURORA_ENABLE_GX)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
-endif ()
 
 # SDL's pkg-config probe can bypass CMake's prefix exclusion. macOS does not
 # need libusb for the supported SDL input paths, so keep that host-only library
@@ -70,8 +67,7 @@ if (_AURORA_EXCLUDE_HOST_HOMEBREW)
   set(SDL_HIDAPI_LIBUSB_SHARED OFF CACHE BOOL "" FORCE)
 endif ()
 
-# Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
-# Otherwise prefer a system package and only fetch it as a last resort.
+# Abseil is needed for core libraries. Prefer a system package and only fetch it as a last resort.
 if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
@@ -86,9 +82,16 @@ else ()
     set(ABSL_MSVC_STATIC_RUNTIME ON CACHE INTERNAL "Link static runtime libraries")
   endif()
   set(ABSL_PROPAGATE_CXX_STD ON)
+  set(_absl_patch)
+  if (NINTENDO_SWITCH)
+    # Horizon: no ELF image introspection, signals, tm_gmtoff, or integer pthread_t (cmake/abseil-horizon.patch).
+    find_program(_absl_patch_tool patch REQUIRED)
+    set(_absl_patch PATCH_COMMAND "${_absl_patch_tool}" -p1 -N -i "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/abseil-horizon.patch")
+  endif ()
   FetchContent_Declare(abseil-cpp
     URL https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    ${_absl_patch}
     EXCLUDE_FROM_ALL
   )
   FetchContent_MakeAvailable(abseil-cpp)
@@ -98,6 +101,7 @@ else ()
 endif ()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraSDL3Provider.cmake)
+
 
 if (NOT TARGET xxhash)
   message(STATUS "aurora: Fetching xxhash")
@@ -243,6 +247,26 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing Freetype")
   endif ()
 
+  # GLSL -> SPIR-V for SDL_GPU's Vulkan backend (lib/gpu/shader.cpp): GX shaders are generated at run
+  # time. Only the GLSL front end and SPIR-V writer: no HLSL, no SPIRV-Tools optimizer, no tools or tests.
+  if (NOT TARGET glslang)
+    message(STATUS "aurora: Fetching glslang")
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(glslang
+      URL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz
+      URL_HASH SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(glslang)
+  endif ()
+
   if (NOT TARGET imgui)
     message(STATUS "aurora: Fetching imgui")
     FetchContent_Declare(imgui
@@ -265,10 +289,9 @@ if (AURORA_ENABLE_GX)
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
     )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)
@@ -285,64 +308,6 @@ if (AURORA_ENABLE_GX)
     target_compile_definitions(imgui PUBLIC IMGUI_USER_CONFIG="aurora/imgui_config.h")
     target_sources(imgui PRIVATE ${PROJECT_SOURCE_DIR}/lib/imgui_config.cpp)
     target_link_libraries(imgui PRIVATE ${AURORA_SDL3_TARGET})
-  endif ()
-
-  if (NOT TARGET sqlite3)
-    message(STATUS "aurora: Fetching sqlite3")
-    FetchContent_Declare(sqlite3
-      URL https://sqlite.org/2026/sqlite-amalgamation-3510300.zip
-      URL_HASH SHA256=acb1e6f5d832484bf6d32b681e858c38add8b2acdfd42ac5df24b8afb46552b4
-      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(sqlite3)
-
-    add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
-    target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
-  else ()
-    message(STATUS "aurora: Using existing sqlite3")
-  endif ()
-
-  if (AURORA_CACHE_USE_ZSTD)
-    if (NOT TARGET libzstd_static)
-      message(STATUS "aurora: Fetching zstd")
-      set(ZSTD_BUILD_STATIC ON)
-      set(ZSTD_BUILD_SHARED OFF)
-      set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "BUILD PROGRAMS" FORCE)
-      set(ZSTD_BUILD_TESTS OFF CACHE BOOL "BUILD TESTS" FORCE)
-
-      if (WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set(C_FLAG_WALL TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WALL TRUE CACHE INTERNAL "")
-        set(C_FLAG_WEXTRA TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WEXTRA TRUE CACHE INTERNAL "")
-        set(C_FLAG_WUNDEF TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WUNDEF TRUE CACHE INTERNAL "")
-        set(C_FLAG_WSHADOW TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WSHADOW TRUE CACHE INTERNAL "")
-        set(C_FLAG_WCAST_ALIGN TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WCAST_ALIGN TRUE CACHE INTERNAL "")
-        set(C_FLAG_WCAST_QUAL TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WCAST_QUAL TRUE CACHE INTERNAL "")
-        set(C_FLAG_WSTRICT_PROTOTYPES TRUE CACHE INTERNAL "")
-        set(LD_FLAG_WL_Z_NOEXECSTACK FALSE CACHE INTERNAL "")
-        set(C_FLAG_QUNUSED_ARGUMENTS TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_QUNUSED_ARGUMENTS TRUE CACHE INTERNAL "")
-        set(C_FLAG_WA_NOEXECSTACK TRUE CACHE INTERNAL "")
-        set(CXX_FLAG_WA_NOEXECSTACK TRUE CACHE INTERNAL "")
-      endif()
-
-      FetchContent_Declare(zstd
-        URL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
-        URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-        SOURCE_SUBDIR build/cmake
-        EXCLUDE_FROM_ALL
-      )
-      FetchContent_MakeAvailable(zstd)
-    else ()
-      message(STATUS "aurora: Using existing zstd")
-    endif ()
   endif ()
 endif ()
 

@@ -92,6 +92,13 @@ public static partial class GeneratedMarkers
     public static partial Regex TranslatedFunctionRegistrationPattern();
 
     /// <summary>
+    /// <c>MKW_NATIVE_BODY(0x…u, symbol)</c>: a native body the translated function's wrapper tail-calls (abi_bridge.h).
+    /// Not a registration: the function stays translated and statically callable.
+    /// </summary>
+    [GeneratedRegex(@"MKW_NATIVE_BODY\s*\(\s*0x(?<address>[0-9A-Fa-f]{8})u?\s*,\s*(?<symbol>[A-Za-z_][A-Za-z0-9_]*)\s*\)", RegexOptions.CultureInvariant)]
+    public static partial Regex NativeBodyPattern();
+
+    /// <summary>
     /// The registration half of <c>PPC_NATIVE_OVERRIDE</c>: address and symbol
     /// only. Deliberately a prefix match, so an override whose argument list
     /// contains a semicolon still registers.

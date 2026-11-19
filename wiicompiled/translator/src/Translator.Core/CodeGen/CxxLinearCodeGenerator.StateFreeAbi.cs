@@ -137,7 +137,14 @@ public sealed partial class CxxLinearCodeGenerator
             (uint)(contract.HidReadBeforeWriteMask | contract.HidPossibleWriteMask));
 
     private static bool StateFreeFitsNativeRegisterBudget(GuestAbiContract contract) =>
-        StateFreeInputCount(contract) <= 4 && StateFreeOutputCount(contract) <= 2;
+        StateFreeInputCount(contract) <= StateFreeMaxInputs && StateFreeOutputCount(contract) <= 2;
+
+    // Windows x64 passes four arguments in registers; AArch64 passes eight (and eight more in FP registers), so a
+    // translation built only for AArch64 (Horizon) can admit larger regions: MKW_STATE_FREE_MAX_INPUTS=8.
+    private static readonly int StateFreeMaxInputs =
+        int.TryParse(Environment.GetEnvironmentVariable("MKW_STATE_FREE_MAX_INPUTS"), out var inputs) && inputs > 0
+            ? inputs
+            : 4;
 
     // Do not use Clang's __regcall here: a state-free callee using host r12 as scratch once collided
     // with a caller that kept the guest-memory page table live in r12, crashing at address 0x4808. The
@@ -145,6 +152,73 @@ public sealed partial class CxxLinearCodeGenerator
     private static string StateFreeCallingConvention(GuestAbiContract contract) => string.Empty;
 
     private static string StateFreeResultType(uint address) => $"MkwStateFreeResult_{address:X8}";
+
+    /// <summary>
+    /// MKW_LEAN_CALLS=1: a state-free call site is just the call. The check "is this callee still the base
+    /// translation, unpatched?" moves into the callee's entry (<see cref="AppendStateFreeEntryGuard"/>), once per
+    /// function instead of once per call site with a duplicated full-sync copy of the call beside it. The caller's
+    /// other registers live in its locals, which the patched path cannot reach, so only the contract's inputs and
+    /// outputs cross it; the call site's outer flush still publishes r1/r2/r13 for it.
+    /// </summary>
+    internal static readonly bool LeanCalls = Environment.GetEnvironmentVariable("MKW_LEAN_CALLS") == "1";
+
+    /// <summary>
+    /// The state-free entry's own patch check (MKW_LEAN_CALLS). When the function is no longer the active base
+    /// translation (a mod override) or its code is patched (the shard emitter appends that test to every
+    /// <c>IsBaseTranslatedCpuTargetActive</c> term), its inputs go to the thread's CpuContext, the call dispatches
+    /// like any context call (override, or the interpreter through <c>func_X</c>'s guard), and the outputs come back
+    /// from the context in <see cref="StateFreeReturnExpression"/>'s order and packing.
+    /// </summary>
+    private static void AppendStateFreeEntryGuard(StringBuilder sb, uint address, GuestAbiContract contract)
+    {
+        const string c = "slow_ctx";
+        sb.AppendLine($"    if (!(IsBaseTranslatedCpuTargetActive<0x{address:X8}u>())) [[unlikely]] {{");
+        sb.AppendLine($"        CpuContext* {c} = TryGetCpuContext();");
+        var gprInputs = StateFreeGprInputMask(contract);
+        for (var gpr = 0; gpr < 32; ++gpr)
+            if ((gprInputs & (1u << gpr)) != 0) sb.AppendLine($"        {c}->gpr[{gpr}] = native_r{gpr};");
+        for (var fpr = 0; fpr < 32; ++fpr)
+            if (((contract.FprReadBeforeWriteMask | contract.FprPossibleWriteMask) & (1u << fpr)) != 0)
+                sb.AppendLine($"        {c}->fpr[{fpr}] = native_f{fpr};");
+        if (contract.CrReadBeforeWriteMask != 0 || contract.CrPossibleWriteMask != 0) sb.AppendLine($"        {c}->cr = native_cr;");
+        if (contract.ReadsXerBeforeWrite || contract.MayWriteXer) sb.AppendLine($"        {c}->xer = native_xer;");
+        if (contract.ReadsCtrBeforeWrite || contract.MayWriteCtr) sb.AppendLine($"        {c}->ctr = native_ctr;");
+        if (contract.ReadsLrBeforeWrite || contract.MayWriteLr) sb.AppendLine($"        {c}->lr = native_lr;");
+        if (contract.ReadsFpscrBeforeWrite || contract.MayWriteFpscr) sb.AppendLine($"        {c}->fpscr = native_fpscr;");
+        for (var gqr = 0; gqr < 8; ++gqr)
+            if (((contract.GqrReadBeforeWriteMask | contract.GqrPossibleWriteMask) & (1 << gqr)) != 0)
+                sb.AppendLine($"        {c}->gqr[{gqr}] = native_gqr{gqr};");
+        for (var hid = 0; hid < 3; ++hid)
+            if (((contract.HidReadBeforeWriteMask | contract.HidPossibleWriteMask) & (1 << hid)) != 0)
+                sb.AppendLine($"        {c}->hid{hid} = native_hid{hid};");
+        sb.AppendLine($"        InvokeDirectCpu<0x{address:X8}u>({c});");
+        var values = new List<string>();
+        var packed = StateFreeOutputCount(contract) <= 2;
+        for (var gpr = 0; gpr < 32; ++gpr)
+            if ((contract.GprPossibleWriteMask & (1u << gpr)) != 0)
+                values.Add(packed ? $"static_cast<uint64_t>({c}->gpr[{gpr}])" : $"{c}->gpr[{gpr}]");
+        for (var fpr = 0; fpr < 32; ++fpr)
+            if ((contract.FprPossibleWriteMask & (1u << fpr)) != 0)
+                values.Add(packed ? $"{c}->fpr[{fpr}].raw" : $"{c}->fpr[{fpr}]");
+        if (contract.CrPossibleWriteMask != 0) values.Add(packed ? $"static_cast<uint64_t>({c}->cr)" : $"{c}->cr");
+        if (contract.MayWriteXer) values.Add(packed ? $"static_cast<uint64_t>({c}->xer)" : $"{c}->xer");
+        if (contract.MayWriteCtr) values.Add(packed ? $"static_cast<uint64_t>({c}->ctr)" : $"{c}->ctr");
+        if (contract.MayWriteLr) values.Add(packed ? $"static_cast<uint64_t>({c}->lr)" : $"{c}->lr");
+        if (contract.MayWriteFpscr) values.Add(packed ? $"static_cast<uint64_t>({c}->fpscr)" : $"{c}->fpscr");
+        for (var gqr = 0; gqr < 8; ++gqr)
+            if ((contract.GqrPossibleWriteMask & (1 << gqr)) != 0)
+                values.Add(packed ? $"static_cast<uint64_t>({c}->gqr[{gqr}])" : $"{c}->gqr[{gqr}]");
+        for (var hid = 0; hid < 3; ++hid)
+            if ((contract.HidPossibleWriteMask & (1 << hid)) != 0)
+                values.Add(packed ? $"static_cast<uint64_t>({c}->hid{hid})" : $"{c}->hid{hid}");
+        sb.AppendLine(values.Count switch
+        {
+            0 => "        return;",
+            1 => $"        return {values[0]};",
+            _ => $"        return {{ {string.Join(", ", values)} }};"
+        });
+        sb.AppendLine("    }");
+    }
 
     private static string StateFreeAvailabilityCondition(
         uint root,
@@ -343,7 +417,26 @@ public sealed partial class CxxLinearCodeGenerator
         var residency = _activeResidency ?? throw new InvalidOperationException(
             $"Resident state-free marshalling requested for 0x{address:X8} without an active residency.");
 
-        AppendFlush(sb, pad, ResidencyBoundarySync.StateFreeResidentOuter);
+        // The outer flush runs on both arms; the slow arm's full pair below is conditional, so it cleans
+        // nothing for the dirty-flush plan (the fast arm leaves earlier writes unpublished).
+        AppendFlush(sb, pad, ResidencyBoundarySync.StateFreeResidentOuter, unconditional: true);
+        if (LeanCalls)
+        {
+            // The call only: the callee's entry guard handles an override or a patch (AppendStateFreeEntryGuard).
+            RecordEmittedDirectCallTarget(address);
+            var leanArguments = StateFreeCallArguments(contract, callSiteLr, residency);
+            if (StateFreeHasOutputs(contract))
+            {
+                var leanResult = $"state_free_result_{address:X8}_{bufferBaseLength + sb.Length:X}";
+                sb.AppendLine($"{pad}const auto {leanResult} = {symbol}({leanArguments});");
+                AppendStateFreeResultStores(sb, pad, contract, leanResult, residency);
+            }
+            else
+            {
+                sb.AppendLine($"{pad}{symbol}({leanArguments});");
+            }
+            return;
+        }
         var inner = pad + "    ";
         sb.AppendLine($"{pad}if ({StateFreeAvailabilityCondition(address, stateFreeAbiContracts, stateFreeCallSymbols)}) {{");
         var arguments = StateFreeCallArguments(contract, callSiteLr, residency);
@@ -596,6 +689,11 @@ public sealed partial class CxxLinearCodeGenerator
                     $"uint32_t cached_r{gpr} = ctx->gpr[{gpr}];",
                     $"uint32_t cached_r{gpr}{{}};",
                     StringComparison.Ordinal);
+                // A register this body writes itself and then hands to a callee: the public body flushed it and
+                // passes ctx->gpr[N]; inside the clone that value is its own local. (No local means an unbound read,
+                // which the retained-context check below still reports.)
+                if (body.Contains($"cached_r{gpr}", StringComparison.Ordinal))
+                    body = body.Replace($"ctx->gpr[{gpr}]", $"cached_r{gpr}", StringComparison.Ordinal);
             }
         }
         for (var fpr = 0; fpr < 32 && (containsCachedFpr || containsCtxFpr); ++fpr)
@@ -613,6 +711,8 @@ public sealed partial class CxxLinearCodeGenerator
                     $"PPC_FPR cached_f{fpr} = ctx->fpr[{fpr}];",
                     $"PPC_FPR cached_f{fpr}{{}};",
                     StringComparison.Ordinal);
+                if (body.Contains($"cached_f{fpr}", StringComparison.Ordinal))
+                    body = body.Replace($"ctx->fpr[{fpr}]", $"cached_f{fpr}", StringComparison.Ordinal);
             }
         }
         body = body.Replace("ctx->cr = cached_cr;", string.Empty, StringComparison.Ordinal);
@@ -703,6 +803,7 @@ public sealed partial class CxxLinearCodeGenerator
         var bodyAttribute = preferInline ? "MKW_PPC_ALWAYS_INLINE_BODY" : "MKW_PPC_NO_INLINE";
         variant.AppendLine($"extern \"C\" {bodyAttribute} {StateFreeReturnType(entryPoint, contract)} {StateFreeCallingConvention(contract)}{stateFreeSymbol}({StateFreeParameterList(contract, includeNames: true)})");
         variant.AppendLine("{");
+        if (LeanCalls) AppendStateFreeEntryGuard(variant, entryPoint, contract);
         variant.Append(body);
         if (!body.EndsWith('\n')) variant.AppendLine();
         variant.AppendLine("}");

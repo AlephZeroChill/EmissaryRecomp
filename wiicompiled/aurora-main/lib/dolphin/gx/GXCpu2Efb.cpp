@@ -5,6 +5,7 @@
 #include <dolphin/gx/GXCpu2Efb.h>
 
 void GXPeekZ(u16 x, u16 y, u32* z) {
+  aurora::gx::worker::sync();  // a readback
   aurora::gfx::depth_peek::poll();
 
   if (z != nullptr) {

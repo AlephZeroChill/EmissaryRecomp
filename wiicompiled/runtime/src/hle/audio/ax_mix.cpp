@@ -1,10 +1,12 @@
 #include "brawl_dirty_memory.h"
 #include "ax_dsp.h"
+#include "guest_thread_guard.h"
 
 #include "ax_internal.h"
 
 #include "abi_bridge.h"
 #include "audio_backend.h"
+#include "axfx_async.h"
 #include "ax_mix_kernels.h"
 #include "isa/big_endian.h"
 #include "memory.h"
@@ -69,7 +71,7 @@ public:
         // worker first: the mix owns those members outright while it runs.
         JoinMix();
         RefreshMixMemoryMap();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mixWorkerEnabled = RuntimeConfigFile::AudioMixWorkerEnabled(true);
         MarkDspInitialized();
         ResetDspTaskGlobals();
@@ -94,7 +96,7 @@ public:
 
     void Stop() {
         JoinMix();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mailState = MailState::WaitingForCmdListSize;
         m_cmdListSize = 0;
         m_toDspBusy = false;
@@ -109,11 +111,14 @@ public:
         // ConfigureFromTaskLocked rewrites the ucode CRC and the PB/command
         // layouts, all of which the mix reads.
         JoinMix();
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         ConfigureFromTaskLocked(taskPtr);
     }
 
     void JoinMix() {
+        // The AXFX jobs first (axfx_async.h): they process the bus buffers PublishAuxOutputs writes and the next
+        // command list reads.
+        AxfxAsync::Join();
         if (m_mixThread.joinable()) {
             std::unique_lock<std::mutex> lock(m_mixMutex);
             m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
@@ -134,25 +139,25 @@ public:
     }
 
     void SetMixWorkerEnabled(bool enabled) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         m_mixWorkerEnabled = enabled;
     }
 
     void SendMail(uint32_t mail) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         HandleMail(mail);
         m_toDspBusy = false;
     }
 
     void QueueResumeCallback() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         ++m_deferredResumeCallbacks;
     }
 
     void ServiceDeferredCallbacks() {
         while (true) {
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                std::lock_guard<GuestThreadGuard> lock(m_guard);
                 if (m_deferredResumeCallbacks == 0) {
                     return;
                 }
@@ -163,17 +168,17 @@ public:
     }
 
     uint32_t CheckMailToDSP() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         return m_toDspBusy ? 1u : 0u;
     }
 
     uint32_t CheckMailFromDSP() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         return m_cpuMails.empty() ? 0u : 1u;
     }
 
     uint32_t ReadMailFromDSP() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<GuestThreadGuard> lock(m_guard);
         if (m_cpuMails.empty()) {
             return m_lastCpuMail & 0x7fffffffu;
         }
@@ -322,6 +327,7 @@ private:
     // guest thread: the DSP sync mails OUTPUT commands raise (so the mail sequence doesn't
     // depend on where the mix runs)
     void DispatchCommandList() {
+        AxfxAsync::Join();  // the command list reads the buffers the AXFX jobs process (normally joined in JoinMix)
         AXCommandLayout layout = m_commandLayout;
         if (layout == AXCommandLayout::Auto) {
             const bool validNew = ScanCommandList(AXCommandLayout::New, nullptr);
@@ -645,11 +651,26 @@ private:
         }
     }
 
+    // BRAWL_AX_TRACE: once a second, the voice list the game handed the DSP and what became of it.
+    struct VoiceTrace {
+        uint32_t lists = 0, voices = 0, running = 0, runningAfter = 0, streams = 0, ended = 0, maxList = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    };
+    static bool VoiceTraceOn() {
+        static const bool on = std::getenv("BRAWL_AX_TRACE") != nullptr;
+        return on;
+    }
+
     void ProcessPBList(uint32_t pbAddr, bool newFilter, bool oldAxLayout) {
+        static VoiceTrace trace;
+        const bool tracing = VoiceTraceOn();
+        uint32_t listLength = 0;
         uint32_t guard = 0;
         while (pbAddr && guard++ < 256) {
             AXPBWii pb{};
             ReadPB(pbAddr, pb);
+            const bool wasRunning = pb.running == 1;
+            ++listLength;
             AXBuffers buffers = MixBuffers();
             const AXMixControl control = ConvertMixerControl(Hilo(pb.mixer_control_hi, pb.mixer_control_lo));
             if (oldAxLayout && (pb.updates.num_updates[0] | pb.updates.num_updates[1] | pb.updates.num_updates[2]) != 0) {
@@ -663,7 +684,29 @@ private:
                 ProcessVoice(pb, buffers, kAxSamplesPerFrame, control, BaseCoefficients(), newFilter);
             }
             WritePB(pbAddr, pb);
+            if (tracing) {
+                const bool nowRunning = pb.running == 1;
+                trace.running += wasRunning;
+                trace.runningAfter += nowRunning;
+                trace.streams += (wasRunning || nowRunning) && pb.is_stream == 1;
+                trace.ended += wasRunning && !nowRunning;
+            }
             pbAddr = Hilo(pb.next_pb_hi, pb.next_pb_lo);
+        }
+        if (!tracing) return;
+        ++trace.lists;
+        trace.voices += listLength;
+        trace.maxList = std::max(trace.maxList, listLength);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - trace.last >= std::chrono::seconds(1)) {
+            const uint32_t n = std::max(trace.lists, 1u);
+            RT_LOGF(RT_TAG_AUDIO, "[axtrace] lists=%u avg_voices=%.1f max_voices=%u running_in=%.1f running_out=%.1f "
+                    "streams=%.1f ended=%u pb_layout=%d ucode=%08X old_layout=%d\n",
+                    trace.lists, double(trace.voices) / n, trace.maxList, double(trace.running) / n,
+                    double(trace.runningAfter) / n, double(trace.streams) / n, trace.ended,
+                    static_cast<int>(m_pbLayout), m_ucodeCrc, oldAxLayout ? 1 : 0);
+            trace = VoiceTrace{};
+            trace.last = now;
         }
     }
 
@@ -1398,7 +1441,9 @@ private:
         std::fflush(stderr);
     }
 
-    mutable std::mutex m_mutex;
+    // Taken only on the guest CPU's thread (guest_thread_guard.h): the mix worker hands state over through
+    // m_mixMutex and the join, never this. ~35 lock/unlock pairs a frame in P+ Training as a mutex.
+    mutable GuestThreadGuard m_guard{"AXWii::m_guard"};
     MailState m_mailState = MailState::WaitingForCmdListSize;
     bool m_toDspBusy = false;
     uint32_t m_cmdListSize = 0;

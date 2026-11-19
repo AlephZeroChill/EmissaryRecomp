@@ -119,7 +119,7 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
   auto height = static_cast<float>(tex.texObj.height());
   const auto vpBias =
       tex.ref && tex.ref->hasArbitraryMips
-          ? log2(std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
+          ? std::log2(std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
                           g_gxState.renderViewport.height / std::max(g_gxState.logicalViewport.height, 1.f)))
           : 0.f;
   return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
@@ -719,6 +719,7 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
     // Same z correction effective_projection() folds into ubuf.proj, applied to the reference plane.
     const auto& vp = g_gxState.renderViewport;
     const bool flip = (vp.znear <= vp.zfar) == UseReversedZ;
+    resolve_zfreeze_plane();
     const auto& p = g_gxState.zFreezePlane;
     buf.append(flip ? Vec4<float>{-p.x(), -p.y(), -p.z(), 0.f} : Vec4<float>{p.x(), p.y(), p.z() + 1.f, 0.f});
   }

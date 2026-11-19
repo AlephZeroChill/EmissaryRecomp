@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <string>
 
+#include "gx_vertex_state_overrides.h"  // last: this file's entry points touch the HLE vertex state
+
 namespace {
 uint32_t CanonicalVtxAttr(uint32_t attr) {
     return attr == GX_VA_NBT ? GX_VA_NRM : attr;
@@ -23,32 +25,102 @@ uint32_t CanonicalVtxAttr(uint32_t attr) {
 // precede the draw carrying the max-index bounds, which cannot be known without
 // buffering the whole primitive. Indexed attributes are therefore expanded into
 // the packed direct stream below (GX_INDEX8/16 -> GX_DIRECT).
+constexpr GxStream::AuroraVtxPublishOptions kBeginPublish{/*includeNbt=*/false,
+                                                          /*fmtLoopFirst=*/static_cast<int>(GX_VA_POS),
+                                                          /*fmtLoopLast=*/static_cast<int>(GX_VA_TEX7)};
+}  // namespace
+
+extern "C" size_t GXShadowVtxBytes();        // aurora GXManage.cpp: Aurora's vertex descriptor/format shadow
+extern "C" void GXShadowSaveVtx(void* out);
+extern "C" void GXShadowSaveDirty(u32 out[2]);
+extern "C" void GXShadowLoadDirty(const u32 in[2]);
+namespace aurora::gx::worker {
+bool enabled() noexcept;
+bool on_gx_thread() noexcept;
+}  // namespace aurora::gx::worker
+namespace aurora::gx::fifo {
+bool in_display_list();
+}  // namespace aurora::gx::fifo
+
+namespace {
+// GX__Begin_HLE's publication, remembered. Effects quads (vanilla Training: 43 a frame, mostly one emitter's particles
+// in a row) publish the same state begin after begin. A publication writes Aurora's descriptor and format fields from
+// the HLE vertex state alone, so once it has run, running it again on the fields it left (and the same HLE state:
+// same generation and format) writes the same values - a fixed point - and its only other effect is the dirty bits.
+// With the GX thread on (Aurora's producer) or in a display list, GXSetVtxDescv / GXSetVtxAttrFmtv set them whatever
+// changed (descriptors 8; formats 0x10 and the format's VAT bit: the begin's format list is never empty), so here they
+// are set directly; while the vertex state is pending the publication is logged as before. Any other case, or other
+// fields (something else wrote them since), publishes. The publication was ~0.37% of game-thread ops at 43 begins a
+// frame (IBS: SETVCDATTR, GXSetVtxDescv, GXSetVtxAttrFmtv, the list building), ~800 instructions a begin.
+struct BeginPublishMemo {
+    uint32_t generation = 0;
+    GXVtxFmt fmt = GX_VTXFMT0;
+    uint8_t fields[256];  // GXShadowSaveVtx after the publication
+};
+BeginPublishMemo s_beginMemo;  // game thread (GX__Begin_HLE)
+
 void ApplyAuroraVtxStateForBegin(GXVtxFmt fmt) {
-    GxStream::PublishAuroraVtxState(fmt,
-                                    GxStream::AuroraVtxPublishOptions{
-                                        /*includeNbt=*/false,
-                                        /*fmtLoopFirst=*/static_cast<int>(GX_VA_POS),
-                                        /*fmtLoopLast=*/static_cast<int>(GX_VA_TEX7)});
+    static const size_t kFieldBytes = GXShadowVtxBytes();
+    const bool canRemember = kFieldBytes <= sizeof(s_beginMemo.fields) && static_cast<uint32_t>(fmt) < GX_MAX_VTXFMT;
+    if (canRemember && t_gxBeginPublishMemoValid && s_beginMemo.generation == g_hleGxState.vtxStateGeneration &&
+        s_beginMemo.fmt == fmt &&
+        ((aurora::gx::worker::enabled() && !aurora::gx::worker::on_gx_thread()) || aurora::gx::fifo::in_display_list())) {
+        uint8_t now[sizeof(s_beginMemo.fields)];
+        GXShadowSaveVtx(now);
+        if (std::memcmp(now, s_beginMemo.fields, kFieldBytes) == 0) {
+            u32 dirty[2];
+            GXShadowSaveDirty(dirty);
+            dirty[0] |= 0x8u | 0x10u;
+            dirty[1] |= 1u << static_cast<uint32_t>(fmt);
+            GXShadowLoadDirty(dirty);
+            ++g_gxBeginPublishSkips;
+            if (__builtin_expect(t_gxVtxPending, 0) && !g3dn::g_recOn) {
+                GXVtxDescList descs[27];
+                GXVtxAttrFmtList fmts[27];
+                int n = 0, m = 0;
+                GxStream::BuildAuroraVtxPublishLists(fmt, kBeginPublish, descs, n, fmts, m);
+                GxCarryLogPublish(fmt, descs, n, fmts, m);
+            }
+            return;
+        }
+    }
+    GxStream::PublishAuroraVtxState(fmt, kBeginPublish);
+    t_gxBeginPublishMemoValid = canRemember;
+    if (canRemember) {
+        s_beginMemo.generation = g_hleGxState.vtxStateGeneration;
+        s_beginMemo.fmt = fmt;
+        GXShadowSaveVtx(s_beginMemo.fields);
+    }
 }
-}
+}  // namespace
 
 // ============================================================================
 // Vertex Descriptor
 // ============================================================================
 
+// The vertex-state setters (also reached directly: native_cpu_calls.inc). While the state is pending (the vertex-state
+// carry, gx_internal.h) they write this thread's stale copy and note the rewrite instead of taking the state back; the
+// layout hash is then invalidated unconditionally (the old value compared against is stale).
 extern "C" void GX__ClearVtxDesc_HLE() {
+    const bool rewriting = GxCarryRewriting();
     bool changed = false;
     for(int i=0; i<26; ++i){
         changed |= g_hleGxState.vtxDesc[i] != GX_NONE;
         g_hleGxState.vtxDesc[i]=GX_NONE;
     }
-    if (changed) g_hleGxState.InvalidateVtxLayoutHash();
+    if (changed || rewriting) g_hleGxState.InvalidateVtxLayoutHash();
     // GXClearVtxDesc resets descriptors only; array base/stride state persists.
     GXClearVtxDesc();
+    if (rewriting) {
+        GxCarryNoteDesc((1u << 26) - 1u);
+        GxCarryLogClear();
+    }
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__ClearVtxDesc_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801efb10, GX__ClearVtxDesc_HLE, (), ());
 
 extern "C" void GX__SetVtxDesc_HLE(uint32_t a, uint32_t t) {
+    const bool rewriting = GxCarryRewriting();
     const uint32_t attr = CanonicalVtxAttr(a);
     if(attr>=26||attr==GX_VA_NULL) return;
     const GXAttrType oldType = g_hleGxState.vtxDesc[attr];
@@ -56,10 +128,14 @@ extern "C" void GX__SetVtxDesc_HLE(uint32_t a, uint32_t t) {
     if (a == GX_VA_NBT) {
         g_hleGxState.vtxDesc[GX_VA_NBT] = GX_NONE;
     }
-    if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxLayoutHash();
+    if (rewriting) GxCarryNoteDesc((1u << attr) | (a == GX_VA_NBT ? 1u << GX_VA_NBT : 0u));
+    if (g_hleGxState.vtxDesc[attr] != oldType || rewriting) g_hleGxState.InvalidateVtxLayoutHash();
     if(IsMatrixIndexAttr((GXAttr)attr)) return;
-    GXSetVtxDesc((GXAttr)a, (t==GX_INDEX8||t==GX_INDEX16)?GX_DIRECT:(GXAttrType)t);
+    const GXAttrType auroraType = (t==GX_INDEX8||t==GX_INDEX16)?GX_DIRECT:(GXAttrType)t;
+    GXSetVtxDesc((GXAttr)a, auroraType);
+    if (rewriting) GxCarryLogDesc(a, auroraType);
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetVtxDesc_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801ef280, GX__SetVtxDesc_HLE, (uint32_t a, uint32_t t), (a, t));
 
 extern "C" void GX__SetVtxDescv_HLE(uint32_t la) {
@@ -71,6 +147,7 @@ extern "C" void GX__SetVtxDescv_HLE(uint32_t la) {
         p+=8;
     }
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetVtxDescv_HLE);  // GX__SetVtxDesc_HLE per entry
 PPC_NATIVE_OVERRIDE_VOID(801ef4e4, GX__SetVtxDescv_HLE, (uint32_t la), (la));
 
 extern "C" void GX__GetVtxDesc_HLE(uint32_t a, uint32_t tp) {
@@ -108,6 +185,7 @@ PPC_NATIVE_OVERRIDE_VOID(801efa80, GX__GetVtxDescv_HLE, (uint32_t la), (la));
 // ============================================================================
 
 extern "C" void GX__SetVtxAttrFmt_HLE(uint32_t vf, uint32_t a, uint32_t c, uint32_t t, uint32_t fr) {
+    const bool rewriting = GxCarryRewriting();
     const uint32_t attr = CanonicalVtxAttr(a);
     if(vf<8&&attr<26){
         const VtxAttrFmt oldFmt = g_hleGxState.vtxAttrFmt[vf][attr];
@@ -117,8 +195,9 @@ extern "C" void GX__SetVtxAttrFmt_HLE(uint32_t vf, uint32_t a, uint32_t c, uint3
         if (a == GX_VA_NBT) {
             g_hleGxState.vtxAttrFmt[vf][GX_VA_NBT] = {};
         }
+        if (rewriting) GxCarryNoteFmt(vf, (1u << attr) | (a == GX_VA_NBT ? 1u << GX_VA_NBT : 0u));
         const auto& newFmt = g_hleGxState.vtxAttrFmt[vf][attr];
-        if (oldFmt.cnt != newFmt.cnt || oldFmt.type != newFmt.type || oldFmt.frac != newFmt.frac) {
+        if (oldFmt.cnt != newFmt.cnt || oldFmt.type != newFmt.type || oldFmt.frac != newFmt.frac || rewriting) {
             g_hleGxState.InvalidateVtxLayoutHash();
         }
     }
@@ -126,7 +205,9 @@ extern "C" void GX__SetVtxAttrFmt_HLE(uint32_t vf, uint32_t a, uint32_t c, uint3
         return;
     }
     GXSetVtxAttrFmt((GXVtxFmt)vf, (GXAttr)a, (GXCompCnt)c, (GXCompType)t, (u8)fr);
+    if (rewriting) GxCarryLogFmt(vf, a, c, t, fr);
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetVtxAttrFmt_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801efb44, GX__SetVtxAttrFmt_HLE, (uint32_t vf, uint32_t a, uint32_t c, uint32_t t, uint32_t fr), (vf, a, c, t, fr));
 
 extern "C" void GX__SetVtxAttrFmtv_HLE(uint32_t vf, uint32_t la) {
@@ -138,6 +219,7 @@ extern "C" void GX__SetVtxAttrFmtv_HLE(uint32_t vf, uint32_t la) {
         p+=16;
     }
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetVtxAttrFmtv_HLE);  // GX__SetVtxAttrFmt_HLE per entry
 PPC_NATIVE_OVERRIDE_VOID(801efce4, GX__SetVtxAttrFmtv_HLE, (uint32_t vf, uint32_t la), (vf, la));
 
 extern "C" void GX__GetVtxAttrFmt_HLE(uint32_t vf, uint32_t a, uint32_t cp, uint32_t tp, uint32_t fp) {
@@ -184,6 +266,7 @@ PPC_NATIVE_OVERRIDE_VOID(801f0194, GX__GetVtxAttrFmtv_HLE, (uint32_t vf, uint32_
 // ============================================================================
 
 extern "C" void GX__SetArray_HLE(uint32_t a, uint32_t ba, uint32_t str) {
+    G3D_REC_HLE(g3dn::kRecSetArray, a, ba, str);
     const uint32_t attr = CanonicalVtxAttr(a);
     if (SpmDumpFrame()) RT_LOGF(RT_TAG_GX, "[drawdump] setarray %u base 0x%08X stride %u\n", attr, ba, str);
     if(attr<26){ g_hleGxState.vtxArray[attr].base=ba; g_hleGxState.vtxArray[attr].stride=str; }
@@ -192,16 +275,21 @@ PPC_NATIVE_OVERRIDE_VOID(801f0208, GX__SetArray_HLE, (uint32_t a, uint32_t ba, u
 
 // Switch-artifact entry point for the same SDK function; forwards rather than
 // repeating the body.
-extern "C" void GX__SetArray_8016e1c4(uint32_t a, uint32_t b, uint32_t s) { GX__SetArray_HLE(a, b, s); }
+extern "C" void GX__SetArray_8016e1c4(uint32_t a, uint32_t b, uint32_t s) {
+    GX_HLE_MaterializeIfPending();  // a named override, not a thunk: writes the HLE vertex arrays
+    GX__SetArray_HLE(a, b, s);
+}
 
 // ============================================================================
 // Texture Coordinate Generation
 // ============================================================================
 
 bool SpmAuroraDlRecording();
+// The texture-coordinate, offset, line and point setters touch no vertex state: their thunks do not take it back.
 extern "C" void GX__SetNumTexGens_HLE(uint32_t n) {
     GXSetNumTexGens((u8)n);
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetNumTexGens_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f0480, GX__SetNumTexGens_HLE, (uint32_t n), (n));
 
 extern "C" void GX__SetTexCoordGen2_HLE(uint32_t dc, uint32_t f, uint32_t sp, uint32_t m, uint32_t n, uint32_t pm) {
@@ -218,6 +306,7 @@ extern "C" void GX__SetTexCoordGen2_HLE(uint32_t dc, uint32_t f, uint32_t sp, ui
     }
     GXSetTexCoordGen2((GXTexCoordID)dc, (GXTexGenType)f, (GXTexGenSrc)sp, m, (GXBool)n, pm);
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetTexCoordGen2_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f0258, GX__SetTexCoordGen2_HLE, (uint32_t dc, uint32_t f, uint32_t sp, uint32_t m, uint32_t n, uint32_t pm), (dc, f, sp, m, n, pm));
 
 extern "C" void GX__EnableTexOffsets_HLE(uint32_t coord, uint32_t lineEnable, uint32_t pointEnable) {
@@ -225,16 +314,19 @@ extern "C" void GX__EnableTexOffsets_HLE(uint32_t coord, uint32_t lineEnable, ui
                        lineEnable ? GX_TRUE : GX_FALSE,
                        pointEnable ? GX_TRUE : GX_FALSE);
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__EnableTexOffsets_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f1330, GX__EnableTexOffsets_HLE, (uint32_t coord, uint32_t lineEnable, uint32_t pointEnable), (coord, lineEnable, pointEnable));
 
 extern "C" void GX__SetLineWidth_HLE(uint32_t width, uint32_t texOffsets) {
     GXSetLineWidth(static_cast<u8>(width), static_cast<GXTexOffset>(texOffsets));
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetLineWidth_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f12ac, GX__SetLineWidth_HLE, (uint32_t width, uint32_t texOffsets), (width, texOffsets));
 
 extern "C" void GX__SetPointSize_HLE(uint32_t pointSize, uint32_t texOffsets) {
     GXSetPointSize(static_cast<u8>(pointSize), static_cast<GXTexOffset>(texOffsets));
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__SetPointSize_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f12fc, GX__SetPointSize_HLE, (uint32_t pointSize, uint32_t texOffsets), (pointSize, texOffsets));
 
 // ============================================================================
@@ -323,6 +415,20 @@ static void SpmDumpBegin(uint32_t t, uint32_t vf, uint32_t nv) {
 }
 
 extern "C" void GX__Begin_HLE(uint32_t t, uint32_t vf, uint32_t nv) {
+    // The vertex-state carry, here and not only in the thunk: also reached directly (native_cpu_calls.inc:
+    // InvokeDirectCpu calls this by name). Without it a text quad (ms::CharWriter::PrintGlyph) began with a deferred
+    // model's descriptors (a crash; an earlier take-back at a fog/Z-mode call used to hide it). No take-back
+    // when everything the draw reads of the vertex state was rewritten here since it went pending (an effect or text
+    // setup: GXClearVtxDesc, its descriptors and formats); the current format is then a rewrite of its own.
+    if (t_gxVtxPending && !g3dn::g_recOn) {
+        if (!GxCarryCanDraw(vf)) {
+            GX_HLE_MaterializeVertexStateSlow(kTakeBackBegin);
+        } else if (GxCarryRewriting()) {
+            GxCarryNoteCurFmt();
+        }
+        GxCarryCountDraw();
+    }
+    t_gxBeginPublished = 0;
     SpmDumpBegin(t, vf, nv);
     SpmRecordRawVertexDisplayList();
     if(IsDisplayListActive()){
@@ -332,11 +438,17 @@ extern "C" void GX__Begin_HLE(uint32_t t, uint32_t vf, uint32_t nv) {
     }
     ServiceDeferredTimingDuringGxWork();
     ApplyAuroraVtxStateForBegin(static_cast<GXVtxFmt>(vf));
+    // For the first vertex store's publication (gx_fifo.cpp BeginPublicationCurrent); none outside an active frame
+    // (the store begins one first).
+    if (vf < GX_MAX_VTXFMT && g_auroraFrameActive.load(std::memory_order_acquire)) {
+        t_gxBeginPublished = uint64_t{g_hleGxState.vtxStateGeneration} << 8 | uint64_t{vf} << 1 | 1u;
+    }
     g_hleGxState.currentVtxFmt=(GXVtxFmt)vf; g_hleGxState.currentPrim=(GXPrimitive)t;
     g_hleGxState.vertsRemaining=nv; g_hleGxState.inBegin=true; g_hleGxState.auroraBeginCalled=false;
     g_hleGxState.fifoReadOffset = 0;
     g_hleGxState.fifoByteCount=0; g_hleGxState.ResetVertex();
 }
+GX_THUNK_SKIPS_TAKEBACK(GX__Begin_HLE);
 PPC_NATIVE_OVERRIDE_VOID(801f1088, GX__Begin_HLE, (uint32_t t, uint32_t vf, uint32_t nv), (t, vf, nv));
 
 extern "C" void GX__End_80044b30() { g_hleGxState.inBegin=false; GXEnd(); }
@@ -447,3 +559,5 @@ extern "C" void GX__DrawSphere_HLE(uint32_t numMajor, uint32_t numMinor) {
     }
 }
 PPC_NATIVE_OVERRIDE_VOID(801f4980, GX__DrawSphere_HLE, (uint32_t numMajor, uint32_t numMinor), (numMajor, numMinor));
+
+#include "gx_vertex_state_overrides_end.h"  // pairs with the include at the top (unity build)

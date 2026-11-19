@@ -2,7 +2,7 @@
 
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../gx/gx.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../gpu/shader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,16 +10,13 @@
 #include <mutex>
 #include <string>
 
-#include <magic_enum.hpp>
 #include <aurora/profiling.hpp>
 
 namespace aurora::gfx::depth_peek {
 namespace {
 Module Log("aurora::gfx::depth_peek");
 
-using webgpu::g_device;
-using webgpu::g_instance;
-using webgpu::g_queue;
+using gpu::g_device;
 
 using Clock = std::chrono::steady_clock;
 
@@ -54,155 +51,87 @@ enum class SlotState : uint8_t {
 };
 
 struct Slot {
-  wgpu::Buffer storageBuffer;
-  wgpu::Buffer readbackBuffer;
-  wgpu::Buffer paramsBuffer;
+  gpu::Buffer storageBuffer;
+  gpu::TransferBuffer readbackBuffer;
+  SDL_GPUFence* fence = nullptr;
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t byteSize = 0;
   SlotState state = SlotState::Available;
 };
 
-struct PendingMap {
-  size_t slotIdx = 0;
-  wgpu::Buffer readbackBuffer;
-  uint64_t byteSize = 0;
-};
-
 std::array<Slot, SlotCount> g_slots;
 size_t g_nextSlot = 0;
-wgpu::BindGroupLayout g_bindGroupLayout;
-wgpu::ComputePipeline g_pipeline;
+gpu::ComputePipeline g_pipeline;
+gpu::Sampler g_sampler;
+bool g_msaaWarned = false;
 bool g_snapshotRequested = false;
 Clock::time_point g_nextSnapshotTime;
 LatestSnapshot g_latest;
 std::mutex g_mutex;
 
-constexpr std::string_view ShaderPreamble = R"(
-struct Params {
-    dstSize: vec2u,
-    srcSize: vec2u,
-    offset: vec2f,
-    scale: vec2f,
-};
-
-@group(0) @binding(1) var<storage, read_write> out_z: array<u32>;
-@group(0) @binding(2) var<uniform> params: Params;
-)"sv;
+constexpr std::string_view ParamsMembers = "uvec2 dstSize; uvec2 srcSize; vec2 offset; vec2 scale;";
 
 constexpr std::string_view ReversedZBody = R"(
-fn gx_z24(depth: f32) -> u32 {
-    return min(u32(clamp(1.0 - depth, 0.0, 1.0) * 16777215.0 + 0.5), 0x00ffffffu);
+uint gx_z24(float depth) {
+  return min(uint(clamp(1.0 - depth, 0.0, 1.0) * 16777215.0 + 0.5), 0x00ffffffu);
 }
 )"sv;
 
 constexpr std::string_view ForwardZBody = R"(
-fn gx_z24(depth: f32) -> u32 {
-    return min(u32(clamp(depth, 0.0, 1.0) * 16777215.0 + 0.5), 0x00ffffffu);
+uint gx_z24(float depth) {
+  return min(uint(clamp(depth, 0.0, 1.0) * 16777215.0 + 0.5), 0x00ffffffu);
 }
 )"sv;
 
 constexpr std::string_view ShaderMain = R"(
-@group(0) @binding(0) var src: texture_depth_2d;
+  if (gid.x >= params.dstSize.x || gid.y >= params.dstSize.y) {
+    return;
+  }
 
-fn load_depth(coord: vec2i) -> f32 {
-    return textureLoad(src, coord, 0);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn cs_main(@builtin(global_invocation_id) id: vec3u) {
-    if (id.x >= params.dstSize.x || id.y >= params.dstSize.y) {
-        return;
-    }
-
-    let dstCenter = vec2f(vec2u(id.xy)) + vec2f(0.5, 0.5);
-    let srcPixel = clamp(vec2i(floor(params.offset + dstCenter * params.scale)), vec2i(0, 0),
-                         vec2i(params.srcSize) - vec2i(1, 1));
-    let depth = load_depth(srcPixel);
-    out_z[id.y * params.dstSize.x + id.x] = gx_z24(depth);
-}
+  vec2 dstCenter = vec2(gid.xy) + vec2(0.5, 0.5);
+  ivec2 srcPixel = clamp(ivec2(floor(params.offset + dstCenter * params.scale)), ivec2(0, 0),
+                         ivec2(params.srcSize) - ivec2(1, 1));
+  float depth = LOAD_DEPTH(src, srcPixel);
+  out_z[gid.y * params.dstSize.x + gid.x] = gx_z24(depth);
 )"sv;
 
-std::string build_shader_source() {
-  std::string source;
-  source.reserve(ShaderPreamble.size() + ReversedZBody.size() + ShaderMain.size());
-  source += ShaderPreamble;
-  source += gx::UseReversedZ ? ReversedZBody : ForwardZBody;
-  source += ShaderMain;
-  return source;
+gpu::shader::Interface shader_interface() {
+  gpu::shader::Interface iface;
+  iface.compute = true;
+  iface.uniforms = {{"params", std::string{ParamsMembers}}};
+  iface.rwStorageBuffers = {"out_z"};
+  iface.textures = {{"src", gpu::shader::TextureKind::Depth}};
+  iface.workgroup[0] = WorkgroupSizeX;
+  iface.workgroup[1] = WorkgroupSizeY;
+  iface.workgroup[2] = 1;
+  return iface;
 }
 
-wgpu::ComputePipeline create_pipeline(const wgpu::BindGroupLayout& bindGroupLayout, const char* label) {
-  const auto shaderSource = build_shader_source();
-  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
-      .code = shaderSource.c_str(),
-  }};
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &wgslSource,
-      .label = label,
-  };
-  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
-
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 1,
-      .bindGroupLayouts = &bindGroupLayout,
-  };
-  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-  const wgpu::ComputePipelineDescriptor pipelineDescriptor{
-      .label = label,
-      .layout = pipelineLayout,
-      .compute =
-          wgpu::ComputeState{
-              .module = module,
-              .entryPoint = "cs_main",
-          },
-  };
-  return g_device.CreateComputePipeline(&pipelineDescriptor);
+gpu::ComputePipeline create_pipeline(const char* label) {
+  return gpu::shader::create_compute(shader_interface(), gx::UseReversedZ ? ReversedZBody : ForwardZBody, ShaderMain,
+                                     label);
 }
 
-wgpu::BindGroupLayout create_bind_group_layout(const char* label) {
-  constexpr std::array entries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Compute,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Depth,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Compute,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Storage,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 2,
-          .visibility = wgpu::ShaderStage::Compute,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Uniform,
-              },
-      },
+gpu::Sampler create_sampler() {
+  constexpr SDL_GPUSamplerCreateInfo info{
+      .min_filter = SDL_GPU_FILTER_NEAREST,
+      .mag_filter = SDL_GPU_FILTER_NEAREST,
+      .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+      .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+      .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+      .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
   };
-  const wgpu::BindGroupLayoutDescriptor descriptor{
-      .label = label,
-      .entryCount = entries.size(),
-      .entries = entries.data(),
-  };
-  return g_device.CreateBindGroupLayout(&descriptor);
+  return gpu::create_sampler(info);
 }
 
-Params make_params(wgpu::Extent3D sourceSize, const FrameMapping& mapping) noexcept {
+Params make_params(uint32_t sourceWidth, uint32_t sourceHeight, const FrameMapping& mapping) noexcept {
   const auto dstSize = mapping.logicalSize;
   Params params{
       .dstWidth = dstSize.x,
       .dstHeight = dstSize.y,
-      .srcWidth = sourceSize.width,
-      .srcHeight = sourceSize.height,
+      .srcWidth = sourceWidth,
+      .srcHeight = sourceHeight,
   };
 
   if (mapping.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
@@ -210,22 +139,31 @@ Params make_params(wgpu::Extent3D sourceSize, const FrameMapping& mapping) noexc
   }
 
   const auto logicalSize = mapping.logicalSize;
-  if (logicalSize.x == 0 || logicalSize.y == 0 || sourceSize.width == 0 || sourceSize.height == 0) {
+  if (logicalSize.x == 0 || logicalSize.y == 0 || sourceWidth == 0 || sourceHeight == 0) {
     return params;
   }
 
   const bool stretch = mapping.viewportPolicy == AURORA_VIEWPORT_STRETCH ||
                        mapping.viewportPolicy == AURORA_VIEWPORT_16_9;
-  const float scaleX = static_cast<float>(sourceSize.width) / static_cast<float>(logicalSize.x);
-  const float scaleY = static_cast<float>(sourceSize.height) / static_cast<float>(logicalSize.y);
+  const float scaleX = static_cast<float>(sourceWidth) / static_cast<float>(logicalSize.x);
+  const float scaleY = static_cast<float>(sourceHeight) / static_cast<float>(logicalSize.y);
   const float scale = std::min(scaleX, scaleY);
   params.scaleX = stretch ? scaleX : scale;
   params.scaleY = stretch ? scaleY : scale;
   params.offsetX =
-      stretch ? 0.f : (static_cast<float>(sourceSize.width) - static_cast<float>(logicalSize.x) * scale) * 0.5f;
+      stretch ? 0.f : (static_cast<float>(sourceWidth) - static_cast<float>(logicalSize.x) * scale) * 0.5f;
   params.offsetY =
-      stretch ? 0.f : (static_cast<float>(sourceSize.height) - static_cast<float>(logicalSize.y) * scale) * 0.5f;
+      stretch ? 0.f : (static_cast<float>(sourceHeight) - static_cast<float>(logicalSize.y) * scale) * 0.5f;
   return params;
+}
+
+void release_fence(Slot& slot) noexcept {
+  if (slot.fence != nullptr) {
+    if (g_device != nullptr) {
+      SDL_ReleaseGPUFence(g_device, slot.fence);
+    }
+    slot.fence = nullptr;
+  }
 }
 
 bool ensure_slot(Slot& slot, uint32_t width, uint32_t height) {
@@ -236,7 +174,6 @@ bool ensure_slot(Slot& slot, uint32_t width, uint32_t height) {
 
   slot.storageBuffer = {};
   slot.readbackBuffer = {};
-  slot.paramsBuffer = {};
   slot.width = width;
   slot.height = height;
   slot.byteSize = byteSize;
@@ -245,27 +182,10 @@ bool ensure_slot(Slot& slot, uint32_t width, uint32_t height) {
     return false;
   }
 
-  const wgpu::BufferDescriptor storageDescriptor{
-      .label = "Depth Peek Storage Buffer",
-      .usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc,
-      .size = byteSize,
-  };
-  slot.storageBuffer = g_device.CreateBuffer(&storageDescriptor);
-
-  const wgpu::BufferDescriptor readbackDescriptor{
-      .label = "Depth Peek Readback Buffer",
-      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-      .size = byteSize,
-  };
-  slot.readbackBuffer = g_device.CreateBuffer(&readbackDescriptor);
-
-  const wgpu::BufferDescriptor paramsDescriptor{
-      .label = "Depth Peek Params Buffer",
-      .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
-      .size = sizeof(Params),
-  };
-  slot.paramsBuffer = g_device.CreateBuffer(&paramsDescriptor);
-  return slot.storageBuffer && slot.readbackBuffer && slot.paramsBuffer;
+  slot.storageBuffer = gpu::create_buffer(SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE, static_cast<uint32_t>(byteSize),
+                                         "Depth Peek Storage Buffer");
+  slot.readbackBuffer = gpu::create_transfer_buffer(false, static_cast<uint32_t>(byteSize));
+  return slot.storageBuffer && slot.readbackBuffer;
 }
 
 Slot* find_available_slot(uint32_t width, uint32_t height) {
@@ -284,36 +204,39 @@ Slot* find_available_slot(uint32_t width, uint32_t height) {
   return nullptr;
 }
 
-void complete_slot(size_t slotIdx, wgpu::MapAsyncStatus status, wgpu::StringView message) {
-  std::lock_guard lock{g_mutex};
-  auto& slot = g_slots[slotIdx];
-  if (status == wgpu::MapAsyncStatus::Success) {
+// Harvests readbacks whose GPU work has finished. Never blocks. Called with g_mutex held.
+void complete_slots() noexcept {
+  for (auto& slot : g_slots) {
+    if (slot.state != SlotState::MapPending || slot.fence == nullptr || !SDL_QueryGPUFence(g_device, slot.fence)) {
+      continue;
+    }
+    release_fence(slot);
     const auto valueCount = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height);
-    const auto* mapped =
-        static_cast<const uint32_t*>(slot.readbackBuffer.GetConstMappedRange(0, valueCount * sizeof(uint32_t)));
+    const auto* mapped = static_cast<const uint32_t*>(SDL_MapGPUTransferBuffer(g_device, slot.readbackBuffer->handle, false));
     if (mapped != nullptr) {
       g_latest.width = slot.width;
       g_latest.height = slot.height;
       g_latest.data.assign(mapped, mapped + valueCount);
+      SDL_UnmapGPUTransferBuffer(g_device, slot.readbackBuffer->handle);
+    } else {
+      Log.warn("Depth Peek readback mapping failed: {}", SDL_GetError());
     }
-    slot.readbackBuffer.Unmap();
-  } else if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
-    Log.warn("Depth Peek readback mapping failed {}: {}", magic_enum::enum_name(status), message);
+    slot.state = SlotState::Available;
   }
-  slot.state = SlotState::Available;
 }
 } // namespace
 
 void initialize() {
-  g_bindGroupLayout = create_bind_group_layout("Depth Peek Bind Group Layout");
-  g_pipeline = create_pipeline(g_bindGroupLayout, "Depth Peek Pipeline");
+  g_pipeline = create_pipeline("Depth Peek Pipeline");
+  g_sampler = create_sampler();
 }
 
 void shutdown() {
   testing::reset();
   g_pipeline = {};
-  g_bindGroupLayout = {};
+  g_sampler = {};
   for (auto& slot : g_slots) {
+    release_fence(slot);
     slot = {};
   }
 }
@@ -333,17 +256,16 @@ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
 }
 
 void poll() noexcept {
-  if (g_instance) {
-    g_instance.ProcessEvents();
-  }
+  std::lock_guard lock{g_mutex};
+  complete_slots();
 }
 
 FrameMapping capture_frame_mapping() noexcept {
   return {vi::configured_fb_size(), gx::g_gxState.viewportPolicy};
 }
 
-void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
-                           wgpu::Extent3D sourceSize, uint32_t msaaSamples, const FrameMapping& mapping) noexcept {
+void encode_frame_snapshot(gpu::Encoder& enc, const gpu::Texture& depth, uint32_t msaaSamples,
+                           const FrameMapping& mapping) noexcept {
   ZoneScoped;
   const auto now = Clock::now();
   {
@@ -356,18 +278,20 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
   }
 
   const auto dstSize = mapping.logicalSize;
-  if (!depthView || dstSize.x == 0 || dstSize.y == 0 || sourceSize.width == 0 || sourceSize.height == 0) {
+  if (!depth || !g_pipeline || dstSize.x == 0 || dstSize.y == 0 || depth->width == 0 || depth->height == 0) {
     return;
   }
-  if (msaaSamples > 1) {
-    Log.fatal("Depth Peek from multisampled EFB targets is not supported");
+  // SDL_GPU cannot sample a multisampled texture.
+  if (msaaSamples > 1 || depth->samples != SDL_GPU_SAMPLECOUNT_1) {
+    if (!g_msaaWarned) {
+      g_msaaWarned = true;
+      Log.warn("Depth Peek from multisampled EFB targets is not supported");
+    }
+    return;
   }
 
-  const Params params = make_params(sourceSize, mapping);
-  wgpu::Buffer storageBuffer;
-  wgpu::Buffer readbackBuffer;
-  wgpu::Buffer paramsBuffer;
-  uint64_t byteSize = 0;
+  const Params params = make_params(depth->width, depth->height, mapping);
+  gpu::Buffer storageBuffer;
   {
     std::lock_guard lock{g_mutex};
     auto* slot = find_available_slot(dstSize.x, dstSize.y);
@@ -376,74 +300,47 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
     }
     slot->state = SlotState::CopySubmitted;
     storageBuffer = slot->storageBuffer;
-    readbackBuffer = slot->readbackBuffer;
-    paramsBuffer = slot->paramsBuffer;
-    byteSize = slot->byteSize;
   }
 
-  g_queue.WriteBuffer(paramsBuffer, 0, &params, sizeof(params));
-
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = depthView,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .buffer = storageBuffer,
-          .size = byteSize,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 2,
-          .buffer = paramsBuffer,
-          .size = sizeof(Params),
-      },
+  const SDL_GPUStorageBufferReadWriteBinding storageBinding{
+      .buffer = storageBuffer->handle,
+      .cycle = false,
   };
-  const wgpu::BindGroupDescriptor bindGroupDescriptor{
-      .label = "Depth Peek Bind Group",
-      .layout = g_bindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
+  SDL_GPUComputePass* pass = enc.begin_compute_pass(nullptr, 0, &storageBinding, 1);
+  if (pass == nullptr) {
+    Log.warn("Depth Peek compute pass failed: {}", SDL_GetError());
+    return;
+  }
+  SDL_BindGPUComputePipeline(pass, g_pipeline->handle);
+  const SDL_GPUTextureSamplerBinding textureBinding{
+      .texture = depth->handle,
+      .sampler = g_sampler->handle,
   };
-  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-
-  const wgpu::ComputePassDescriptor passDescriptor{
-      .label = "Depth Peek Compute Pass",
-  };
-  const auto pass = cmd.BeginComputePass(&passDescriptor);
-  pass.SetPipeline(g_pipeline);
-  pass.SetBindGroup(0, bindGroup);
-  pass.DispatchWorkgroups((dstSize.x + WorkgroupSizeX - 1) / WorkgroupSizeX,
-                          (dstSize.y + WorkgroupSizeY - 1) / WorkgroupSizeY);
-  pass.End();
-
-  cmd.CopyBufferToBuffer(storageBuffer, 0, readbackBuffer, 0, byteSize);
+  SDL_BindGPUComputeSamplers(pass, 0, &textureBinding, 1);
+  SDL_PushGPUComputeUniformData(enc.cmd(), 0, &params, sizeof(params));
+  SDL_DispatchGPUCompute(pass, (dstSize.x + WorkgroupSizeX - 1) / WorkgroupSizeX,
+                         (dstSize.y + WorkgroupSizeY - 1) / WorkgroupSizeY, 1);
+  SDL_EndGPUComputePass(pass);
 }
 
+// The readback is recorded on its own command buffer submitted after the frame's, so its fence
+// covers exactly the copy whose result is mapped.
 void after_submit() noexcept {
-  std::vector<PendingMap> pendingMaps;
-  {
-    std::lock_guard lock{g_mutex};
-    for (size_t i = 0; i < g_slots.size(); ++i) {
-      auto& slot = g_slots[i];
-      if (slot.state != SlotState::CopySubmitted) {
-        continue;
-      }
-      slot.state = SlotState::MapPending;
-      pendingMaps.push_back({
-          .slotIdx = i,
-          .readbackBuffer = slot.readbackBuffer,
-          .byteSize = slot.byteSize,
-      });
+  std::lock_guard lock{g_mutex};
+  complete_slots();
+  for (auto& slot : g_slots) {
+    if (slot.state != SlotState::CopySubmitted) {
+      continue;
     }
-  }
-
-  for (const auto& pending : pendingMaps) {
-    pending.readbackBuffer.MapAsync(
-        wgpu::MapMode::Read, 0, pending.byteSize, wgpu::CallbackMode::AllowSpontaneous,
-        [slotIdx = pending.slotIdx](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-          complete_slot(slotIdx, status, message);
-        });
+    gpu::Encoder enc;
+    if (!enc) {
+      slot.state = SlotState::Available;
+      continue;
+    }
+    gpu::download_from_buffer(enc, *slot.storageBuffer, 0, *slot.readbackBuffer, 0,
+                              static_cast<uint32_t>(slot.byteSize));
+    slot.fence = enc.submit_with_fence();
+    slot.state = slot.fence != nullptr ? SlotState::MapPending : SlotState::Available;
   }
 }
 
@@ -455,6 +352,7 @@ void reset() noexcept {
   g_nextSnapshotTime = {};
   g_latest = {};
   for (auto& slot : g_slots) {
+    release_fence(slot);
     slot.state = SlotState::Available;
   }
 }

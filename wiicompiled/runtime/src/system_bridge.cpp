@@ -330,7 +330,7 @@ void SystemBridge::WriteGuestMemorySnapshot(std::ostream& os, const std::filesys
            << (dump.good() ? "" : " (write failed)") << std::endl;
     }
     constexpr uint32_t kMem2Base = 0x90000000u;
-    for (uint32_t mem2Size : {0x08000000u, 0x04000000u}) {
+    for (uint32_t mem2Size : {static_cast<uint32_t>(Memory::kMem2Size), 0x04000000u}) {
         if (!Memory::Contains(kMem2Base, mem2Size)) {
             continue;
         }
@@ -480,7 +480,8 @@ void SystemBridge::SeedLowMemDefaults(const Memory::Config& config) {
         const uint32_t ipcBufLo = ipcBufHi - kIPCArenaSize;
         const uint32_t iosReservedLo = kIosMem2End;                      // IOS's own area starts where the game's MEM2 ends
         const uint32_t iosReservedHi = kIosMem2End + kIosReservedSize;  // 0x93620000, as Dolphin reports for IOS36
-        // The FST goes at the top of the mapping, out of the game's arena.
+        // The FST goes at the top of the mapping, out of the game's arena, just above the module homes
+        // (BrawlModulesSnapshotImages fails the boot if they reach it).
         g_dvdFstReservedSize = kDvdFstReserveSize;
         g_dvdFstReservedBase = Memory::kMem2CachedBase + mem2Size - kIosReservedSize - kIPCArenaSize - kDvdFstReserveSize;
         const uint32_t mem2ArenaHi = ipcBufLo;

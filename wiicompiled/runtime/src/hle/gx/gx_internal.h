@@ -3,9 +3,11 @@
 #include "hle_stubs.h"
 #include "memory.h"
 #include "gx_guest_write.h"
+#include "g3d_native.h"  // G3D_REC_HLE: the native g3d path's verification recorder
 #include "ppc_runtime.h"
 #include "aurora_events.h"
 #include "gx_texture_binding_contract.h"
+#include "guest_thread_guard.h"
 
 #include <algorithm>
 
@@ -41,6 +43,25 @@
 #include <cstdio>
 #include <new>
 #include <cstdlib>
+
+// GXGetTexBufferSize walks the mip chain level by level for every texture a draw plans to load (PlanTexLoad) and every
+// texture object check (gx_objects.cpp); a frame uses a few dozen distinct (size, format, mip) combinations, kept here
+// per thread. Exact: the size is a pure function of the arguments. Formats past 16 bits are not cached.
+inline uint32_t CachedTexBufferSize(uint16_t width, uint16_t height, uint32_t format, GXBool mips, uint8_t maxLod) {
+    if (format > 0xFFFFu) return GXGetTexBufferSize(width, height, format, mips, maxLod);
+    struct Entry {
+        uint64_t key;
+        uint32_t size;
+    };
+    static thread_local Entry cache[64];
+    const uint64_t key = (uint64_t{width} | uint64_t{height} << 16 | uint64_t{format} << 32 |
+                          uint64_t{mips != 0 ? 1u : 0u} << 48 | uint64_t{maxLod} << 49) + 1u;  // never 0 (empty)
+    Entry& entry = cache[(key * 0x9E3779B97F4A7C15ull) >> 58];
+    if (entry.key == key) return entry.size;
+    const uint32_t size = GXGetTexBufferSize(width, height, format, mips, maxLod);
+    entry = {key, size};
+    return size;
+}
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -131,6 +152,8 @@ struct HleTexObj {
     }
 };
 
+struct GxTexPlanMemo;  // gx_texture.cpp: a deferred draw's remembered texture plan
+
 // One entry of the texobj table, keyed by the guest GXTexObj address.
 //
 // Derives from TexObjMeta on purpose: `GetTexObjMeta()` hands out a reference to
@@ -159,6 +182,10 @@ struct TexObjSlot : TexObjMeta {
     uint32_t indexedSize = 0;
     bool inIntervalIndex = false;
     bool pendingIntervalUpdate = false;
+
+    // The object's remembered texture plan (gx_texture.cpp PlanTexLoad), allocated at its first repeatable plan and
+    // kept for the slot's life (slots are never erased). A cache beside the decoded state, so mutable.
+    mutable GxTexPlanMemo* planMemo = nullptr;
 };
 
 struct TlutObjMeta {
@@ -289,7 +316,7 @@ struct GxDisplayListState {
 };
 extern GxDisplayListState g_dlRecordState;
 
-inline bool IsDisplayListActive() noexcept { return g_dlRecordState.active; }
+// IsDisplayListActive() is defined below t_gxDrawWorker.
 
 // Mirrors GX__BeginDisplayList_HLE's guest-side initialization.
 void BeginDisplayListRecording(uint32_t listAddr, uint32_t sizeBytes);
@@ -310,6 +337,117 @@ void EndDisplayListRecording();
 void WriteDisplayListData(uint32_t val, uint32_t sizeBytes);
 void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout = std::chrono::milliseconds(100));
 void EnsureAuroraFrameActive();
+// A thread_local with a constant initializer, declared so: other translation units then access it directly instead
+// of through a TLS wrapper call that checks for a dynamic initializer (as g3d_native.h).
+#ifndef MKW_TLS_CONSTINIT
+#if defined(__clang__)
+#define MKW_TLS_CONSTINIT [[clang::require_constant_initialization]]
+#elif defined(__GNUC__) && __GNUC__ >= 10
+#define MKW_TLS_CONSTINIT __constinit
+#else
+#define MKW_TLS_CONSTINIT
+#endif
+#endif
+// This thread is the draw worker replaying deferred native draws (hle/g3d_native.cpp, G3D_NATIVE_ASYNC=2): it makes no
+// guest writes (the game thread makes them when it records) and never begins a frame (the game thread's is active).
+MKW_TLS_CONSTINIT extern thread_local bool t_gxDrawWorker;
+// A display list being recorded (GXBeginDisplayList .. GXEndDisplayList) belongs to the game thread. The draw worker
+// is still replaying draws deferred before the list began: their packets go to its job, never into the list. (Before,
+// it wrote into the list through g_dlRecordState's plain cursor at the same time as the game thread; on ARM it could
+// also see `active` set with the previous list's base/size/writePtr.)
+inline bool IsDisplayListActive() noexcept { return !t_gxDrawWorker && g_dlRecordState.active; }
+// The vertex-state carry (g3d_native.cpp, G3D_NATIVE_ASYNC=2): after a deferred native draw this thread's HLE vertex
+// state (g_hleGxState's vertex fields: descriptors, formats, arrays) and Aurora's vertex descriptor/format shadow are
+// stale - the draw worker holds them - until something reads or writes them here: the GX entry points of the files
+// that touch them (gx_vertex_state_overrides.h) and the FIFO write path rebuild them first, from the worker's state
+// after its last job (GX_HLE_MaterializeVertexStateSlow, which waits for that job). Not while a native draw is being
+// recorded: its GX calls are recorded, not run.
+MKW_TLS_CONSTINIT extern thread_local bool t_gxVtxPending;
+// Aurora's producer FIFO append: aurora-main/lib/gx/fifo.hpp write_data, the function every GX_WRITE_* expands to,
+// over the same per-thread buffer (declared here as there), for HLE paths that emit a whole packet's bytes at once
+// (gx_lighting.cpp light loads, gx_fifo.cpp raw begins): the same bytes as the GX_WRITE_* sequence they replace.
+namespace aurora::gx::fifo {
+namespace detail {
+MKW_TLS_CONSTINIT extern thread_local uint8_t* sBufferData;
+MKW_TLS_CONSTINIT extern thread_local uint32_t sBufferSize;
+MKW_TLS_CONSTINIT extern thread_local uint32_t sBufferCapacity;
+MKW_TLS_CONSTINIT extern thread_local bool sInDisplayList;
+MKW_TLS_CONSTINIT extern thread_local uint8_t* sDlBuffer;
+MKW_TLS_CONSTINIT extern thread_local uint32_t sDlSize;
+MKW_TLS_CONSTINIT extern thread_local uint32_t sDlWritePos;
+}  // namespace detail
+void write_data_grow(const void* data, uint32_t length);
+}  // namespace aurora::gx::fifo
+inline void GxAuroraFifoWrite(const void* data, uint32_t length) {
+    namespace d = aurora::gx::fifo::detail;
+    if (!d::sInDisplayList) {
+        if (d::sBufferSize + length <= d::sBufferCapacity) {
+            std::memcpy(d::sBufferData + d::sBufferSize, data, length);
+            d::sBufferSize += length;
+            return;
+        }
+        aurora::gx::fifo::write_data_grow(data, length);
+    } else if (d::sDlWritePos + length <= d::sDlSize) {
+        std::memcpy(d::sDlBuffer + d::sDlWritePos, data, length);
+        d::sDlWritePos += length;
+    }
+}
+// GX_RAW_BEGIN (gx_fifo.cpp): 0 off, 1 on (default), 2 check - the packet paths above draw the old way and compare.
+int GxRawPacketMode();
+void GxNoteLightPacketCheck(bool same);  // the stats line's light-packet comparisons (check mode)
+extern uint64_t g_gxLightPackets;        // light loads written as one packet (game thread; the stats line)
+extern uint64_t g_gxBeginPublishSkips;   // GX__Begin_HLE publications found already in place (gx_vertex.cpp)
+extern uint64_t g_gxTexMtxPackets;       // texture-matrix loads written as one packet (gx_transform.cpp; game thread)
+void GxNoteTexMtxPacketCheck(bool same);  // check mode's texture-matrix packet comparisons
+
+// GX__Begin_HLE's publication of the vertex state to Aurora (gx_vertex.cpp), for the begin's first vertex store
+// (gx_fifo.cpp HleFifoWrite), which publishes again before GXBegin: (vertex-state generation << 8 | format << 1 | 1)
+// as published in an active frame; 0: none since (cleared at the store, and where a saved state is loaded back).
+MKW_TLS_CONSTINIT extern thread_local uint64_t t_gxBeginPublished;
+// GX__Begin_HLE's remembered publication (gx_vertex.cpp ApplyAuroraVtxStateForBegin) is valid: cleared where a saved
+// vertex state is loaded back (its generation number then comes from elsewhere).
+MKW_TLS_CONSTINIT extern thread_local bool t_gxBeginPublishMemoValid;
+// Why the game thread took the vertex state back (counted per reason, g3d_native.cpp's carry stats line).
+enum GxTakeBackReason : int {
+    kTakeBackEntry,       // a GX entry thunk or named override of the vertex files, a display-list call
+    kTakeBackBegin,       // GXBegin whose draw needs vertex state this thread has not rewritten
+    kTakeBackFifoDraw,    // the same for a draw command in FIFO bytes
+    kTakeBackFifoCp,      // a CP register write in FIFO bytes
+    kTakeBackFifoIndexed, // an indexed XF load (reads the matrix arrays) in FIFO bytes
+    kTakeBackFifoList,    // a display-list call in FIFO bytes
+    kTakeBackNativeDraw,  // a native draw replayed here, or deferred after this thread rewrote vertex state
+    kTakeBackLogFull,     // the rewrite log reached its bound
+    kTakeBackReasons
+};
+extern "C" void GX_HLE_MaterializeVertexStateSlow(int reason);
+inline void GX_HLE_MaterializeIfPending(GxTakeBackReason reason = kTakeBackEntry) {
+    if (__builtin_expect(t_gxVtxPending, 0) && !g3dn::g_recOn) GX_HLE_MaterializeVertexStateSlow(reason);
+}
+// Rewrite tracking (gx_fifo.cpp): while the vertex state is pending, the setters below write this thread's stale copy
+// and note which parts they rewrote - descriptors per attribute, formats per format and attribute, the current format
+// - with their Aurora calls logged, instead of taking the state back. A draw whose parts are all rewritten needs no
+// take-back (GxCarryCanDraw). The take-back that does come rebuilds the state the jobs left, replays the logged Aurora
+// calls on it and puts the rewritten parts back: the state sequential execution would have.
+bool GxCarryRewriting();  // pending, not recording: the next vertex-state write is tracked (room made in the log)
+void GxCarryNoteDesc(uint32_t attrMask);
+void GxCarryNoteFmt(uint32_t fmt, uint32_t attrMask);
+void GxCarryNoteCurFmt();
+void GxCarryCountDraw();  // a draw issued here (counted while the state is pending: it needed no take-back)
+void GxCarryLogClear();
+void GxCarryLogDesc(uint32_t attr, uint32_t type);
+void GxCarryLogFmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint32_t frac);
+// All descriptors rewritten, none indexed, and the formats of the enabled attributes in `fmt` rewritten: what a draw
+// with this format reads of the vertex state is this thread's own.
+bool GxCarryCanDraw(uint32_t fmt);
+// Override thunks of the vertex files whose function handles the carry itself (rewrite tracking) or touches no vertex
+// state: the thunk does not take the state back (gx_vertex_state_overrides.h).
+template <auto Fn>
+struct GxThunkSkipsTakeBack {
+    static constexpr bool value = false;
+};
+#define GX_THUNK_SKIPS_TAKEBACK(fn) \
+    template <>                     \
+    struct GxThunkSkipsTakeBack<&fn> { static constexpr bool value = true; }
 
 GXColor DecodeGxColor(uint32_t colorWord);
 void WriteGuestFloat(uint32_t addr, float value, const char* label = nullptr);
@@ -350,11 +488,18 @@ bool IsKnownTlutFormat(uint32_t fmt);
 bool ValidateTlutData(uint32_t objAddr, const TlutObjMeta& meta);
 
 TexObjMeta& GetTexObjMeta(uint32_t addr);
+TexObjMeta& GetTexObjMetaForWrite(uint32_t addr, const TexObjMeta& next);  // queues the interval patch only if needed
+TexObjMeta& GetTexObjMetaForImageWrite(uint32_t addr, uint32_t dataAddr, uint16_t width, uint16_t height,
+                                       uint32_t format, bool mipmap);
+TexObjMeta& GetTexObjMetaForMaxLodWrite(uint32_t addr, float maxLod);
+TexObjMeta& GetTexObjMetaKeepingInterval(uint32_t addr);                    // for writes outside the interval fields
 TexObjMeta ExtractTexObjMetaFromGuest(uint32_t addr);
 bool TryGetOrExtractTexObjMeta(uint32_t addr, TexObjMeta& outMeta);
 TlutObjMeta& GetTlutObjMeta(uint32_t addr);
 GXTexObj* GetHostTexObj(uint32_t addr);
 GXTexObj* TryGetHostTexObj(uint32_t addr);
+// The texobj table's slot for a guest GXTexObj, or nullptr; read only (gx_texture.cpp's repeated-load check).
+const TexObjSlot* FindTexObjSlotForPlan(uint32_t addr);
 GXTexObj* CreateHostTexObj(uint32_t addr);
 void MarkHostTexObjConstructed(uint32_t addr);
 void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size);
@@ -362,13 +507,15 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size);
 // over their destination. This is the allocation-reuse generation boundary
 // for copy textures; it must be called for every data-cache store/flush range.
 void InvalidateEfbCopyDestinationsForRange(uint32_t addr, uint32_t size);
+// Whether that call would look past its page test (a page holding a copy destination in the range).
+bool EfbCopyPagesTouched(uint32_t addr, uint32_t size);
 // Before a data-cache op on a copy destination: downloads still-pending GPU copies there into RAM.
 void DownloadEfbCopiesForRange(uint32_t addr, uint32_t size);
 GXTlutObj* CreateHostTlutObj(uint32_t addr);
 void MarkHostTlutObjConstructed(uint32_t addr);
 GXTlutObj* GetHostTlutObj(uint32_t addr);
 void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size);
-// Call (holding g_tlutObjMutex) when an init changes a TLUT's data range, format or size.
+// Call (holding g_tlutObjGuard) when an init changes a TLUT's data range, format or size.
 void NoteTlutObjRangeChangedLocked();
 // One-stop invalidation for DMA-class host-side writes into guest RAM (DVD
 // reads, DCZeroRange, LC stores): texobjs + TLUTs + EFB copies + display
@@ -393,15 +540,20 @@ static inline int GetCompSizeBytes(GXCompType type) {
 // as GxStream::ReadArrayComp, next to the single fixed-point conversion table
 // its display-list and FIFO counterparts share.
 
-extern HleGxState g_hleGxState;
+MKW_TLS_CONSTINIT extern thread_local HleGxState g_hleGxState;
 // Set once the guest (or a default-injection site) has published an alpha
 // compare to aurora; the only consumer is GxStream::EnsureDefaultGxAlphaCompare.
 extern bool g_alphaCompareValid;
-extern std::array<BoundTexInfo, 8> g_boundTexMaps;
+MKW_TLS_CONSTINIT extern thread_local std::array<BoundTexInfo, 8> g_boundTexMaps;  // per producer thread, as g_hleGxState
 extern TexCopyState g_texCopyState;
 
-extern std::mutex g_texObjMutex;
-extern std::mutex g_tlutObjMutex;
+// The guards of the GX object tables below (texture objects, TLUT objects; guest_thread_guard.h). Everything that reads
+// or writes these tables runs on the guest CPU's host thread: the GX HLE entry points and the DMA-write notifications
+// (DVD, SD and NAND reads, cache ops, locked-cache DMA), all called from guest code. As std::mutexes they were ~700
+// lock/unlock pairs a frame in P+ Training, ~1% of that thread: each waited for the store buffer to drain behind the
+// DMA copy before it.
+extern GuestThreadGuard g_texObjGuard;
+extern GuestThreadGuard g_tlutObjGuard;
 // Guest GXTexObj address -> decoded metadata + host object. std::unordered_map
 // rather than absl::flat_hash_map because the runtime target does not link
 // absl, and because callers (gx_texture.cpp) hold an iterator across an insert

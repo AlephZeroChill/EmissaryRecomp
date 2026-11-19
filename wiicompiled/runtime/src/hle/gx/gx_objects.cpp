@@ -2,6 +2,7 @@
 #include "runtime_log.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 
 // --- Texture and TLUT Objects ---
@@ -54,16 +55,16 @@ struct HleTlutObj {
     }
 };
 
-std::mutex g_texObjMutex;
+GuestThreadGuard g_texObjGuard{"g_texObjGuard"};
 std::map<uint32_t, std::unique_ptr<HleTlutObj>> g_HostTlutObjMap;
-std::mutex g_tlutObjMutex;
+GuestThreadGuard g_tlutObjGuard{"g_tlutObjGuard"};
 
 // The texobj table. One slot per guest GXTexObj address holds both the decoded
 // metadata and the Aurora object, so GXLoadTexObj resolves everything it needs
 // with a single hash lookup instead of six tree descents across two maps.
 std::unordered_map<uint32_t, TexObjSlot> g_TexObjMeta;
 std::map<uint32_t, TlutObjMeta> g_TlutObjMeta;
-std::array<BoundTexInfo, 8> g_boundTexMaps{};
+thread_local std::array<BoundTexInfo, 8> g_boundTexMaps{};
 
 namespace {
 
@@ -112,6 +113,55 @@ struct TlutInterval {
 std::vector<TlutInterval> g_tlutIntervals;
 uint64_t g_tlutIntervalMaxSize = 0;
 bool g_tlutObjBoundsDirty = true;
+
+// The 4 KiB pages under each index's ranges, so a flush that touches none of them skips the binary search and walk
+// (the per-model matrix flushes, a few per model per frame, never touch a texture or a palette). A superset: the
+// texobj index's patches only add pages, its rebuild and the TLUT rebuild recompute them. Guest thread, under the
+// index's guard. A range reaching past the tracked span always walks.
+namespace {
+using GxPageBits = std::array<uint64_t, (GxGuestWrite::kTrackedPageCount + 63) / 64>;
+GxPageBits g_texObjPages{};
+GxPageBits g_tlutPages{};
+
+void MarkGxPages(GxPageBits& bits, uint64_t start, uint64_t size) {
+    if (size == 0 || start >= GxGuestWrite::kTrackedSpan) {
+        return;
+    }
+    const uint64_t end = std::min<uint64_t>(start + size, GxGuestWrite::kTrackedSpan);
+    for (uint64_t page = start >> GxGuestWrite::kTrackedPageShift; page <= (end - 1) >> GxGuestWrite::kTrackedPageShift;
+         ++page) {
+        bits[page >> 6] |= 1ull << (page & 63);
+    }
+}
+
+bool TouchesGxPages(const GxPageBits& bits, uint64_t start, uint64_t end) {  // start < end
+    if (end > GxGuestWrite::kTrackedSpan) {
+        return true;
+    }
+    const uint64_t first = start >> GxGuestWrite::kTrackedPageShift;
+    const uint64_t last = (end - 1) >> GxGuestWrite::kTrackedPageShift;
+    const uint64_t lastWord = last >> 6;
+    uint64_t mask = ~0ull << (first & 63);
+    for (uint64_t w = first >> 6;; ++w, mask = ~0ull) {
+        if (w == lastWord) {
+            mask &= ~0ull >> (63 - (last & 63));
+        }
+        if ((bits[w] & mask) != 0) {
+            return true;
+        }
+        if (w == lastWord) {
+            return false;
+        }
+    }
+}
+
+// BRAWL_GX_DMA_FULL=1: every DMA/data-cache notification walks both indexes and bumps the write counters, as before
+// the page maps (a same-binary A/B switch).
+const bool g_gxDmaFull = [] {
+    const char* v = std::getenv("BRAWL_GX_DMA_FULL");
+    return v != nullptr && v[0] == '1';
+}();
+} // namespace
 
 // Guest GXTexObj is 32 bytes: word0 wrap/filter bits, word1 LOD bits, word2 width/height/format,
 // word3 data address (<<5), word4 user data, word5 texFmt, word6 tlut, byte 0x1F flags. Exact
@@ -212,7 +262,7 @@ bool TryBuildTexObjIntervalEntry(TexObjSlot& slot, TexObjIntervalEntry& outEntry
 
     const uint8_t maxLod = slot.maxLod > 0.0f ? static_cast<uint8_t>(std::min(slot.maxLod, 255.0f)) : 0u;
     const uint32_t texSize =
-        GXGetTexBufferSize(slot.width, slot.height, slot.format, static_cast<GXBool>(slot.mipmap), maxLod);
+        CachedTexBufferSize(slot.width, slot.height, slot.format, static_cast<GXBool>(slot.mipmap), maxLod);
     if (texSize == 0) {
         return false;
     }
@@ -261,6 +311,7 @@ void RebuildTexObjIntervalsLocked() {
     g_texObjIntervals.clear();
     g_texObjIntervals.reserve(g_TexObjMeta.size());
     g_texObjIntervalMaxSize = 0;
+    g_texObjPages.fill(0);
     for (auto& entry : g_TexObjMeta) {
         TexObjSlot& slot = entry.second;
         slot.pendingIntervalUpdate = false;
@@ -268,6 +319,7 @@ void RebuildTexObjIntervalsLocked() {
         if (TryBuildTexObjIntervalEntry(slot, interval)) {
             g_texObjIntervalMaxSize = std::max(g_texObjIntervalMaxSize, interval.size);
             g_texObjIntervals.push_back(interval);
+            MarkGxPages(g_texObjPages, interval.dataAddr, interval.size);
             slot.indexedDataAddr = interval.dataAddr;
             slot.indexedSize = interval.size;
             slot.inIntervalIndex = true;
@@ -315,6 +367,7 @@ bool PatchTexObjIntervalEntryLocked(TexObjSlot& slot) {
             it->slot = &slot;
             slot.indexedSize = fresh.size;
             g_texObjIntervalMaxSize = std::max(g_texObjIntervalMaxSize, fresh.size);
+            MarkGxPages(g_texObjPages, fresh.dataAddr, fresh.size);
             return false;
         }
         // Index and slot disagree; fall through and rebuild this entry.
@@ -352,6 +405,7 @@ bool PatchTexObjIntervalEntryLocked(TexObjSlot& slot) {
     slot.indexedSize = fresh.size;
     slot.inIntervalIndex = true;
     g_texObjIntervalMaxSize = std::max(g_texObjIntervalMaxSize, fresh.size);
+    MarkGxPages(g_texObjPages, fresh.dataAddr, fresh.size);
     return true;
 }
 
@@ -393,6 +447,7 @@ void EnsureTlutObjBoundsLocked() {
     }
     g_tlutIntervals.clear();
     g_tlutIntervalMaxSize = 0;
+    g_tlutPages.fill(0);
     for (auto& [objAddr, meta] : g_TlutObjMeta) {
         (void)objAddr;
         if (meta.dataAddr == 0 || meta.entries == 0 || !IsKnownTlutFormat(meta.format)) {
@@ -402,6 +457,7 @@ void EnsureTlutObjBoundsLocked() {
         const uint64_t size = static_cast<uint64_t>(meta.entries) * 2u;
         g_tlutIntervals.push_back({tlutStart, tlutStart + size, &meta});
         g_tlutIntervalMaxSize = std::max(g_tlutIntervalMaxSize, size);
+        MarkGxPages(g_tlutPages, tlutStart, size);
     }
     std::sort(g_tlutIntervals.begin(), g_tlutIntervals.end(),
               [](const TlutInterval& a, const TlutInterval& b) { return a.start < b.start; });
@@ -533,6 +589,53 @@ TexObjMeta& GetTexObjMeta(uint32_t addr) {
     return slot;
 }
 
+// GetTexObjMeta for a write that leaves the slot's interval fields (what TryBuildTexObjIntervalEntry reads: data
+// address, width, height, format, mip flag, max LOD) as in `next`: the interval patch is queued only when they differ
+// from the slot's. A slot that is not pending matches its index entry (every write that changes those fields queues
+// it first, as here), and a write that keeps them keeps it so; the patch would have found nothing to move. (The
+// patches run in the next data-cache notification.) GXInitTexObj/LOD and the texture plans' writebacks rewrite the
+// same fields every frame: ~40 GXInitTexObj, ~40 GXInitTexObjLOD and ~35 full plans a frame in vanilla Training.
+namespace {
+bool SameFloatBits(float a, float b) {
+    uint32_t x, y;
+    std::memcpy(&x, &a, sizeof x);
+    std::memcpy(&y, &b, sizeof y);
+    return x == y;
+}
+TexObjMeta& WriteTexObjSlot(TexObjSlot& slot, bool intervalKept) {
+    if (!intervalKept) QueueTexObjIntervalUpdate(slot);
+    MarkTexObjSyncedLocked(slot);
+    return slot;
+}
+}  // namespace
+
+TexObjMeta& GetTexObjMetaForWrite(uint32_t addr, const TexObjMeta& next) {
+    TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+    return WriteTexObjSlot(slot, slot.dataAddr == next.dataAddr && slot.width == next.width &&
+                                     slot.height == next.height && slot.format == next.format &&
+                                     slot.mipmap == next.mipmap && SameFloatBits(slot.maxLod, next.maxLod));
+}
+
+// The same for GXInitTexObj(CI), which sets the image fields and keeps the max LOD, and GXInitTexObjLOD, which of the
+// interval fields sets only the max LOD.
+TexObjMeta& GetTexObjMetaForImageWrite(uint32_t addr, uint32_t dataAddr, uint16_t width, uint16_t height,
+                                       uint32_t format, bool mipmap) {
+    TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+    return WriteTexObjSlot(slot, slot.dataAddr == dataAddr && slot.width == width && slot.height == height &&
+                                     slot.format == format && slot.mipmap == mipmap);
+}
+TexObjMeta& GetTexObjMetaForMaxLodWrite(uint32_t addr, float maxLod) {
+    TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+    return WriteTexObjSlot(slot, SameFloatBits(slot.maxLod, maxLod));
+}
+
+// GetTexObjMeta for a write that changes none of the interval fields (wrap, filter, LOD bias, TLUT, user data).
+TexObjMeta& GetTexObjMetaKeepingInterval(uint32_t addr) {
+    TexObjSlot& slot = FindOrCreateTexObjSlot(addr);
+    MarkTexObjSyncedLocked(slot);
+    return slot;
+}
+
 // Same contract as GetTexObjMeta: the caller mutates the returned reference, so
 // the cached TLUT address bounds have to be recomputed before the next flush.
 TlutObjMeta& GetTlutObjMeta(uint32_t addr) {
@@ -599,6 +702,8 @@ void MarkHostTexObjConstructed(uint32_t addr) {
     }
 }
 
+const TexObjSlot* FindTexObjSlotForPlan(uint32_t addr) { return FindTexObjSlot(addr); }
+
 GXTexObj* TryGetHostTexObj(uint32_t addr) {
     TexObjSlot* slot = FindTexObjSlot(addr);
     if (slot != nullptr && slot->host && slot->host->constructed) {
@@ -620,9 +725,12 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
 
     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
     const uint64_t dirtyEnd = dirtyStart + size;
-    std::lock_guard<std::mutex> guard(g_texObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
 
     EnsureTexObjIntervalsLocked();
+    if (!g_gxDmaFull && !TouchesGxPages(g_texObjPages, dirtyStart, dirtyEnd)) {
+        return;  // no entry's range can overlap
+    }
     const auto lower = std::lower_bound(
         g_texObjIntervals.begin(), g_texObjIntervals.end(), static_cast<uint32_t>(dirtyStart),
         [](const TexObjIntervalEntry& entry, uint32_t key) { return entry.dataAddr < key; });
@@ -656,6 +764,34 @@ void MarkTexObjsDirtyForRange(uint32_t addr, uint32_t size) {
 // Defined in gx_dl.cpp.
 extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size);
 
+namespace {
+// Whether every step of GxNotifyGuestRamDmaWrite below returns at its first test for [addr, addr + size): no page of a
+// copy destination (InvalidateEfbCopyDestinationsForRange), no texobj interval patch pending and no texture page
+// (MarkTexObjsDirtyForRange: EnsureTexObjIntervalsLocked then does nothing), the TLUT bounds current and no palette
+// page (MarkTlutObjsDirtyForRange), no tracked page. The guards are taken as those steps take them. size > 0.
+bool DmaWriteCoversNothing(uint32_t addr, uint32_t size) {
+    if (EfbCopyPagesTouched(addr, size)) {
+        return false;
+    }
+    const uint64_t start = CanonicalizeGxMainRamAddress(addr);
+    const uint64_t end = start + size;
+    {
+        std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
+        if (g_texObjIntervalsRebuildAll || !g_texObjIntervalsPending.empty() ||
+            TouchesGxPages(g_texObjPages, start, end)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<GuestThreadGuard> guard(g_tlutObjGuard);
+        if (g_tlutObjBoundsDirty || TouchesGxPages(g_tlutPages, start, end)) {
+            return false;
+        }
+    }
+    return !GxGuestWrite::AnyTracked(addr, size);
+}
+}  // namespace
+
 // Single entry point for DMA-class host writes into guest RAM (DVD reads, DCZeroRange, locked
 // cache stores) that the SDK brackets with DCInvalidateRange rather than a flush, so the normal
 // DC flush/store interceptors never see them. Without this call, GX caches keyed on guest bytes
@@ -664,9 +800,22 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size) {
     if (size == 0) {
         return;
     }
+    // A write that no index or consumer covers (per-model matrix flushes, locked-cache stores: ~140 of ~190 a frame in
+    // vanilla Training) leaves only the dirty marks of the steps below, each of which would return at its first test:
+    // tested once here instead of through four calls.
+    if (!g_gxDmaFull && DmaWriteCoversNothing(addr, size)) {
+        BrawlDirtyMemory::Mark(addr, size);
+        return;
+    }
     MarkTexObjsDirtyForRange(addr, size);
     MarkTlutObjsDirtyForRange(addr, size);
-    GxNotifyDisplayListMemoryWrite(addr, size);
+    if (g_gxDmaFull || GxGuestWrite::AnyTracked(addr, size)) {
+        GxNotifyDisplayListMemoryWrite(addr, size);
+    } else {
+        // No write-generation consumer reads these pages (gx_guest_write.h g_trackedPages): only the rollback's
+        // dirty marks remain of the notification.
+        BrawlDirtyMemory::Mark(addr, size);
+    }
 }
 
 GXTlutObj* CreateHostTlutObj(uint32_t addr) {
@@ -710,8 +859,11 @@ void MarkTlutObjsDirtyForRange(uint32_t addr, uint32_t size) {
 
     const uint64_t dirtyStart = CanonicalizeGxMainRamAddress(addr);
     const uint64_t dirtyEnd = dirtyStart + size;
-    std::lock_guard<std::mutex> guard(g_tlutObjMutex);
+    std::lock_guard<GuestThreadGuard> guard(g_tlutObjGuard);
     EnsureTlutObjBoundsLocked();
+    if (!g_gxDmaFull && !TouchesGxPages(g_tlutPages, dirtyStart, dirtyEnd)) {
+        return;  // no palette's range can overlap
+    }
     const auto lower = std::lower_bound(
         g_tlutIntervals.begin(), g_tlutIntervals.end(), dirtyStart,
         [](const TlutInterval& entry, uint64_t key) { return entry.start < key; });

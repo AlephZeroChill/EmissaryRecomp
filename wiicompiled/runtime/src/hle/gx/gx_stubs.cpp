@@ -1,6 +1,10 @@
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include "gx_internal.h"
 #include "runtime_log.h"
+#include "hz_perf.h"
+#include "g3d_native.h"
 
 extern "C" void __GXSetSUTexRegs();
 
@@ -8,38 +12,36 @@ extern "C" void __GXSetSUTexRegs();
 // FIFO Write Helpers
 // ============================================================================
 
+// g3d_native.h's recorder sees every guest FIFO byte as written (big-endian), whichever helper wrote it.
 extern "C" void GX_HLE_FIFO_WriteFloat(float val) {
     u32 raw; std::memcpy(&raw, &val, 4);
+    const uint8_t be[4] = {uint8_t(raw >> 24), uint8_t(raw >> 16), uint8_t(raw >> 8), uint8_t(raw)};
+    g3dn::HleRec rec(g3dn::kRecFifo, be, 4);
+    if (rec.skip) return;
     try { HleFifoWrite(raw, 4); } catch (...) { RT_LOGF(RT_TAG_GX, "FIFO write float failed\n"); }
 }
 
-extern "C" void GX_HLE_FIFO_Write32(uint32_t val) { HleFifoWrite(val, 4); }
-extern "C" void GX_HLE_FIFO_Write16(uint16_t val) { HleFifoWrite(static_cast<u32>(val), 2); }
-extern "C" void GX_HLE_FIFO_Write8(uint8_t val) { HleFifoWrite(static_cast<u32>(val), 1); }
-
-extern "C" void GX__SetDrawSync_8016ed08(uint32_t token) {
-    (void)token;
-    try { uint32_t gd = Memory::Read32(kGXDataPtrAddr); if (gd) {
-        if (Memory::Read32(gd + 0x5FCu)) GX__SetDirtyState_HLE();
-        Memory::Write16(gd + 2, 0);
-    } } catch (...) {}
+extern "C" void GX_HLE_FIFO_Write32(uint32_t val) {
+    const uint8_t be[4] = {uint8_t(val >> 24), uint8_t(val >> 16), uint8_t(val >> 8), uint8_t(val)};
+    g3dn::HleRec rec(g3dn::kRecFifo, be, 4);
+    if (rec.skip) return;
+    HleFifoWrite(val, 4);
+}
+extern "C" void GX_HLE_FIFO_Write16(uint16_t val) {
+    const uint8_t be[2] = {uint8_t(val >> 8), uint8_t(val)};
+    g3dn::HleRec rec(g3dn::kRecFifo, be, 2);
+    if (rec.skip) return;
+    HleFifoWrite(static_cast<u32>(val), 2);
+}
+extern "C" void GX_HLE_FIFO_Write8(uint8_t val) {
+    g3dn::HleRec rec(g3dn::kRecFifo, &val, 1);
+    if (rec.skip) return;
+    HleFifoWrite(static_cast<u32>(val), 1);
 }
 
-extern "C" void GX__SetDrawSync_8016e9fc(uint32_t token) { GX__SetDrawSync_8016ed08(token); }
-
-// SPM GXSetDrawSync (0x8028cc90). sysWaitDrawSync polls the PE token register through __peReg for up to
-// 100 ms; no PE is emulated and __peReg was 0, so every wait timed out (3.5 s frames when the Blooper's
-// offscreen NPCs draw, ta2_02). Draws are consumed in order here, so the token is reached at once: point
-// __peReg at a RAM block and store the token in its token register (+0xE).
-extern "C" void SPM_GXSetDrawSync(uint32_t token) {
-    constexpr uint32_t kSpmPeRegPtrAddr = 0x805A0878u;  // __peReg (SPM: r13-0x6FB0 in sysWaitDrawSync)
-    constexpr uint32_t kSpmPeRegBlock = 0x80002F00u;    // low-memory debugger area; no exception vectors are installed
-    try {
-        Memory::Write32(kSpmPeRegPtrAddr, kSpmPeRegBlock);
-        Memory::Write16(kSpmPeRegBlock + 0xEu, static_cast<uint16_t>(token));
-    } catch (const ::Memory::AccessViolation&) {}
-}
-PPC_NATIVE_OVERRIDE_VOID(801f08d8, SPM_GXSetDrawSync, (uint32_t token), (token));
+// Brawl's GXSetDrawSync (0x801F08D8) runs translated: its PE_TOKEN_INT/PE_TOKEN BP writes go down the gather pipe like
+// any FIFO bytes, and its GXFlush half calls the HLE __GXSetDirtyState and PPCSync. Brawl's only GXReadDrawSync caller,
+// a GPU watchdog (0x8003D834), ignores the token it reads through its own __peReg (0xCC001000).
 
 extern "C" void OSWakeupThread_HLE(CpuContext* ctx);
 
@@ -67,9 +69,39 @@ extern "C" void GX__FinishInterruptHandler_HLE() {
 }
 PPC_NATIVE_OVERRIDE_VOID(801f0d2c, GX__FinishInterruptHandler_HLE, (), ());
 
+// BRAWL_DRAWDONE_SITES=1: per call site (host return address as an offset into the executable, and the guest LR),
+// how often GXDrawDone runs and how long it blocks, logged every 4800 calls (~10 s in a match). With Aurora's GX
+// thread on, that block is the wait for the GX thread to finish decoding.
+extern "C" char __executable_start __attribute__((weak));  // Horizon's linker script has none: 0 (absolute addresses)
+static void NoteDrawDoneSite(const void* hostReturn, uint32_t guestLr, uint64_t nanos) {
+    static const bool on = std::getenv("BRAWL_DRAWDONE_SITES") != nullptr;
+    if (!on) return;
+    struct Site { const void* host; uint32_t lr; uint64_t calls, nanos; };
+    static Site sites[16];
+    static uint64_t total = 0;
+    for (auto& s : sites) {
+        if (s.host == hostReturn || s.host == nullptr) { s.host = hostReturn; s.lr = guestLr; ++s.calls; s.nanos += nanos; break; }
+    }
+    if (++total % 4800 != 0) return;
+    for (auto& s : sites) {
+        if (s.host == nullptr) continue;
+        RT_LOGF(RT_TAG_GX, "drawdone site +0x%lx lr 0x%08X: %llu calls, mean wait %.3f ms\n",
+                static_cast<unsigned long>(static_cast<const char*>(s.host) - &__executable_start), s.lr,
+                static_cast<unsigned long long>(s.calls), s.calls ? s.nanos / 1e6 / s.calls : 0.0);
+        s.calls = s.nanos = 0;
+    }
+}
+
 extern "C" void GX__DrawDone_HLE() {
+    HZ_PHASE(kHzDrawDoneTicks);
     try { Memory::Write8(kGxDrawDoneFlagAddr, 0); } catch (...) {}
-    GXDrawDone(); GX__FinishInterruptHandler_HLE();
+    const auto start = std::chrono::steady_clock::now();
+    GXDrawDone();
+    const CpuContext* cpu = TryGetCpuContext();
+    NoteDrawDoneSite(__builtin_return_address(0), cpu ? cpu->lr : 0,
+                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start).count()));
+    GX__FinishInterruptHandler_HLE();
 }
 PPC_NATIVE_OVERRIDE_VOID(801f0a30, GX__DrawDone_HLE, (), ());
 
