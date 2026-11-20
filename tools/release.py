@@ -224,9 +224,36 @@ def publish(args, tag, prerelease, commit, files):
     run(*command)
 
 
+def publish_existing(args, tag, prerelease, commit):
+    """Publishes what an earlier run left in the output folder, byte for byte (packaging again would change the
+    archives' timestamps, so they would no longer be the files that were tried), after checking it is that release."""
+    out = args.out
+    manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+    if manifest.get('version') != tag:
+        raise RuntimeError(f'{out / "manifest.json"} is {manifest.get("version")}, not {tag}')
+    built = manifest.get('commit', '')
+    # The release names the commit its files were built from: this checkout or one before it (the tool may have
+    # changed since), never another branch's.
+    if built != commit and subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor', built, commit]).returncode:
+        raise RuntimeError(f'those files were built from {built}, which is not in the history of this checkout')
+    assets = []
+    for platform, entry in manifest['platforms'].items():
+        archive = out / entry['asset']
+        if sha256(archive) != entry['sha256'] or archive.stat().st_size != entry['size']:
+            raise RuntimeError(f'{archive} is not the file manifest.json describes')
+        assets.append(archive)
+    sums = out / 'SHA256SUMS'
+    for line in sums.read_text(encoding='utf-8').splitlines():
+        digest, name = line.split(maxsplit=1)
+        if sha256(out / name) != digest:
+            raise RuntimeError(f'{out / name} does not match SHA256SUMS')
+    log(f'publishing {tag} ({", ".join(manifest["platforms"])}) from {out}')
+    publish(args, tag, prerelease, built, {'assets': [*assets, out / 'manifest.json', sums], 'info': manifest})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--game', type=Path, required=True, help='the extracted disc (DATA: sys/main.dol, files/)')
+    parser.add_argument('--game', type=Path, help='the extracted disc (DATA: sys/main.dol, files/)')
     parser.add_argument('--linux-game', help='the same, as the Linux build sees it (default: --game through /mnt)')
     parser.add_argument('--tag', help='the release tag (default: v<VERSION>[-<prerelease>])')
     parser.add_argument('--prerelease', help='a prerelease of VERSION: rc.1 makes v<VERSION>-rc.1')
@@ -237,6 +264,8 @@ def main():
     parser.add_argument('--allow-dirty', action='store_true', help='build a tree with uncommitted changes (no publish)')
     parser.add_argument('--out', type=Path, help='output folder (default: dist/<tag>)')
     parser.add_argument('--publish', action='store_true', help='create the GitHub release (gh, GH_TOKEN or gh auth)')
+    parser.add_argument('--publish-existing', action='store_true',
+                        help='publish the files already in the output folder (built and tested before), unchanged')
     parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', REPO))
     args = parser.parse_args()
     if args.prerelease and args.tag:
@@ -257,11 +286,16 @@ def main():
     for key in ('repo', 'commit', 'appVersion', 'protocol'):
         if key not in lock:
             raise RuntimeError(f'brawl_online.lock has no {key}')
-    if not (args.game / 'sys/main.dol').is_file():
-        raise RuntimeError(f'{args.game}: no sys/main.dol (the extracted disc: DATA)')
     out = (args.out or ROOT / 'dist' / tag).resolve()
     out.mkdir(parents=True, exist_ok=True)
     args.out = out
+    if args.publish_existing:
+        if dirty:
+            raise RuntimeError('a tree with uncommitted changes is never published')
+        publish_existing(args, tag, prerelease, commit)
+        return
+    if not args.game or not (args.game / 'sys/main.dol').is_file():
+        raise RuntimeError(f'--game {args.game}: no sys/main.dol (the extracted disc: DATA)')
     log(f'{PRODUCT} {tag} from {commit}{" (with uncommitted changes)" if dirty else ""}; Brawl Online '
         f'{lock["appVersion"]} at {lock["commit"]}; {", ".join(platforms)}')
 
