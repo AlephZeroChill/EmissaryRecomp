@@ -2,7 +2,7 @@
 # The Linux program of a release (tools/release.py runs it, in WSL on Windows): builds <commit> of <repo> with Brawl
 # Online's core at its brawl_online.lock, in ~/emissary-release (Linux's own disk: a build on /mnt/<drive> is many
 # times slower), and copies what the download needs to <out>: WiiCompiled (finding its libraries beside it), the
-# libpng it was linked with, dsp_coef.bin, cacert.pem, wii_bootstrap/ and Sys/ (Brawl Online's region sets).
+# libraries the build made itself, if it links any, dsp_coef.bin, cacert.pem, wii_bootstrap/ and Sys/ (Brawl Online's region sets).
 #   tools/release-linux.sh <repo> <extracted disc DATA> <out> <jobs> <tag> <commit>
 # Build on Ubuntu 24.04 (tools/linux-build-deps.sh): the program needs the glibc and libstdc++ it was built with or newer.
 set -euo pipefail

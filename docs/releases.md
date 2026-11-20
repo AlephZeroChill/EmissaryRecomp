@@ -63,7 +63,7 @@ EmissaryRecomp/
   engine_usa_v2.dll      the game for older CPUs (x86-64-v2)                        (Windows)
   SDL3.dll, libc++.dll, libunwind.dll, libpng16.dll, libz.dll                      (Windows; Windows' own UCRT)
   WiiCompiled            Linux: the program (RUNPATH $ORIGIN)                        (Linux)
-  libpng16.so.16         the libraries the build made itself                         (Linux)
+  lib*.so*               any library the build made itself (none today: it needs only libz, glibc, libstdc++) (Linux)
   cacert.pem             TLS roots for the game's own HTTPS (Schannel on Windows)    (Linux)
   dsp_coef.bin           the Wii DSP coefficient ROM
   wii_bootstrap/         the Wii's first-run NAND files

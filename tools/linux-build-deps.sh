@@ -11,7 +11,7 @@ export DEBIAN_FRONTEND=noninteractive
 # A build machine: no fsync after every unpacked file (in a WSL disk image those made the install take over 30 minutes).
 echo force-unsafe-io >/etc/dpkg/dpkg.cfg.d/unsafe-io
 apt-get update -q
-# README.md's list (SDL, Dawn and the runtime), git, and patchelf (the program finds its libpng beside it: $ORIGIN).
+# README.md's list (SDL and the runtime), git, and patchelf (a library the build makes itself is found beside the program: $ORIGIN).
 apt-get install -y -q --no-install-recommends ca-certificates cmake python3 git clang lld ninja-build build-essential \
   pkg-config libicu-dev patchelf \
   libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxfixes-dev libxrender-dev \

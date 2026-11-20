@@ -166,7 +166,7 @@ def stage_linux(stage: Path, native: Path, info: dict) -> Path:
         if not (native / need).exists():
             raise RuntimeError(f'missing {native / need}: the Linux build did not finish')
     for f in sorted(native.iterdir()):
-        if f.is_file():  # WiiCompiled, its bundled libraries (libpng16.so.16), dsp_coef.bin, cacert.pem
+        if f.is_file():  # WiiCompiled, any library it bundles, dsp_coef.bin, cacert.pem
             shutil.copyfile(f, top / f.name)
     copy_tree(native / 'wii_bootstrap', top / 'wii_bootstrap')
     copy_tree(native / 'Sys', top / 'Sys')
