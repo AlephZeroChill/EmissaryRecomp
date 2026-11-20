@@ -17,6 +17,7 @@ the commit and appVersion.
 """
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import re
 import shutil
@@ -31,6 +32,7 @@ PATHS = [
     'core/',
     'dolphin/Source/Core/Common/',
     'dolphin/Source/Core/Core/Brawlback/include/',
+    'dolphin/Source/Core/InputCommon/GCPadStatus.h',
     'dolphin/Source/Core/Core/Rollback/FrameProfile.cpp',
     'dolphin/Source/Core/Core/Rollback/FrameProfile.h',
     'dolphin/Source/Core/Core/Rollback/UdpSocket6.cpp',
@@ -109,7 +111,9 @@ def stamp_app_version(dest: Path, version: str):
 
 def fetch(dest: Path, repo: str, commit: str, app_version: str | None) -> Path:
     stamp = dest / '.brawl-online-commit'
-    want = commit + (f' {app_version}' if app_version else '')
+    # The list of paths is part of what was fetched: a checkout made with an older list is fetched again.
+    paths = hashlib.sha256(' '.join(PATHS + SUBMODULES).encode()).hexdigest()[:12]
+    want = f'{commit} {app_version or "-"} {paths}'
     if stamp.exists() and stamp.read_text().strip() == want:
         return dest
     if dest.exists():
