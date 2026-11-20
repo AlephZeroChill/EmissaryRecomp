@@ -23,6 +23,8 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 
@@ -167,6 +169,36 @@ Pad LocalPad(int chan) {
 
 void ScreenMessage(const char* text, uint32_t, uint32_t) { std::fprintf(stderr, "[brawl-online] %s\n", text); }
 float DrawAspect() { return DisplaySettings::PictureAspect(); }
+
+void StallReport(char* out, size_t size) {
+    // Any thread: the deterministic clock is an atomic, the scheduler's words are guest memory. The
+    // emulated time moves while guest threads wait in the scheduler (which paces it to real time) and
+    // stands still while guest code runs or the game's thread is held in host code; the idle context
+    // current means no guest thread could run. Each report says how far it moved since the last one.
+    static std::atomic<uint64_t> s_lastTicks{0};
+    static std::atomic<int64_t> s_lastNs{0};
+    const auto be32 = [](uint32_t addr) -> uint32_t {
+        const uint8_t* p = GuestPointer(addr, 4);
+        return p ? (uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | uint32_t(p[3])) : 0;
+    };
+    const uint64_t ticks = DetClock::Now();
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+    const uint64_t lastTicks = s_lastTicks.exchange(ticks);
+    const int64_t lastNs = s_lastNs.exchange(ns);
+    constexpr double kTicksPerSecond = 60'750'000.0;
+    char moved[96] = "";
+    if (lastNs != 0 && ns - lastNs < 60'000'000'000LL && ticks >= lastTicks)
+        std::snprintf(moved, sizeof moved, " (%.2f s in the last %.1f s)", double(ticks - lastTicks) / kTicksPerSecond,
+                      double(ns - lastNs) / 1e9);
+    const uint32_t current = be32(0x800000D4u);  // OSCurrentContext
+    const uint32_t running = be32(0x800000E4u);  // the running thread's context
+    const uint32_t queued = be32(0x805A06F8u);   // RunQueueBits
+    std::snprintf(out, size, "recomp: emulated time %.3f s%s, %s, running thread %08x, run queue bits %08x",
+                  double(ticks) / kTicksPerSecond, moved,
+                  current == 0x804DD970u ? "the scheduler idles (no guest thread can run)" : "a guest thread runs",
+                  running, queued);
+}
 void StopGame() {
     std::fputs("[brawl-online] the core stops the game\n", stderr);
     std::exit(0);

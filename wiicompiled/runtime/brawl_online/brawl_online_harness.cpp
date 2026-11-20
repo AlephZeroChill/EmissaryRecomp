@@ -596,6 +596,67 @@ void CoreProfileStart() {
 #endif
 }
 
+// The game's thread (the loop top's), for CoreGameThreadStack from the core's network thread.
+#ifdef _WIN32
+static std::atomic<HANDLE> s_gameThread{nullptr};
+#endif
+
+void CoreNoteGameThread() {
+#ifdef _WIN32
+    if (s_gameThread.load()) return;
+    HANDLE h = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+        s_gameThread.store(h);
+#endif
+}
+
+// The game's thread's native stack now, as module+offset (the executable's resolve with WiiCompiled.map):
+// for the core's loop watch, when the game's thread has not run a session frame for a second. The thread
+// is suspended only while its frames are unwound into a fixed array (nothing allocates meanwhile: it may
+// hold the heap's lock), then named after it runs again.
+void CoreGameThreadStack(char* out, size_t size) {
+    if (size) out[0] = 0;
+#ifdef _WIN32
+    const HANDLE target = s_gameThread.load();
+    if (!target || size == 0) return;
+    std::array<uint64_t, 40> pcs{};
+    size_t n = 0;
+    if (SuspendThread(target) == DWORD(-1)) return;
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(target, &ctx)) {
+        while (n < pcs.size() && ctx.Rip) {
+            pcs[n++] = ctx.Rip;
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+            if (!fn) {  // a leaf: its return address is at the stack pointer
+                ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+                continue;
+            }
+            void* handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+        }
+    }
+    ResumeThread(target);
+    size_t used = std::snprintf(out, size, "game thread stack");
+    for (size_t i = 0; i < n && used + 1 < size; ++i) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(pcs[i]), &mod))
+            GetModuleFileNameA(mod, name, sizeof(name));
+        const char* base = std::strrchr(name, '\\');
+        const int w = std::snprintf(out + used, size - used, "%s %s+0x%llx", i ? " <" : "", base ? base + 1 : name,
+                                    (unsigned long long)(pcs[i] - reinterpret_cast<uintptr_t>(mod)));
+        if (w < 0) break;
+        used += size_t(w);
+    }
+#endif
+}
+
 void CoreHarnessStart() {
     const char* port = std::getenv("BRAWL_ONLINE_HARNESS_PORT");
     if (!port || !*port) return;
