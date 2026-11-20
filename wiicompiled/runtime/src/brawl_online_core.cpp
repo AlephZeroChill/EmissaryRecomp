@@ -276,6 +276,10 @@ void HarnessPads(void* gc_pads) {
     for (int i = 0; i < 4; ++i)
         if (p[i].button & 0x0100) settings_overlay::NotifyStrapInputAccepted();
 }
+void DrawUi(float top) {
+    if (Enabled()) B::CoreUiDraw(top);
+}
+bool UiBlocksInput() { return Enabled() && B::CoreUiBlocksInput(); }
 void PadThreadUpdated(CpuContext* ctx) {
     static bool seen = false;
     if (!seen) { seen = true; std::fprintf(stderr, "[brawl-online] hook reached: pad thread loop 0x8002BA84\n"); }

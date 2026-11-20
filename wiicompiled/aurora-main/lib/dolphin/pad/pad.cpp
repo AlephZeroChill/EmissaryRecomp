@@ -313,6 +313,8 @@ constexpr PADCLampRegion ClampRegion{
 bool g_initialized;
 bool g_keyboardBindingsLoaded = false;
 std::atomic_bool g_blockPAD{false};
+// The keyboard and mouse bindings only (PADBlockKeyboard): controllers still play.
+std::atomic_bool g_blockKeyboard{false};
 bool g_suppressHeldOnRead = false;
 std::array<PADButton, PAD_CHANMAX> g_suppressedButtons{};
 std::array<bool, PAD_CHANMAX> g_suppressLeftTrigger{};
@@ -737,7 +739,8 @@ u32 PADRead(PADStatus* status) {
     }
 
     status[i].err = PAD_ERR_NONE;
-    if (g_keyboardBindings[i].m_mappingsSet && SDL_GetKeyboardFocus() != nullptr) {
+    if (g_keyboardBindings[i].m_mappingsSet && SDL_GetKeyboardFocus() != nullptr &&
+        !g_blockKeyboard.load(std::memory_order_acquire)) {
       std::for_each(g_keyboardBindings[i].m_buttonMapping.begin(), g_keyboardBindings[i].m_buttonMapping.end(),
                     [&kbState, &numKeys, &i, &status](const PADKeyButtonBinding& mapping) {
             if (mapping.scancode > PAD_KEY_INVALID && mapping.scancode < numKeys && kbState[mapping.scancode]) {
@@ -1656,6 +1659,8 @@ void PADRestoreDefaultMapping(const u32 port) {
   __PADSetDefaultMapping(controller);
   controller->m_axisMapping = g_defaultAxes;
 }
+
+void PADBlockKeyboard(const bool block) { g_blockKeyboard.store(block, std::memory_order_release); }
 
 void PADBlockInput(const bool block) {
   if (g_blockPAD.exchange(block, std::memory_order_acq_rel) && !block) {

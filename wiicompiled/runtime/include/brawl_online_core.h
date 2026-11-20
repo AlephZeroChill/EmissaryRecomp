@@ -36,4 +36,11 @@ void PadThreadUpdated(CpuContext* ctx);
 struct HarnessPad;
 void HarnessPads(void* gc_pads);
 
+// Brawl Online's in-game UI (brawlonline.net core/ui: on-screen messages, chat, the replay overlay),
+// drawn in the runtime's ImGui frame (settings_overlay::Draw, once per presented frame, the frame
+// open). `top`: the height the runtime's own bar covers at the top of the window (0: none).
+void DrawUi(float top);
+// The UI has the keyboard (the chat box): the game gets no keyboard or controller input meanwhile.
+bool UiBlocksInput();
+
 }  // namespace BrawlOnlineCore

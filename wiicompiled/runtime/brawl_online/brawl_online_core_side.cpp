@@ -242,6 +242,7 @@ void CoreStart(const char* user_dir, const char* replay_comm) {
     B::CoreWatchCrashes();
     BrawlOnline::SetEngine(&s_engine);
     BrawlOnline::SetHost(&s_host);
+    CoreUiStart();
     BrawlOnline::InitCompat(user_dir);
     Common::Log::LogManager::Init();
     INFO_LOG_FMT(BRAWLBACK, "Brawl Online core in EmissaryRecomp, user folder {}", user_dir);

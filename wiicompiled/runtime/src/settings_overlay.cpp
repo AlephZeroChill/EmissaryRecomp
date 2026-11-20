@@ -33,6 +33,7 @@ extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint
 #include "memory.h"
 #include "generated/RuntimeConfig.h"
 #include "wii_remote_input.h"
+#include "brawl_online_core.h"
 
 #include <imgui.h>
 #include <SDL3/SDL_dialog.h>
@@ -1921,6 +1922,11 @@ void PersistDisplayModeIfChanged() {
 void ApplyInputBlockState() {
     const bool blocked = controller_mapping_wizard::IsActive() || g_rebind.active ||
                          g_exitPromptOpen || g_topBarVisible || StartupScreenVisible() || OnlineMenu::IsOpen();
+#if MKW_BRAWL_ONLINE_CORE
+    // Brawl Online's chat box has the keyboard: the keyboard and mouse bindings rest meanwhile, and
+    // controllers play on (as in Dolphin).
+    PADBlockKeyboard(BrawlOnlineCore::UiBlocksInput());
+#endif
     PADBlockInput(blocked);
     InputBindings::SetInputBlocked(blocked);
 }
@@ -2007,6 +2013,10 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             if (OnlineMenu::IsOpen()) SetTopBarVisible(false);
             ApplyInputBlockState();
         }
+#if MKW_BRAWL_ONLINE_CORE
+        // Keys typed into Brawl Online's chat box are not hotkeys.
+        if (BrawlOnlineCore::UiBlocksInput() && ev->sdl.type == SDL_EVENT_KEY_DOWN) continue;
+#endif
         if (!g_rebind.active && g_muteHotkey != PAD_KEY_INVALID &&
             IsToggleKey(ev->sdl, static_cast<SDL_Scancode>(g_muteHotkey))) {
             g_audioMuted = !g_audioMuted;
@@ -2139,6 +2149,10 @@ void Draw() noexcept {
     DrawExitPrompt();
     controller_mapping_wizard::Draw();
     DrawNotice();
+#if MKW_BRAWL_ONLINE_CORE
+    // Brawl Online's on-screen messages, chat and replay overlay, under the F10 bar when it shows.
+    BrawlOnlineCore::DrawUi(g_topBarVisible ? ImGui::GetFrameHeight() : 0.0f);
+#endif
     ApplyInputBlockState();
     DrawStartupScreen();
     OnlineMenu::Draw();  // above the title card: the launcher can open it at start

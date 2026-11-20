@@ -86,13 +86,23 @@ target_link_libraries(mkw_runtime_common PRIVATE GekkoNet)
 set(BRAWL_ONLINE_ROOT "" CACHE PATH "A brawlonline.net checkout (core/, dolphin/) to build Brawl Online's core from")
 if(BRAWL_ONLINE_ROOT)
     set(BRAWL_ONLINE_GEKKONET_TARGET GekkoNet CACHE STRING "" FORCE)
+    # Its in-game UI too (core/ui: on-screen messages, chat, the replay overlay), drawn with aurora's
+    # ImGui (Dolphin's version) in the runtime's ImGui frame (brawl_online/brawl_online_ui.cpp).
+    set(BRAWL_ONLINE_UI ON CACHE BOOL "" FORCE)
     add_subdirectory("${BRAWL_ONLINE_ROOT}/core/standalone" "${CMAKE_CURRENT_BINARY_DIR}/brawl-online-core" EXCLUDE_FROM_ALL)
     add_library(mkw_brawl_online_core STATIC "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_core_side.cpp"
-        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_harness.cpp")
+        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_harness.cpp"
+        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_ui.cpp")
     target_include_directories(mkw_brawl_online_core PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include")
-    target_link_libraries(mkw_brawl_online_core PUBLIC brawl_online_core_standalone)
+    target_link_libraries(mkw_brawl_online_core PUBLIC brawl_online_core_standalone brawl_online_ui
+        PRIVATE ${AURORA_SDL3_TARGET} aurora::pad)
     target_compile_definitions(mkw_runtime_common PRIVATE MKW_BRAWL_ONLINE_CORE=1)
     set(MKW_BRAWL_ONLINE_SYS "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Rollback")
+    # The UI's fonts (Dolphin's Sys/Resources: the OSD's and the chat's).
+    set(MKW_BRAWL_ONLINE_FONTS
+        "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/OSD_Font.ttf"
+        "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSans-Regular.ttf"
+        "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf")
 endif()
 mkw_configure_object_target(mkw_runtime_common)
 target_compile_features(mkw_runtime_common PRIVATE cxx_std_20)
@@ -232,6 +242,9 @@ function(mkw_configure_product target)
         endif()
         add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${MKW_BRAWL_ONLINE_SYS}" "$<TARGET_FILE_DIR:${target}>/Sys/Rollback")
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/Sys/Resources"
+            COMMAND ${CMAKE_COMMAND} -E copy ${MKW_BRAWL_ONLINE_FONTS} "$<TARGET_FILE_DIR:${target}>/Sys/Resources")
     endif()
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
