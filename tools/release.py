@@ -123,7 +123,7 @@ def stage_common(top: Path, info: dict, newline: str):
     for key, value in (('{VERSION}', info['version']), ('{CORE}', info['brawlOnline'])):
         text = text.replace(key, value)
     (top / 'README.txt').write_text(text, encoding='utf-8', newline=newline)
-    (top / 'release.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8')
+    (top / 'release.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8', newline='\n')
 
 
 def guard(top: Path):
@@ -222,6 +222,10 @@ def publish(args, tag, prerelease, commit, files):
                '--title', f'{PRODUCT} {tag}', '--notes-file', str(notes)]
     command += ['--prerelease', '--latest=false'] if prerelease else ['--latest']
     run(*command)
+
+
+def write_sums(out: Path, files: list[Path]):
+    (out / 'SHA256SUMS').write_text(''.join(f'{sha256(f)}  {f.name}\n' for f in files), encoding='utf-8', newline='\n')
 
 
 def publish_existing(args, tag, prerelease, commit):
@@ -329,9 +333,10 @@ def main():
         manifest_platforms[platform] = {'asset': name, 'size': archive.stat().st_size, 'sha256': sha256(archive),
                                         'program': f'{TOP}/{PLATFORMS[platform]["program"]}'}
     manifest = {**info, 'prerelease': prerelease, 'platforms': manifest_platforms}
-    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    # LF on every system (Python on Windows writes CRLF by default, and `sha256sum -c` reads the CR as part of the name).
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8', newline='\n')
     assets.append(out / 'manifest.json')
-    (out / 'SHA256SUMS').write_text(''.join(f'{sha256(a)}  {a.name}\n' for a in assets), encoding='utf-8')
+    write_sums(out, assets)
     assets.append(out / 'SHA256SUMS')
     for a in assets:
         log(f'{a} ({a.stat().st_size / 1e6:.1f} MB)')
