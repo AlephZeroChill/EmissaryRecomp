@@ -19,8 +19,10 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -109,6 +111,14 @@ def stamp_app_version(dest: Path, version: str):
     user_h.write_text(text, encoding='utf-8', newline='')
 
 
+def remove_tree(path: Path):
+    # git's object files are read-only, which Windows refuses to delete: make them writable first.
+    def writable(function, name, _error):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+    shutil.rmtree(path, onexc=writable)
+
+
 def fetch(dest: Path, repo: str, commit: str, app_version: str | None) -> Path:
     stamp = dest / '.brawl-online-commit'
     # The list of paths is part of what was fetched: a checkout made with an older list is fetched again.
@@ -117,7 +127,7 @@ def fetch(dest: Path, repo: str, commit: str, app_version: str | None) -> Path:
     if stamp.exists() and stamp.read_text().strip() == want:
         return dest
     if dest.exists():
-        shutil.rmtree(dest)
+        remove_tree(dest)
     dest.mkdir(parents=True)
     git('init', '-q', cwd=dest)
     git('remote', 'add', 'origin', repo, cwd=dest)
