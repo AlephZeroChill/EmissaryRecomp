@@ -23,6 +23,9 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <mutex>
 #include <string>
 
@@ -168,8 +171,25 @@ Pad LocalPad(int chan) {
 void ScreenMessage(const char* text, uint32_t, uint32_t) { std::fprintf(stderr, "[brawl-online] %s\n", text); }
 float DrawAspect() { return DisplaySettings::PictureAspect(); }
 void StopGame() {
+    // As Dolphin's Core::Stop: the core's parts are told it stops (the stopping callbacks: replays finished, the
+    // session closed), on a thread of its own so a caller holding one of the core's locks never waits on itself;
+    // then the program ends without running static destructors. exit() from here raced aurora's GX and render
+    // threads, which still ran, through the destructors (heap corruption, 0xc0000374, seen after a session ended).
+    // The core's log flushes every line. If the stop hangs, the program ends after 5 seconds anyway.
+    static std::atomic<bool> stopping{false};
+    if (stopping.exchange(true)) return;
     std::fputs("[brawl-online] the core stops the game\n", stderr);
-    std::exit(0);
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::fputs("[brawl-online] the stop took over 5 s: ending now\n", stderr);
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }).detach();
+    std::thread([] {
+        BrawlOnlineCore::Shutdown();
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }).detach();
 }
 
 }  // namespace BrawlOnlineBridge
