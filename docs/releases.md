@@ -20,7 +20,7 @@ players. This page says what a release is, how one is made (`tools/release.py`, 
 ```json
 {
   "repo": "https://github.com/sarahkittyy/brawlonline.net.git",
-  "commit": "c09f03b80b5df6495b2593cd63c741476b8dded3",
+  "commit": "747a9a574a5e1e6c25338fa62a3c07630dacf2c6",
   "appVersion": "0.2.3",
   "protocol": 1
 }
@@ -88,7 +88,7 @@ the player's own disc is extracted by the launcher, and the game reads it throug
   "protocol": 1,
   "core": {
     "repo": "https://github.com/sarahkittyy/brawlonline.net.git",
-    "commit": "c09f03b80b5df6495b2593cd63c741476b8dded3",
+    "commit": "747a9a574a5e1e6c25338fa62a3c07630dacf2c6",
     "appVersion": "0.2.3"
   },
   "engine": { "name": "emissary", "version": "v0.7.0-rc.1" },
