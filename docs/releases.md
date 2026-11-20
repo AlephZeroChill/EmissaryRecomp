@@ -61,8 +61,7 @@ EmissaryRecomp/
   WiiCompiled.exe        Windows: the loader; it starts engine_usa.dll, or engine_usa_v2.dll on a CPU without AVX2/FMA
   engine_usa.dll         the game (x86-64-v3)                                       (Windows)
   engine_usa_v2.dll      the game for older CPUs (x86-64-v2)                        (Windows)
-  SDL3.dll, webgpu_dawn.dll, dxcompiler.dll, dxil.dll, libc++.dll, libunwind.dll,
-  msvcp140*.dll, vcruntime140*.dll                                                  (Windows)
+  SDL3.dll, libc++.dll, libunwind.dll, libpng16.dll, libz.dll                      (Windows; Windows' own UCRT)
   WiiCompiled            Linux: the program (RUNPATH $ORIGIN)                        (Linux)
   libpng16.so.16         the libraries the build made itself                         (Linux)
   cacert.pem             TLS roots for the game's own HTTPS (Schannel on Windows)    (Linux)

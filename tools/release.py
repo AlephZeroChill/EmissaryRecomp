@@ -32,9 +32,6 @@ PLATFORMS = {
     'windows': {'asset': '{p}-{tag}-Windows.zip', 'program': 'WiiCompiled.exe'},
     'linux': {'asset': '{p}-{tag}-Linux.tar.gz', 'program': 'WiiCompiled'},
 }
-# Windows: the Visual C++ 2015-2022 runtime that Dawn (webgpu_dawn.dll) and dxcompiler.dll load, app-local so a PC
-# without the redistributable starts the game (package-brawl.ps1 does the same).
-VC_RUNTIME = ('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 TAG = re.compile(r'^v(\d+\.\d+\.\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$')
 
 
@@ -148,12 +145,10 @@ def stage_windows(stage: Path, info: dict) -> Path:
         if not need.exists():
             raise RuntimeError(f'missing {need}: build both engines with the core (build-brawl.ps1 -BrawlOnline lock)')
     shutil.copyfile(v3 / 'WiiCompiled.exe', top / 'WiiCompiled.exe')  # the loader
-    for dll in sorted(v3.glob('*.dll')):  # the engine and the libraries beside it (SDL3, Dawn, dxcompiler, libc++...)
+    for dll in sorted(v3.glob('*.dll')):  # the engine and the libraries beside it (SDL3, libc++, libpng...)
         if dll.name.lower() != 'engine_usa_v2.dll':
             shutil.copyfile(dll, top / dll.name)
     shutil.copyfile(v2 / 'engine_usa_v2.dll', top / 'engine_usa_v2.dll')
-    for name in VC_RUNTIME:
-        shutil.copyfile(Path(os.environ['SystemRoot']) / 'System32' / name, top / name)
     shutil.copyfile(v3 / 'dsp_coef.bin', top / 'dsp_coef.bin')
     copy_tree(v3 / 'wii_bootstrap', top / 'wii_bootstrap')
     copy_tree(v3 / 'Sys', top / 'Sys')  # Brawl Online's region sets (Sys/Rollback), read beside the program
