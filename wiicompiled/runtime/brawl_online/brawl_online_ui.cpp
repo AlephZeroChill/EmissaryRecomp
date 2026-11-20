@@ -20,6 +20,7 @@
 #include <dolphin/pad.h>
 
 #include "BrawlOnline/Config/OnlineSettings.h"
+#include "BrawlOnline/Rollback/GameplaySession.h"
 #include "BrawlOnline/UI/Hooks.h"
 #include "BrawlOnline/UI/OnScreenDisplay.h"
 #include "BrawlOnline/UI/OnlineChatUI.h"
@@ -30,6 +31,10 @@
 #include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "input_expr.h"
+
+namespace settings_overlay {
+void NotifyStrapInputAccepted() noexcept;  // runtime/include/settings_overlay.h (the runtime's headers stay out)
+}
 
 namespace B = BrawlOnlineBridge;
 namespace UI = BrawlOnline::UI;
@@ -169,6 +174,9 @@ void CoreUiDraw(float top) {
         Start();
     }
     PollChatKey();
+    // A replay or a watched game (the launcher's playback, BRAWL_ONLINE_REPLAY_COMM): nobody presses
+    // A on the title card, which would cover it the whole time.
+    if (Gprb::Session::GetPlaybackInfo().active) settings_overlay::NotifyStrapInputAccepted();
 
     // Dolphin's ImGui coordinates are the backbuffer's pixels, its scale the screen's DPI scale; the
     // runtime's are the window's points, its framebuffer scale applied when drawn. So: scale 1, and
