@@ -46,9 +46,17 @@ void WriteBE32(u32 addr, u32 v) {
     }
 }
 
+#ifndef MKW_RELEASE_VERSION
+#define MKW_RELEASE_VERSION "dev"  // a build without --release-version (tools/build.py)
+#endif
+
 // ---- The engine ----------------------------------------------------------------------------------
 class RecompEngine final : public BrawlOnline::Engine {
 public:
+    // Who this player runs, in mm's hello and tickets and the game reports (Brawl Online's
+    // `engine` / `engineVersion`; docs/design/brawl-online-core.md §10, "Which engine").
+    BrawlOnline::EngineIdentity Identity() const override { return {"emissary", MKW_RELEASE_VERSION}; }
+
     B::Action action = B::Action::Normal;
     u32 call_target = 0;
 
@@ -256,9 +264,6 @@ void CoreStart(const char* user_dir, const char* replay_comm) {
     CoreUiStart();
     BrawlOnline::InitCompat(user_dir);
     Common::Log::LogManager::Init();
-#ifndef MKW_RELEASE_VERSION
-#define MKW_RELEASE_VERSION "dev"  // a build without --release-version (tools/build.py)
-#endif
     INFO_LOG_FMT(BRAWLBACK, "Brawl Online core in EmissaryRecomp {}, user folder {}", MKW_RELEASE_VERSION, user_dir);
     Gprb::RegisterOnlineBackend();
     Online::Session::SelectConfigured();
