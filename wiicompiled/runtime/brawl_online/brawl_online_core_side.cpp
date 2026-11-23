@@ -178,6 +178,15 @@ public:
         return {{"save_count", double(saves)}, {"load_count", double(loads)}, {"partial_granules", 0}};
     }
     std::vector<std::pair<u32, u64>> PartialGranuleSkips() const override { return {}; }
+#ifdef BRAWL_ONLINE_ENGINE_STALL_REPORT  // the core's loop watch (a core before it has none)
+    std::string StallReport() const override {
+        char text[512];
+        B::StallReport(text, sizeof text);
+        char stack[2048];
+        B::CoreGameThreadStack(stack, sizeof stack);
+        return *stack ? std::string(text) + "; " + stack : std::string(text);
+    }
+#endif
 
 private:
     struct Slot { s64 tag = NO_TAG; int key = 0; };
@@ -265,6 +274,7 @@ void CoreShutdown() {
 
 Action CoreLoopTop(uint32_t* call_target) {
     CoreProfileStart();
+    CoreNoteGameThread();
     auto& system = Core::System::GetInstance();
     s_engine.action = Action::Normal;
     Online::GameAlive::Beat();

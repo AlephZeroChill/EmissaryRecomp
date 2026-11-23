@@ -169,6 +169,62 @@ void RaiseWindowsProcessPriority() {
     }
 }
 
+// The executable holds the whole translated game (about 240 MB of code). Windows reads each part of it
+// from disk the first time it runs, so a frame that runs much game code for the first time waits for the
+// disk: on a hard disk or a busy USB drive with a cold cache, the first frame of an online match took
+// 10 s and the other player's game dropped this one (brawlonline.net, docs/design/brawl-online-core.md
+// §10, 2026-11-19). From start-up, a background thread brings the whole image into memory with large
+// reads (PrefetchVirtualMemory), then reads one byte of every page so what the prefetch skipped comes in
+// too, long before a match starts. On an SSD this takes a fraction of a second.
+void PrefetchExecutableImage() {
+    std::thread([] {
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const auto start = std::chrono::steady_clock::now();
+        auto* const base = reinterpret_cast<uint8_t*>(::GetModuleHandleW(nullptr));
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        const size_t size = nt->OptionalHeader.SizeOfImage;
+        // WIN32_MEMORY_RANGE_ENTRY and PrefetchVirtualMemory (Windows 8), looked up so older SDKs build.
+        struct RangeEntry {
+            void* address;
+            size_t bytes;
+        };
+        using PrefetchFn = BOOL(WINAPI*)(HANDLE, ULONG_PTR, RangeEntry*, ULONG);
+        const auto prefetch = reinterpret_cast<PrefetchFn>(reinterpret_cast<void*>(
+            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory")));
+        RangeEntry range{base, size};
+        const bool prefetched = prefetch != nullptr && prefetch(::GetCurrentProcess(), 1, &range, 0) != FALSE;
+        const auto afterPrefetch = std::chrono::steady_clock::now();
+        // Every readable page, region by region (the image has no guard or no-access pages, but be sure).
+        size_t touched = 0;
+        volatile uint8_t sink = 0;
+        for (uint8_t* p = base; p < base + size;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (::VirtualQuery(p, &info, sizeof(info)) == 0) {
+                break;
+            }
+            uint8_t* const end = std::min(static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize, base + size);
+            const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if (info.State == MEM_COMMIT && (info.Protect & readable) != 0 && (info.Protect & PAGE_GUARD) == 0) {
+                for (uint8_t* page = p; page < end; page += 4096) {
+                    sink = sink + *page;
+                    ++touched;
+                }
+            }
+            p = end;
+        }
+        (void)sink;
+        const auto ms = [](auto from, auto to) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+        };
+        RT_LOG(RT_TAG_RUNTIME) << "executable image: " << (size >> 20) << " MiB, " << touched
+                               << " pages in memory after " << ms(start, std::chrono::steady_clock::now())
+                               << " ms (PrefetchVirtualMemory " << (prefetched ? "" : "not ") << "used, "
+                               << ms(start, afterPrefetch) << " ms)" << std::endl;
+    }).detach();
+}
+
 class WindowsTimerResolutionGuard {
 public:
     WindowsTimerResolutionGuard() {
@@ -1229,6 +1285,9 @@ int RuntimeMain(int argc, char** argv) {
     HZ_TRACE("[horizon] RuntimeMain: transcript");
     InitializeProcessTranscript(argc, argv);
     HZ_TRACE("[horizon] RuntimeMain: transcript done");
+#if defined(_WIN32)
+    PrefetchExecutableImage();
+#endif
     if (std::signal(SIGABRT, AbortSignalHandler) == SIG_ERR) {
         FaultReport::Message message;
         message.Text("[runtime] FATAL installing SIGABRT handler; errno=").Decimal(errno).Fatal();

@@ -52,6 +52,9 @@ void ScreenMessage(const char* text, uint32_t ms, uint32_t argb);
 void StopGame();
 // The width over height the game's picture is shown at (DisplaySettings::PictureAspect; 0 = not known yet).
 float DrawAspect();
+// For the core's loop watch (Engine::StallReport), from its network thread while the game's thread
+// has not run a session frame for a second or more: the guest clock and which guest context runs.
+void StallReport(char* out, size_t size);
 
 // ---- The core, for the runtime (core side) -----------------------------------------------------
 // What the loop does after the core's loop-top hook.
@@ -81,6 +84,9 @@ void CoreWatchExit();
 void CoreWatchCrashes();
 // BRAWL_ONLINE_PROFILE: sample the calling thread (the game loop's).
 void CoreProfileStart();
+// The calling thread is the game loop's; its native stack from any thread (for the loop watch).
+void CoreNoteGameThread();
+void CoreGameThreadStack(char* out, size_t size);
 // The guest CPU of this thread (pc, lr, ctr, GPRs) to stderr: for crash reports.
 void DumpGuestCpu();
 bool CoreHarnessActive();
