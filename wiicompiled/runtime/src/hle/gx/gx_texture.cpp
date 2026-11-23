@@ -802,9 +802,33 @@ TexPlanInputs TakeTexPlanInputs(const TexObjSlot* slot, uint32_t oa) {
 }
 }  // namespace
 
+// The SDK's GXLoadTexObj(PreLoaded) puts the map's BP register ids into the top bytes of the guest object's mode0,
+// mode1, image0 and image3 words (Brawl 0x801F2E4C: rlwimi ..., 24, 0, 7, then stored back), as the words it sends.
+// Code that finds a loaded object by those words sees them: Brawl Online's plugin points the room CSS state models'
+// texture objects (ScnMdl material buffers) at its relabelled copies by matching image3 = 0x94-0x97/0xB4-0xB7 | image
+// (without them the recomp kept Brawl's own "Selecting Character..." and "Selecting Stage..." panels). Done before the
+// plan, so the slot's guest shadow and the plan memo hold the stamped bytes and repeated loads stay on the fast paths;
+// written only where a byte changes. Every other writer of these words keeps their top bytes.
+static void StampTexObjRegisterIds(uint32_t oa, uint32_t tid) {
+    static constexpr uint8_t kMode0[8] = {0x80, 0x81, 0x82, 0x83, 0xA0, 0xA1, 0xA2, 0xA3};
+    static constexpr uint8_t kMode1[8] = {0x84, 0x85, 0x86, 0x87, 0xA4, 0xA5, 0xA6, 0xA7};
+    static constexpr uint8_t kImage0[8] = {0x88, 0x89, 0x8A, 0x8B, 0xA8, 0xA9, 0xAA, 0xAB};
+    static constexpr uint8_t kImage3[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7};
+    if (oa == 0 || tid >= 8) return;
+    try {
+        const struct { uint32_t off; uint8_t id; } words[4] = {
+            {0x00, kMode0[tid]}, {0x04, kMode1[tid]}, {0x08, kImage0[tid]}, {0x0C, kImage3[tid]}};
+        for (const auto& w : words) {
+            if (Memory::Read8(oa + w.off) != w.id) Memory::Write8(oa + w.off, w.id);
+        }
+    } catch (...) {
+    }
+}
+
 // remember: a deferred draw's load (GX_HLE_PlanTexLoadForJob). An inline load (GX__LoadTexObj_HLE) never repeats so:
 // its GXLoadTexObj writes the map's register ids into the host object, so its next plan finds other host bytes.
 static TexLoadPlan PlanTexLoad(uint32_t oa, uint32_t tid, bool remember = false) {
+    StampTexObjRegisterIds(oa, tid);
     if (!remember) return PlanTexLoadFull(oa, tid);
     std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     ++s_texPlanJobs;
