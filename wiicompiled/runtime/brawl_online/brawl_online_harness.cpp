@@ -40,12 +40,15 @@ using Socket = int;
 
 #include <picojson.h>
 
+#include "BrawlOnline/Online/Chat.h"
 #include "BrawlOnline/Online/GameBridge.h"
 #include "BrawlOnline/Online/OnlineClient.h"
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Online/Rooms.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
+#include "BrawlOnline/UI/OnScreenDisplay.h"
+#include "BrawlOnline/UI/OnlineChatUI.h"
 
 namespace B = BrawlOnlineBridge;
 using Object = picojson::object;
@@ -337,6 +340,44 @@ Object Dispatch(const std::string& cmd, const Object& a) {
     }
     if (cmd == "game_bridge_status") return Online::GameBridge::Status();
     if (cmd == "rooms_status") return Online::Rooms::Status();
+    // Chat and the UI (Dolphin's HarnessServer.cpp, the same core and core/ui calls).
+    if (cmd == "chat_status") return Online::Chat::Status();
+    if (cmd == "chat_send" || cmd == "chat_hide" || cmd == "chat_report" || cmd == "chat_leave") {
+        if (const auto error = Online::Chat::HarnessRequest(cmd, a)) throw Error(*error);
+        return Online::Chat::Status();
+    }
+    if (cmd == "osd_messages") {
+        picojson::array texts;
+        for (std::string& t : OSD::GetMessageTexts()) texts.emplace_back(std::move(t));
+        Object r;
+        r["messages"] = picojson::value(texts);
+        return r;
+    }
+    if (cmd == "chat_ui") {
+        // The chat window as the UI drew it: each frame recorded since the last call (a subset of
+        // Dolphin's fields), then `record` (default true) and `activate` (the chat key).
+        picojson::array frames;
+        for (const auto& f : VideoCommon::OnlineChatUI::TakeRecordedFrames()) {
+            Object o;
+            o["frame"] = Num(f.frame);
+            o["display"] = picojson::value(picojson::array{Num(f.display_w), Num(f.display_h)});
+            o["shown"] = picojson::value(f.shown);
+            o["rect"] = picojson::value(picojson::array{Num(f.x), Num(f.y), Num(f.w), Num(f.h)});
+            o["collapsed"] = picojson::value(f.collapsed);
+            o["focused"] = picojson::value(f.focused);
+            o["alpha"] = Num(f.alpha);
+            o["typing"] = picojson::value(f.typing);
+            o["title"] = picojson::value(f.title);
+            o["unread"] = Num(f.unread);
+            o["font_px"] = Num(f.font_px);
+            frames.emplace_back(std::move(o));
+        }
+        VideoCommon::OnlineChatUI::SetRecording(Bool(a, "record", true));
+        if (Bool(a, "activate", false)) VideoCommon::OnlineChatUI::Activate();
+        Object r;
+        r["frames"] = picojson::value(frames);
+        return r;
+    }
     if (cmd == "online_status") return Online::Client::OnlineStatus();
     if (cmd == "mm_status") return Online::Client::MatchmakingStatus();
     if (cmd == "mm_cancel") {

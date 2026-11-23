@@ -28,15 +28,14 @@ static bool g_useSdlRenderer = false;
 // ImGui passes per frame, and every one of them used to rebuild the draw lists from scratch.
 static bool g_frameDataBuilt = false;
 
-// An image handed to ImGui: ImTextureID is a pointer to `binding`, so entries must not move.
+// An image handed to ImGui: ImTextureID is its SDL_GPUTexture (ImGui 1.92.2's SDL_GPU backend,
+// which samples it with its own linear sampler).
 struct GpuTexture {
   gpu::Texture texture;
-  SDL_GPUTextureSamplerBinding binding{};
 };
 
 static std::vector<SDL_Texture*> g_sdlTextures;
 static std::vector<std::unique_ptr<GpuTexture>> g_gpuTextures;
-static gpu::Sampler g_gpuSampler;
 
 static void recreate_device_objects() noexcept {
   ImGui_ImplSDLGPU3_DestroyDeviceObjects();
@@ -105,7 +104,6 @@ void shutdown() noexcept {
   }
   g_sdlTextures.clear();
   g_gpuTextures.clear();
-  g_gpuSampler.reset();
   g_useSdlRenderer = false;
   g_scale = 0.f;
   g_frameDataBuilt = false;
@@ -180,9 +178,6 @@ void new_frame(const AuroraWindowSize& size) noexcept {
       }
       g_scale = size.scale;
     }
-    if (!ImGui::GetIO().Fonts->IsBuilt()) {
-      recreate_device_objects();
-    }
     ImGui_ImplSDLGPU3_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
@@ -211,7 +206,7 @@ void prepare(SDL_GPUCommandBuffer* cmd) noexcept {
   if (g_useSdlRenderer) {
     return;
   }
-  Imgui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), cmd);
+  ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), cmd);
 }
 
 void render(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass) noexcept {
@@ -239,29 +234,15 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
     g_sdlTextures.push_back(texture);
     return reinterpret_cast<ImTextureID>(texture);
   }
-  if (!g_gpuSampler) {
-    const SDL_GPUSamplerCreateInfo samplerInfo{
-        .min_filter = SDL_GPU_FILTER_LINEAR,
-        .mag_filter = SDL_GPU_FILTER_LINEAR,
-        .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
-        .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-        .max_anisotropy = 1.0f,
-        .max_lod = 1000.0f,
-    };
-    g_gpuSampler = gpu::create_sampler(samplerInfo);
-  }
   auto texture = gpu::create_texture_2d(width, height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
                                         SDL_GPU_TEXTUREUSAGE_SAMPLER, "imgui texture");
-  if (!texture || !g_gpuSampler) {
+  if (!texture) {
     return ImTextureID{};
   }
   gpu::write_texture(*texture, 0, 0, width, height, 0, 0, data, 4 * width, height);
   auto entry = std::make_unique<GpuTexture>();
-  entry->binding = {.texture = texture->handle, .sampler = g_gpuSampler->handle};
+  const auto id = static_cast<ImTextureID>(reinterpret_cast<intptr_t>(texture->handle));
   entry->texture = std::move(texture);
-  const auto id = reinterpret_cast<ImTextureID>(&entry->binding);
   g_gpuTextures.push_back(std::move(entry));
   return id;
 }

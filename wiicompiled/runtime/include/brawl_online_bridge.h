@@ -92,4 +92,11 @@ void DumpGuestCpu();
 bool CoreHarnessActive();
 void CoreHarnessPads(Pad* pads);
 
+// Brawl Online's in-game UI (brawl_online_ui.cpp, core/ui), in the runtime's ImGui frame: each
+// presented frame, `top` the height the runtime's bar covers; whether the UI has the keyboard.
+void CoreUiDraw(float top);
+bool CoreUiBlocksInput();
+// At the core's start (CoreStart, core side): the UI's hooks, before the first message.
+void CoreUiStart();
+
 }  // namespace BrawlOnlineBridge

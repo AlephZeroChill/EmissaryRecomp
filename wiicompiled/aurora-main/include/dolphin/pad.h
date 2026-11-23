@@ -245,6 +245,9 @@ s32 PADGetNativeButtonPressed(u32 port);
 PADSignedNativeAxis PADGetNativeAxisPulled(u32 port);
 void PADRestoreDefaultMapping(u32 port);
 void PADBlockInput(bool block);
+// The keyboard and mouse bindings read as released while blocked (a text box has the keyboard);
+// controllers are still read.
+void PADBlockKeyboard(bool block);
 
 /**
  * Set the default controller mapping used.

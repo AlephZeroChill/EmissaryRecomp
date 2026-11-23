@@ -270,8 +270,11 @@ if (AURORA_ENABLE_GX)
   if (NOT TARGET imgui)
     message(STATUS "aurora: Fetching imgui")
     FetchContent_Declare(imgui
-      URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b-docking.tar.gz
-      URL_HASH SHA256=466fdef9b18de15f0bb6e288e3d00ffa3d82200ec458ce5e4f724a161d9528a5
+      # Dolphin's version: Brawl Online draws its in-game UI with the same code in both
+      # (brawlonline.net core/ui), with 1.92's texture protocol (fonts of any size, glyphs made as
+      # they are first drawn).
+      URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz
+      URL_HASH SHA256=da3d453cce74e0fb3d67f8d798a2a8d04fcaf0b33ce0e0131d0695dfc4f64191
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       EXCLUDE_FROM_ALL
     )
@@ -296,7 +299,9 @@ if (AURORA_ENABLE_GX)
 
     if (TARGET Freetype::Freetype)
       target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp)
-      target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
+      # stb_truetype too: a font can ask for it (ImFontConfig::FontLoader), as Brawl Online's UI does
+      # to draw its fonts as Dolphin does.
+      target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE IMGUI_ENABLE_STB_TRUETYPE)
       target_link_libraries(imgui PRIVATE Freetype::Freetype)
     endif ()
   else ()
