@@ -110,6 +110,11 @@ inline std::filesystem::path ManagedNandRootPath() {
             std::ifstream in(owner);
             std::getline(in, ownerKey);
         }
+        // .game written on Windows ends its lines with CR LF (a text-mode stream): on Linux the CR
+        // would make the same game's key differ, and its saves would go to an empty Saves/<key>/NAND.
+        while (!ownerKey.empty() && std::isspace(static_cast<unsigned char>(ownerKey.back()))) {
+            ownerKey.pop_back();
+        }
         if (ownerKey.empty()) {
             std::error_code ec;
             std::filesystem::create_directories(shared, ec);
