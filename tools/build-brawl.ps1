@@ -2,14 +2,20 @@
 # pinned llvm-mingw toolchain, the engine as a DLL started by a small loader exe, and the C++/WinRT headers for the
 # media-session monitor. The result is copied to Play\, which tools\package-brawl.ps1 packages.
 #   powershell -ExecutionPolicy Bypass -File tools\build-brawl.ps1 [-Game <extracted disc>] [-Jobs N] [-OldCpu]
+#       [-BrawlOnline lock|off|<brawlonline.net checkout>] [-ReleaseVersion v0.7.0] [-NoPlay]
 # Extract the disc first (extract.cmake, see README.md); -Game defaults to Disc\DATA, like build.cmake.
+# -BrawlOnline: Brawl Online's online core, linked in-process (default: lock, the commit brawl_online.lock pins; off:
+# the standalone game). -NoPlay leaves Play\ alone (tools\release.py packages straight from the build folder).
 [CmdletBinding()]
 param(
     [string]$Game,
     [int]$Jobs = 0,
     # The engine for processors without AVX2/FMA (x86-64-v2): engine_usa_v2.dll, built in build\release-v2\; the
     # loader picks it on such a CPU.
-    [switch]$OldCpu
+    [switch]$OldCpu,
+    [string]$BrawlOnline = 'lock',
+    [string]$ReleaseVersion = '',
+    [switch]$NoPlay
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
@@ -37,10 +43,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $cppWinRt 'winrt\base.h'))) {
 $env:PATH = "$toolchain\llvm-mingw\bin;$toolchain\CMake\bin;$toolchain\Ninja;$env:PATH"
 
 $release = "-DMKW_ENGINE_MODULE=ON;-DMKW_ENGINE_MODULE_NAME=$module;-DMKW_CPPWINRT_INCLUDE_DIR=$($cppWinRt.Replace('\', '/'))"
-$extra = @(if ($OldCpu) { '-DMKW_HOST_ISA=v2' }) + @(if ($Game) { "-DGAME=$Game" })
+$extra = @(if ($OldCpu) { '-DMKW_HOST_ISA=v2' }) + @(if ($Game) { "-DGAME=$Game" }) +
+    @("-DBRAWL_ONLINE=$BrawlOnline", "-DRELEASE_VERSION=$ReleaseVersion")
 & cmake "-DBUILD_DIR=$build" "-DJOBS=$Jobs" "-DNATIVE_ARGS=$release" @extra -P (Join-Path $root 'build.cmake')
 if ($LASTEXITCODE -ne 0) { throw "build.cmake failed with exit code $LASTEXITCODE." }
 $native = Join-Path $build 'native'
+if ($NoPlay) { Write-Host "Built $native"; exit 0 }
 
 # Only the copy running from Play\ locks the files we overwrite; sweeps run their own copy under autotest\ and must survive.
 $playExe = [IO.Path]::GetFullPath((Join-Path $root 'Play\SuperSmashBrosBrawl.exe'))
@@ -60,5 +68,9 @@ function Copy-ReplacingLocked($from, $to) {
 Get-ChildItem (Join-Path $native '*') -File -Include '*.dll', 'dsp_coef.bin' |
     ForEach-Object { Copy-ReplacingLocked $_.FullName (Join-Path $root "Play\$($_.Name)") }
 Copy-Item -LiteralPath (Join-Path $native 'wii_bootstrap') -Destination (Join-Path $root 'Play') -Recurse -Force
+# Brawl Online's region sets (the core reads Sys\Rollback beside the program); none in a build without the core.
+$sys = Join-Path $root 'Play\Sys'
+if (Test-Path -LiteralPath $sys) { Remove-Item -LiteralPath $sys -Recurse -Force }
+if (Test-Path -LiteralPath (Join-Path $native 'Sys')) { Copy-Item -LiteralPath (Join-Path $native 'Sys') -Destination $sys -Recurse }
 if (-not $OldCpu) { Copy-ReplacingLocked (Join-Path $native 'WiiCompiled.exe') $playExe }
 Write-Host "Copied $native to Play\"

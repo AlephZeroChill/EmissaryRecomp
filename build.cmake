@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.25)
 # Run from any directory, after extract.cmake: cmake -P /path/to/build.cmake
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 set(args --cmake "${CMAKE_COMMAND}")
-foreach(var BUILD_DIR GAME EXTRACT JOBS CODE_VARIANTS)  # build.py's own options: -DJOBS=2 -> --jobs=2
+# build.py's own options: -DJOBS=2 -> --jobs=2. -DBRAWL_ONLINE=lock links Brawl Online's online core at brawl_online.lock
+# (off: the standalone game, the default; or a brawlonline.net checkout), -DRELEASE_VERSION=v0.7.0 names the release.
+foreach(var BUILD_DIR GAME EXTRACT JOBS CODE_VARIANTS BRAWL_ONLINE BRAWL_ONLINE_DIR RELEASE_VERSION)
     if(DEFINED ${var})
         string(TOLOWER "${var}" option)
         string(REPLACE "_" "-" option "${option}")

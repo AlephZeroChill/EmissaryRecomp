@@ -246,7 +246,10 @@ void CoreStart(const char* user_dir, const char* replay_comm) {
     BrawlOnline::SetHost(&s_host);
     BrawlOnline::InitCompat(user_dir);
     Common::Log::LogManager::Init();
-    INFO_LOG_FMT(BRAWLBACK, "Brawl Online core in EmissaryRecomp, user folder {}", user_dir);
+#ifndef MKW_RELEASE_VERSION
+#define MKW_RELEASE_VERSION "dev"  // a build without --release-version (tools/build.py)
+#endif
+    INFO_LOG_FMT(BRAWLBACK, "Brawl Online core in EmissaryRecomp {}, user folder {}", MKW_RELEASE_VERSION, user_dir);
     Gprb::RegisterOnlineBackend();
     Online::Session::SelectConfigured();
     Online::GameBridge::Reset();

@@ -196,6 +196,15 @@ processors without AVX2). The release (`Brawl Recompiled.exe` plus a hidden `eng
 `tools\build-launcher.ps1` (the launcher, Windows and Linux) and `tools\package-brawl.ps1 -Zip`;
 `tools/package-linux.sh` makes the Linux download from a `build.cmake` build on Linux.
 
+### Brawl Online releases
+
+With `-DBRAWL_ONLINE=lock`, `build.cmake` links Brawl Online's online core at the commit `brawl_online.lock` pins
+(`off`, the default, builds the game on its own; a path uses a brawlonline.net checkout), and `tools\build-brawl.ps1`
+builds that way by default (`-BrawlOnline off` for the standalone game). The releases Brawl Online's launcher installs
+(`EmissaryRecomp-<tag>-Windows.zip`, `EmissaryRecomp-<tag>-Linux.tar.gz` and `manifest.json`, versioned by
+`VERSION`) are made by `tools/release.py`, locally or by the Release workflow on a maintainer's tag; their layout,
+the manifest, the Linux build machine and the CI runner are in [`docs/releases.md`](docs/releases.md).
+
 | Folder | What it is |
 |---|---|
 | `wiicompiled/translator` | PowerPC to C++ static recompiler (C#) |
