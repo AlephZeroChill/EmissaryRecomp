@@ -1383,7 +1383,13 @@ int RuntimeMain(int argc, char** argv) {
             NetplayUi::OnSessionStall();
         });
         if (RuntimeConfigFile::DiscordPresenceEnabled()) {
-            DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Super Smash Bros. Brawl");
+            // Discord names the activity after the application of this client ID ("Emissary"); the
+            // logo is that application's art asset "emissary".
+            DiscordPresence::Activity presence;
+            presence.details = "Super Smash Bros. Brawl";
+            presence.largeImageKey = "emissary";
+            presence.largeImageText = "Emissary";
+            DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), std::move(presence));
         }
         SystemBridge::Initialize();
         TranslatedFunctionRegistry::Finalize();
