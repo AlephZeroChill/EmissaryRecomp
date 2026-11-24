@@ -35,6 +35,7 @@ extern "C" void Android_UnlockActivityMutex(void);
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -583,7 +584,20 @@ AuroraWindowSize get_window_size() {
     fb_h = scaledH;
   }
 
-  const float scale = SDL_GetWindowDisplayScale(g_window);
+  float scale = SDL_GetWindowDisplayScale(g_window);
+  // AURORA_TEST_SCALE_FLIP=<n> (tests): every n reads the display scale changes between its own and
+  // half again as much, as when the window moves between monitors of different DPI, so the code a
+  // scale change runs (ImGui's device objects recreated, imgui.cpp new_frame) runs again and again.
+  static const int scaleFlip = [] {
+    const char* v = std::getenv("AURORA_TEST_SCALE_FLIP");
+    return v != nullptr ? std::atoi(v) : 0;
+  }();
+  if (scaleFlip > 0) {
+    static std::atomic<uint64_t> reads{0};
+    if ((reads.fetch_add(1, std::memory_order_relaxed) / static_cast<uint64_t>(scaleFlip)) % 2 == 1) {
+      scale *= 1.5f;
+    }
+  }
   return {
       .width = static_cast<uint32_t>(width),
       .height = static_cast<uint32_t>(height),
