@@ -64,6 +64,13 @@ void ScreenMessage(const char* text, uint32_t ms, uint32_t argb);
 void StopGame();
 // The width over height the game's picture is shown at (DisplaySettings::PictureAspect; 0 = not known yet).
 float DrawAspect();
+// The game's thread stands still at the loop top (a replay paused or buffering: the core's
+// Engine::WhileStandingStill, about 30 times a second): the window's events, the controllers read
+// for LeaveButtonsHeld, and the last frame presented again with the UI drawn over it.
+void StandStill();
+// START or B held on a local controller (a Wii Remote's B or +) as last read (FrameInput::SampleLocal: every
+// retrace, and while the game stands still; within the last 250 ms, else false): any thread.
+bool LeaveButtonsHeld();
 // For the core's loop watch (Engine::StallReport), from its network thread while the game's thread
 // has not run a session frame for a second or more: the guest clock and which guest context runs.
 void StallReport(char* out, size_t size);

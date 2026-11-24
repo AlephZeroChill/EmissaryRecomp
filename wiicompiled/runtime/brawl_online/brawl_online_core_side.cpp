@@ -229,6 +229,11 @@ public:
         return {{"save_count", double(saves)}, {"load_count", double(loads)}, {"partial_granules", 0}};
     }
     std::vector<std::pair<u32, u64>> PartialGranuleSkips() const override { return {}; }
+#ifdef BRAWL_ONLINE_ENGINE_STANDING_STILL  // a playback paused or buffering (a core before it has none)
+    // The runtime presents and handles the window's events on the game's thread: while the core holds
+    // it at the loop top, the last frame and the UI are shown again from here.
+    void WhileStandingStill() override { B::StandStill(); }
+#endif
 #ifdef BRAWL_ONLINE_ENGINE_STALL_REPORT  // the core's loop watch (a core before it has none)
     std::string StallReport() const override {
         char text[512];
@@ -276,6 +281,11 @@ public:
         s.isConnected = p.connected;
         return s;
     }
+    // A room's game watched (RoomWatch, the Rooms thread): the controllers are only read on the game's
+    // thread, which reads them while the watch stands still (B::StandStill).
+#ifdef BRAWL_ONLINE_HOST_LEAVE_BUTTONS_HELD  // a core before it has none
+    bool LeaveButtonsHeld() override { return B::LeaveButtonsHeld(); }
+#endif
     void StopGame() override { B::StopGame(); }
     bool HarnessActive() const override { return BrawlOnlineBridge::CoreHarnessActive(); }
     // The shape the picture is shown at: the game draws for it (GameBridge::PutAspect; 0 = as the game draws).

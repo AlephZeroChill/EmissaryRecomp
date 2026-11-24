@@ -41,6 +41,10 @@ void PadThreadUpdated(CpuContext* ctx);
 // harness's pads instead, while one is on.
 struct HarnessPad;
 void HarnessPads(void* gc_pads);
+// The local controllers as FrameInput::SampleLocal just read them (`frame`: a FrameInput::Frame), every
+// retrace and while the core holds the game still: START or B (a Wii Remote's B or +) held, for the core's
+// Host::LeaveButtonsHeld (a room's game watched) from any thread.
+void NoteLocalPads(const void* frame);
 
 // Brawl Online's in-game UI (brawlonline.net core/ui: on-screen messages, chat, the replay overlay),
 // drawn in the runtime's ImGui frame (settings_overlay::Draw, once per presented frame, the frame

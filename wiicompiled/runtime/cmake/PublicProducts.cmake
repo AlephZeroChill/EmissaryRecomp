@@ -95,7 +95,7 @@ if(BRAWL_ONLINE_ROOT)
         "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_ui.cpp")
     target_include_directories(mkw_brawl_online_core PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include")
     target_link_libraries(mkw_brawl_online_core PUBLIC brawl_online_core_standalone brawl_online_ui
-        PRIVATE ${AURORA_SDL3_TARGET} aurora::pad)
+        PRIVATE ${AURORA_SDL3_TARGET} aurora::pad ZLIB::ZLIB)
     target_compile_definitions(mkw_runtime_common PRIVATE MKW_BRAWL_ONLINE_CORE=1)
     # The release this build is (tools/build.py --release-version, VERSION + tag), which the core logs; empty: "dev".
     set(MKW_RELEASE_VERSION "" CACHE STRING "The EmissaryRecomp release of this build (v0.7.0); empty for a dev build")

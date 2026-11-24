@@ -14,6 +14,8 @@
 #include "guest_code_patch.h"
 #include "memory.h"
 #include "settings_overlay.h"
+#include "aurora_events.h"
+#include "hle_stubs.h"
 
 #include <cstdio>
 #include <exception>
@@ -31,6 +33,8 @@
 #include <string>
 
 void PAD_HLE_SampleLocalPads(FrameInput::GcPad* pads);
+extern std::atomic_bool g_auroraFrameActive;
+extern "C" void aurora_gx_present_last_display_copy();
 
 namespace {
 
@@ -220,6 +224,48 @@ Pad LocalPad(int chan) {
 }
 
 void ScreenMessage(const char* text, uint32_t, uint32_t) { std::fprintf(stderr, "[brawl-online] %s\n", text); }
+
+namespace {
+std::atomic<bool> s_leaveHeld{false};
+std::atomic<int64_t> s_leaveReadNs{0};
+int64_t SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+
+void StandStill() {
+    // As netplay_ui's OnSessionStall: at most about 60 presents a second while nothing moves.
+    static int64_t last = 0;
+    const int64_t now = SteadyNs();
+    if (now - last < 15'000'000) return;
+    last = now;
+    UpdateAuroraAndProcessEvents();
+    // The controllers as the game would read them (the harness's pads while it drives the game, at
+    // rest while an overlay owns input): the game's pad thread stands still with it, so they are read
+    // here (SampleLocal notes START / B for LeaveButtonsHeld, as at every retrace).
+    (void)FrameInput::SampleLocal();
+    if (g_auroraFrameActive.load(std::memory_order_acquire)) {
+        aurora_gx_present_last_display_copy();  // the last picture, not the empty frame buffer
+        settings_overlay::Draw();
+        VI_HLE_PresentFrame(/*presentedXfb=*/false, /*paceToRetrace=*/false);
+    }
+}
+
+void NoteLeaveButtons(const FrameInput::Frame& frame) {
+    bool held = false;
+    for (const FrameInput::Remote& r : frame) {
+        if (r.pad.connected && (r.pad.button & (0x1000u | 0x0200u)) != 0) held = true;  // START, B
+        if (r.connected && (r.sample.hold & (0x0400u | 0x0010u)) != 0) held = true;     // B, PLUS
+    }
+    s_leaveHeld.store(held, std::memory_order_relaxed);
+    s_leaveReadNs.store(SteadyNs(), std::memory_order_release);
+}
+
+bool LeaveButtonsHeld() {
+    const int64_t at = s_leaveReadNs.load(std::memory_order_acquire);
+    return at != 0 && SteadyNs() - at < 250'000'000 && s_leaveHeld.load(std::memory_order_relaxed);
+}
 float DrawAspect() { return DisplaySettings::PictureAspect(); }
 
 void StallReport(char* out, size_t size) {
@@ -416,6 +462,9 @@ void HarnessPads(void* gc_pads) {
     // A on the harness's pads lifts the startup cover, as a player's A does.
     for (int i = 0; i < 4; ++i)
         if (p[i].button & 0x0100) settings_overlay::NotifyStrapInputAccepted();
+}
+void NoteLocalPads(const void* frame) {
+    if (Enabled()) B::NoteLeaveButtons(*static_cast<const FrameInput::Frame*>(frame));
 }
 void DrawUi(float top) {
     if (Enabled()) B::CoreUiDraw(top);
