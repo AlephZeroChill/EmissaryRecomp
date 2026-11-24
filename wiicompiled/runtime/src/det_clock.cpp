@@ -195,6 +195,8 @@ void SetRollbackResimulating(bool active) noexcept {
     g_resimulating = active;
 }
 
+bool RollbackResimulating() noexcept { return g_resimulating; }
+
 void ResetPacing() noexcept {
     // (Brawl Online's ResetThrottleToNow: a rollback burst still pending is dropped too.)
     g_burstPending = false;

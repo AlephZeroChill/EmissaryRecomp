@@ -43,6 +43,32 @@ void Audio_HLE_PollDeferred();
 // Deterministic mode: the virtual tick at which the AI DMA block in flight completes, or
 // DetClock::kNever while audio DMA is stopped.
 uint64_t Audio_HLE_DetNextEventTicks();
+// Brawl Online's rollback (its Engine's SetRollbackAudioWaits / AddRollbackAudioPause / SetRollbackLoadWait, as
+// Dolphin's CoreTiming and SystemTimers' AudioDMACallback do them; docs/design/brawl-online-core.md §10.4). The
+// gameplay-only snapshots leave the sound system out, so a sound plays on through a rollback; with the waits on (a
+// session), the audio clock waits for the re-runs: the session adds each re-run pass's field to a pause, and the AI
+// DMA holds that many ticks of blocks (no output, no DMA callback, so no AX frame, no voice moves, no wake-up of the
+// game's sound thread), so the music and sounds advance only with the frames that are shown, and a sound only the
+// corrected input starts is heard from its start. Without them every re-run's span was cut out of what plays: its
+// blocks went to the output at once, unpaced, and the output queue, full, dropped the frames after. The blocks hold
+// too while the session waits at the loop top for the game's loads. Turning the waits off drops a pause not yet
+// taken. Guest thread.
+void Audio_HLE_SetRollbackWaits(bool wait);
+void Audio_HLE_AddRollbackPause(int64_t ticks);
+void Audio_HLE_SetLoadWait(bool waiting);
+// The output silenced while a playback runs fast (Brawl Online's Engine::SetPlaybackMuted: a spectator's or room
+// watcher's catch-up to live, a seek's fast-forward): the AI blocks still run the DMA callback, their samples are
+// dropped instead of queued (a muted queue would still fill at the playback's speed and play late after).
+void Audio_HLE_SetOutputMuted(bool muted);
+struct AudioHleStats {
+    uint64_t played = 0;          // AI DMA blocks delivered (output + callback)
+    uint64_t playedInReruns = 0;  // ... of them while a rollback's re-run ran
+    uint64_t heldForReruns = 0;   // blocks the re-run pause held
+    uint64_t heldInLoadWaits = 0; // blocks held while the session waited for loads
+    uint64_t muted = 0;           // delivered blocks whose samples were dropped (muted)
+    uint64_t blockTicks = 0;      // one block's ticks (the last block's)
+};
+AudioHleStats Audio_HLE_Stats();
 bool OS_HLE_InterruptsEnabled() noexcept;
 extern "C" void OS_HLE_ProcessAlarmsDeferred(int maxToProcess);
 extern "C" void OS_HLE_BeginDeferredGuestCallbacks();

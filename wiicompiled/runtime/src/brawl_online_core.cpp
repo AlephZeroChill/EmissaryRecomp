@@ -5,6 +5,7 @@
 #include "brawl_online_bridge.h"
 
 #include "abi_bridge.h"
+#include "audio_backend.h"
 #include "brawl_dirty_memory.h"
 #include "brawl_snapshot_store.h"
 #include "brawl_write_watch.h"
@@ -174,7 +175,22 @@ void ResetPacing() { DetClock::ResetPacing(); }
 void SetSpeed(double factor) { DetClock::SetSpeed(factor); }
 void AdvancePacing(int64_t ns) { DetClock::AdvanceSchedule(std::chrono::nanoseconds(ns)); }
 void BeginBurst() { DetClock::BeginRollbackBurst(); }
-void SetLoadWait(bool waiting) { DetClock::SetLoadWait(waiting); }
+void SetLoadWait(bool waiting) {
+    DetClock::SetLoadWait(waiting);
+    Audio_HLE_SetLoadWait(waiting);
+}
+void SetAudioWaits(bool wait) { Audio_HLE_SetRollbackWaits(wait); }
+void AddAudioPause(int64_t ticks) { Audio_HLE_AddRollbackPause(ticks); }
+double SetAudioMuted(bool muted) {
+    static uint64_t s_mutedBefore = 0;
+    const AudioHleStats a = Audio_HLE_Stats();
+    Audio_HLE_SetOutputMuted(muted);
+    if (muted) {
+        s_mutedBefore = a.muted;
+        return 0.0;
+    }
+    return double((a.muted - s_mutedBefore) * a.blockTicks) / 60'750'000.0;
+}
 bool ScheduledHostTime(int64_t* steady_ns) {
     std::chrono::steady_clock::time_point due;
     if (!DetClock::ScheduledRealTime(&due)) return false;
@@ -189,6 +205,8 @@ struct PacingMark {
     std::chrono::steady_clock::time_point real{};
     uint64_t ticks = 0, sleptNs = 0;
     DetClock::PacingStats stats;
+    AudioHleStats audio;
+    AudioBackend::Stats output;
 };
 PacingMark s_pacingMark;
 std::chrono::nanoseconds PacedLead() { return std::chrono::nanoseconds(CorePacedSleepLeadNs()); }
@@ -198,7 +216,8 @@ void SetPresentPacing(bool on, bool lead) {
     DetClock::SetPresentPacing(on, on && lead ? &PacedLead : nullptr);
     if (on && !s_pacingMark.on) {
         DetClock::ResetSpeedRange();
-        s_pacingMark = {true, std::chrono::steady_clock::now(), DetClock::Now(), DetClock::PacingNanoseconds(), DetClock::Stats()};
+        s_pacingMark = {true, std::chrono::steady_clock::now(), DetClock::Now(), DetClock::PacingNanoseconds(), DetClock::Stats(),
+                        Audio_HLE_Stats(), AudioBackend::Instance().GetStats()};
     } else if (!on)
         s_pacingMark.on = false;
 }
@@ -220,6 +239,35 @@ void PacingReport(char* out, size_t size) {
                   double(DetClock::PacingNanoseconds() - m.sleptNs) / 1e9, s.speedMin, s.speedMax,
                   (unsigned long long)(s.advances - m.stats.advances), (unsigned long long)(s.reanchors - m.stats.reanchors),
                   (unsigned long long)(s.bursts - m.stats.bursts), (unsigned long long)(s.leadWakes - m.stats.leadWakes));
+}
+
+void AudioReport(char* out, size_t size) {
+    // Since the match's pacing went on: the AI DMA blocks played against the shown timeline (the timeline less the
+    // re-runs and the load waits: what the audio has to follow), the blocks held for re-runs against the re-runs' own
+    // time, those played while a re-run ran, and what the output queue did (its latency, blocks it dropped as full).
+    const auto& m = s_pacingMark;
+    const AudioHleStats a = Audio_HLE_Stats();
+    const AudioBackend::Stats o = AudioBackend::Instance().GetStats();
+    const double tps = 60'750'000.0;
+    const double block = double(a.blockTicks) / tps;
+    const uint64_t played = a.played - m.audio.played, rerunsHeld = a.heldForReruns - m.audio.heldForReruns,
+                   loadsHeld = a.heldInLoadWaits - m.audio.heldInLoadWaits;
+    const double rerun = double(DetClock::Stats().resimTicks - m.stats.resimTicks) / tps;
+    const double shown = double(DetClock::Now() - m.ticks) / tps - rerun - double(loadsHeld) * block;
+    const uint64_t offered = o.blocks - m.output.blocks;
+    const double perMs = o.bytesPerSecond ? 1000.0 / o.bytesPerSecond : 0.0;
+    std::snprintf(out, size,
+                  "recomp audio: played %llu blocks (%.3f s) for %.3f s shown (%.2f%%), held %llu for re-runs (%.3f s; "
+                  "re-runs %.3f s), %llu in load waits, %llu played during re-runs, %llu muted; output queue avg %.1f ms, "
+                  "max %.1f ms, %llu of %llu blocks dropped (full)",
+                  (unsigned long long)played, double(played) * block, shown,
+                  shown > 0 ? 100.0 * double(played) * block / shown : 0.0, (unsigned long long)rerunsHeld,
+                  double(rerunsHeld) * block, rerun, (unsigned long long)loadsHeld,
+                  (unsigned long long)(a.playedInReruns - m.audio.playedInReruns),
+                  (unsigned long long)(a.muted - m.audio.muted),
+                  offered ? double(o.queuedBytesSum - m.output.queuedBytesSum) / double(offered) * perMs : 0.0,
+                  double(o.queuedBytesMax) * perMs, (unsigned long long)(o.dropped - m.output.dropped),
+                  (unsigned long long)offered);
 }
 
 Pad LocalPad(int chan) {

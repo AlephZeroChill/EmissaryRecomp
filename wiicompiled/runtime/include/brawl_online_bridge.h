@@ -44,6 +44,14 @@ int64_t TakeMaxBehindNs();
 void SetPresentPacing(bool on, bool lead);
 // The pacing's counters since SetPresentPacing(true), one line (logged at the match's end).
 void PacingReport(char* out, size_t size);
+// The audio clock's waits for rollback re-runs and the fast playbacks' mute (the core's Engine::SetRollbackAudioWaits,
+// AddRollbackAudioPause, SetPlaybackMuted; hle_stubs.h Audio_HLE_SetRollbackWaits). SetLoadWait holds the audio too.
+void SetAudioWaits(bool wait);
+void AddAudioPause(int64_t ticks);
+// Muted or not; unmuting returns the seconds of output dropped while it was muted.
+double SetAudioMuted(bool muted);
+// The audio's counters since SetPresentPacing(true), one line (logged with PacingReport's).
+void AudioReport(char* out, size_t size);
 
 // Snapshots of guest RAM in the runtime's delta store (SnapshotStore + WriteWatch), driven by the
 // core's ring: the ranges (sorted by physical address, not overlapping), then saves and restores

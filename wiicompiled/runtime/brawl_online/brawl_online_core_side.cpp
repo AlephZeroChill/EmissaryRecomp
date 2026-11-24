@@ -95,9 +95,19 @@ public:
     }
     // The loop top's wait for the game's loads: unpaced meanwhile (the deterministic clock's load wait).
     void SetRollbackLoadWait(bool waiting) override { B::SetLoadWait(waiting); }
-    // The audio clock's waits for re-runs: the recomp's audio follows the deterministic clock (not done).
-    void SetRollbackAudioWaits(bool) override {}
-    void AddRollbackAudioPause(s64) override {}
+    // The audio clock's waits for re-runs (by the fields the session adds as pauses) and its hold in the load waits,
+    // as Dolphin's AudioDMACallback: the recomp's AI DMA holds its blocks (hle_stubs.h Audio_HLE_SetRollbackWaits).
+    // Without them (PPR_GPRB_RESIM_AUDIO=advance, the core's switch) the audio runs through re-runs and plays them.
+    void SetRollbackAudioWaits(bool wait) override { B::SetAudioWaits(wait); }
+    void AddRollbackAudioPause(s64 ticks) override { B::AddAudioPause(ticks); }
+#ifdef BRAWL_ONLINE_ENGINE_PLAYBACK_MUTE
+    // A playback running fast (a watcher's catch-up, a seek's fast-forward): the output silenced meanwhile.
+    void SetPlaybackMuted(bool muted) override {
+        const double dropped = B::SetAudioMuted(muted);
+        if (muted) INFO_LOG_FMT(BRAWLBACK, "recomp audio: muted (a playback running fast)");
+        else INFO_LOG_FMT(BRAWLBACK, "recomp audio: unmuted, {:.3f} s of sound dropped while muted", dropped);
+    }
+#endif
     // Time sync (docs/design/brawl-online-core.md §10.2): the session's speed for this machine (a little slower when
     // it is ahead of the other, faster when behind) and its catch-up frames, on the deterministic clock's schedule,
     // as Dolphin's CoreTiming throttle takes them.
@@ -122,6 +132,8 @@ public:
         if (!on && present_pacing) {
             char line[512];
             B::PacingReport(line, sizeof line);
+            INFO_LOG_FMT(BRAWLBACK, "{}", line);
+            B::AudioReport(line, sizeof line);
             INFO_LOG_FMT(BRAWLBACK, "{}", line);
         }
         present_pacing = on;

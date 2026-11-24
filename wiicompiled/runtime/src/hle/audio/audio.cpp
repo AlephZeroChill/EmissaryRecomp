@@ -55,6 +55,14 @@ struct AIDmaState {
     bool loggedBackendFailure = false;
     bool loggedMissingCallback = false;
     bool loggedAccessFailure = false;
+    // Brawl Online's rollback (hle_stubs.h, Audio_HLE_SetRollbackWaits): the audio clock waits for re-runs by this
+    // many ticks of blocks still to hold (below 0: a block held past the pause, taken from the next one, so the
+    // blocks held add up to the pauses); the load wait's hold; the fast playback's mute.
+    bool rollbackWaits = false;
+    int64_t rollbackPause = 0;
+    bool loadWait = false;
+    bool outputMuted = false;
+    AudioHleStats stats;
 };
 
 AIDmaState g_ai{};
@@ -126,6 +134,13 @@ void DumpAudioBlock(const uint8_t* src, uint32_t bytes) {
 bool PushAudioBlock(uint32_t startAddr, uint32_t length) {
     if (startAddr == 0 || length == 0) {
         return false;
+    }
+    {
+        std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+        if (g_ai.outputMuted) {
+            ++g_ai.stats.muted;
+            return true;  // dropped (Audio_HLE_SetOutputMuted)
+        }
     }
     const uint32_t bytes = length;
     const uint8_t* src = nullptr;
@@ -627,15 +642,33 @@ void AudioTickDeterministic(CpuContext* ctx)
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
     CpuContextScope scope(cpu);
 
-    for (int blocksCompleted = 0; blocksCompleted < kMaxBlocksPerTick; ++blocksCompleted) {
+    for (int blocksCompleted = 0; blocksCompleted < kMaxBlocksPerTick;) {
         {
             std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
             if (DetClock::Now() < g_ai.detBlockDueTicks) {
                 break;
             }
-            g_ai.detBlockDueTicks += DetBlockTicks(length, sampleRate);
+            const uint64_t blockTicks = DetBlockTicks(length, sampleRate);
+            g_ai.detBlockDueTicks += blockTicks;
             g_ai.bytesLeft = 0;
+            g_ai.stats.blockTicks = blockTicks;
+            // Brawl Online's rollback: the block's time passes without its DMA while the session waits for loads or a
+            // re-run's pause lasts (SystemTimers' AudioDMACallback in Dolphin). Nothing of the guest runs for it.
+            if (g_ai.loadWait && g_ai.rollbackWaits) {
+                ++g_ai.stats.heldInLoadWaits;
+                continue;
+            }
+            if (g_ai.rollbackPause > 0) {
+                g_ai.rollbackPause -= static_cast<int64_t>(blockTicks);
+                ++g_ai.stats.heldForReruns;
+                continue;
+            }
+            ++g_ai.stats.played;
+            if (DetClock::RollbackResimulating()) {
+                ++g_ai.stats.playedInReruns;
+            }
         }
+        ++blocksCompleted;
 
         AxDspHle::JoinMixWorker();
         if (EnsureAudioBackend(sampleRate) && !PushAudioBlock(startAddr, length)) {
@@ -680,6 +713,41 @@ void AudioTickDeterministic(CpuContext* ctx)
 }
 
 } // namespace
+
+void Audio_HLE_SetRollbackWaits(bool wait)
+{
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+    g_ai.rollbackWaits = wait;
+    if (!wait) {
+        g_ai.rollbackPause = 0;
+    }
+}
+
+void Audio_HLE_AddRollbackPause(int64_t ticks)
+{
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+    if (g_ai.rollbackWaits) {
+        g_ai.rollbackPause += ticks;
+    }
+}
+
+void Audio_HLE_SetLoadWait(bool waiting)
+{
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+    g_ai.loadWait = waiting;
+}
+
+void Audio_HLE_SetOutputMuted(bool muted)
+{
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+    g_ai.outputMuted = muted;
+}
+
+AudioHleStats Audio_HLE_Stats()
+{
+    std::lock_guard<GuestThreadGuard> lock(g_ai.guard);
+    return g_ai.stats;
+}
 
 uint64_t Audio_HLE_DetNextEventTicks()
 {

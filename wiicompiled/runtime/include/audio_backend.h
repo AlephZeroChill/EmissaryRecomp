@@ -26,6 +26,17 @@ public:
     void SetMasterVolume(float volume);
     void SetMuted(bool muted);
 
+    // Since the start: blocks offered, those dropped because the output queue was full, and what was queued ahead of
+    // each offered block (the output's latency then), for the session's logs.
+    struct Stats {
+        uint64_t blocks = 0;
+        uint64_t dropped = 0;
+        uint64_t queuedBytesSum = 0;
+        uint32_t queuedBytesMax = 0;
+        uint32_t bytesPerSecond = 0;
+    };
+    Stats GetStats() const;
+
 private:
     AudioBackend() = default;
     ~AudioBackend() = default;
@@ -52,6 +63,7 @@ private:
     float m_masterVolume = 1.0f;
     bool m_muted = false;
     bool m_reportedDroppedBlock = false;
+    Stats m_stats;
     bool m_openFailed = false;  // no output device: the retry thread owns reopening (EnsureInitializedLocked)
     bool m_reportedOpenFailure = false;
     bool m_shutdown = false;    // Shutdown ran since the last Init: a retry that lands now must not install

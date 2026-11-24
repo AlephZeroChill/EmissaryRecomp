@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -19,6 +20,24 @@ namespace {
 bool g_audoutInitialized = false;  // audoutInitialize succeeded (SDL3 has no Horizon audio driver: libnx audout)
 }
 #endif
+
+namespace {
+// WIICOMPILED_AUDIO_DUMP_OUTPUT=<file>: what the output queue took, as raw 16-bit little-endian PCM at the queue's
+// format (32 kHz stereo for the game: left, right), in order: the game's sound as it is played, less the blocks a full
+// queue dropped and any silence the device filled in (WIICOMPILED_AUDIO_DUMP, audio.cpp, is the AI's output before the
+// queue).
+void DumpQueued(const void* data, int bytes) {
+    static FILE* file = [] {
+        const char* path = std::getenv("WIICOMPILED_AUDIO_DUMP_OUTPUT");
+        return path != nullptr && *path != '\0' ? std::fopen(path, "wb") : nullptr;
+    }();
+    if (file == nullptr || bytes <= 0) {
+        return;
+    }
+    std::fwrite(data, 1, static_cast<size_t>(bytes), file);
+    std::fflush(file);
+}
+}  // namespace
 
 AudioBackend& AudioBackend::Instance() {
     // Never destroyed: the retry thread may still be waiting on m_retryWake when static destructors run.
@@ -308,6 +327,13 @@ uint32_t AudioBackend::QueueLimitBytesLocked() const {
     return static_cast<uint32_t>((bytesPerSecond * queueMs) / 1000u);
 }
 
+AudioBackend::Stats AudioBackend::GetStats() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    Stats s = m_stats;
+    s.bytesPerSecond = static_cast<uint32_t>(m_spec.freq) * static_cast<uint32_t>(m_spec.channels) * sizeof(int16_t);
+    return s;
+}
+
 bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
     if (!m_stream) {
         return false;
@@ -316,8 +342,12 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
     if (queued < 0) {
         return true;
     }
+    ++m_stats.blocks;
+    m_stats.queuedBytesSum += static_cast<uint64_t>(queued);
+    m_stats.queuedBytesMax = std::max(m_stats.queuedBytesMax, static_cast<uint32_t>(queued));
     const uint32_t maxQueued = QueueLimitBytesLocked();
     if (static_cast<uint64_t>(queued) + static_cast<uint64_t>(std::max(incomingBytes, 0)) > maxQueued) {
+        ++m_stats.dropped;
         // Match Dolphin's FIFO overflow behavior: preserve the continuous audio
         // already queued and discard the new block.  Clearing SDL's entire
         // stream creates an audible discontinuity (the severe crackle seen when
@@ -372,6 +402,7 @@ bool AudioBackend::PushWiiAiSamplesBE16(const uint8_t* data, size_t bytes) {
         RT_LOG(RT_TAG_AUDIO) << "SDL_PutAudioStreamData failed: " << SDL_GetError() << std::endl;
         return false;
     }
+    DumpQueued(m_convertBuffer.data(), lenBytes);
 
     return true;
 }
@@ -394,6 +425,7 @@ bool AudioBackend::PushSamplesLE16(const int16_t* samples, size_t sampleCount) {
         RT_LOG(RT_TAG_AUDIO) << "SDL_PutAudioStreamData failed: " << SDL_GetError() << std::endl;
         return false;
     }
+    DumpQueued(samples, lenBytes);
 
     return true;
 }

@@ -43,6 +43,7 @@ void PaceTo(uint64_t ticks, bool frameBoundary = false);
 void ResetPacing() noexcept;
 // Replayed frames advance guest time without consuming another wall-clock frame.
 void SetRollbackResimulating(bool active) noexcept;
+bool RollbackResimulating() noexcept;
 uint64_t PacingNanoseconds() noexcept;
 
 // A network session's time sync and frame pacing (Brawl Online's Engine, as Dolphin's CoreTiming throttle does it;
