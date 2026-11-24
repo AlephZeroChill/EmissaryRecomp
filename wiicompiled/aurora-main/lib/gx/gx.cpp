@@ -911,18 +911,45 @@ gfx::ClipRect scale_logical_scissor_rect(const gfx::ClipRect& logicalScissor) no
     return logicalScissor;
   }
 
+  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
   const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
-  const float left = logical_to_target_x(static_cast<float>(logicalScissor.x));
-  const float top = logical_to_target_y(static_cast<float>(logicalScissor.y));
-  const float right = logical_to_target_x(static_cast<float>(logicalScissor.x + logicalScissor.width));
-  const float bottom = logical_to_target_y(static_cast<float>(logicalScissor.y + logicalScissor.height));
-
-  const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
-  const auto mappedTop = std::clamp(static_cast<int32_t>(std::floor(top)), 0, static_cast<int32_t>(targetHeight));
-  const auto mappedRight =
-      std::clamp(static_cast<int32_t>(std::ceil(right)), mappedLeft, static_cast<int32_t>(targetWidth));
-  const auto mappedBottom =
-      std::clamp(static_cast<int32_t>(std::ceil(bottom)), mappedTop, static_cast<int32_t>(targetHeight));
+  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
+    return logicalScissor;
+  }
+  // A scaled pixel is inside the scissor when its centre is, so each edge goes to the nearest target pixel edge:
+  // the rounding of a texture copy's source and clear (GXFrameBuffer.cpp map_texture_copy_source), so a region
+  // the game draws under a scissor and then copies with clear is cleared to its last pixel. Rounding the right
+  // and bottom edges up drew one column (row) past the copy's clear when the scale is not a whole number: Brawl
+  // draws its shadows under a 512x512 scissor at the EFB's corner and clears that square with its copy; at 853
+  // pixels for 640 (a 16:9 window), the shadow pass's depth stayed in column 682 and hid the whole frame there,
+  // a black vertical line at 80% of the picture in every match. An edge left empty by the rounding keeps one pixel.
+  const auto mapEdge = [](int32_t edge, uint32_t logicalSize, uint32_t targetSize) {
+    const int64_t numerator = static_cast<int64_t>(edge) * static_cast<int64_t>(targetSize);
+    const int64_t denominator = static_cast<int64_t>(logicalSize);
+    int64_t quotient = numerator / denominator;
+    int64_t remainder = numerator % denominator;
+    if (remainder < 0) {
+      remainder += denominator;
+      --quotient;
+    }
+    return static_cast<int32_t>(quotient + (remainder >= (denominator + 1) / 2 ? 1 : 0));
+  };
+  const auto mapSpan = [&](int32_t start, int32_t size, uint32_t logicalSize, uint32_t targetSize) {
+    const auto limit = static_cast<int32_t>(targetSize);
+    const int32_t first = std::clamp(mapEdge(start, logicalSize, targetSize), 0, limit);
+    int32_t last = std::clamp(mapEdge(start + size, logicalSize, targetSize), first, limit);
+    if (last == first && size > 0) {
+      if (last < limit) {
+        ++last;
+      } else if (first > 0) {
+        return std::pair{first - 1, last};
+      }
+    }
+    return std::pair{first, last};
+  };
+  const auto [mappedLeft, mappedRight] = mapSpan(logicalScissor.x, logicalScissor.width, logicalFbWidth, targetWidth);
+  const auto [mappedTop, mappedBottom] =
+      mapSpan(logicalScissor.y, logicalScissor.height, logicalFbHeight, targetHeight);
 
   return {
       .x = mappedLeft,

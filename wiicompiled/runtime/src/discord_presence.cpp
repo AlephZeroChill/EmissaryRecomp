@@ -138,11 +138,10 @@ std::string BuildActivityPayload(const Activity& activity) {
 
 class Client {
 public:
-    void Initialize(const std::string& clientId, const std::string& title) {
+    void Initialize(const std::string& clientId, Activity activity) {
         std::lock_guard<std::mutex> lock(mutex_);
         basicClientId_ = IsClientId(clientId) ? clientId : std::string{};
-        basicActivity_ = {};
-        basicActivity_.details = title;
+        basicActivity_ = std::move(activity);
         basicActivity_.startTimestamp = UnixSeconds();
         customClient_ = false;
         activity_ = basicActivity_;
@@ -451,8 +450,8 @@ Client g_client;
 
 } // namespace
 
-void Initialize(const std::string& basicClientId, const std::string& basicTitle) {
-    g_client.Initialize(basicClientId, basicTitle);
+void Initialize(const std::string& basicClientId, Activity basicActivity) {
+    g_client.Initialize(basicClientId, std::move(basicActivity));
 }
 
 void SetClient(const std::string& clientId) {
