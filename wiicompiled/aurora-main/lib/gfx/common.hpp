@@ -341,7 +341,10 @@ void seal_frame(SealedFrame& out) noexcept;
 
 // Encode a sealed frame. Never touches the producer-visible recording state,
 // so this may run concurrently with the producer's FIFO drains.
-void render(SealedFrame& frame, gpu::Encoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true);
+void render(SealedFrame& frame, gpu::Encoder& cmd, int32_t interpolatedFrame = -1, bool finalize = true,
+            bool recycle = true);
+// Recycles a sealed frame's passes after render(frame, cmd, -1, true, false) and the replays that followed it.
+void recycle_sealed_passes(SealedFrame& frame) noexcept;
 
 // Encode the frame that is still being recorded. Only for the synchronous
 // EFB-readback split path, which runs on the producer thread.

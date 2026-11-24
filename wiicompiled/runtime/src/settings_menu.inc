@@ -88,6 +88,15 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
                         LimitResolutionForFrameRate();
                         if (aurora_get_display_mode() == AURORA_DISPLAY_MODE_EXCLUSIVE) aurora_set_display_mode(AURORA_DISPLAY_MODE_EXCLUSIVE);
                     }});
+    static constexpr const char* kInBetween[] = {"INTERPOLATE", "PREDICT"};
+    rows.push_back({"Frame interpolation", kInBetween[g_framePredict ? 1 : 0],
+                    "Interpolate is a frame behind the game. Predict shows each game frame at once and guesses the frames after it.",
+                    [](int) {
+                        g_framePredict = !g_framePredict;
+                        aurora_set_frame_interpolation_mode(g_framePredict ? AURORA_FRAME_INTERPOLATION_PREDICT
+                                                                           : AURORA_FRAME_INTERPOLATION_INTERPOLATE);
+                        RuntimeConfigFile::SetFrameInterpolationMode(g_framePredict ? "predict" : "interpolate");
+                    }});
     rows.push_back({"V-Sync", OnOff(g_vsync.load()), "No screen tearing; the game follows your screen's refresh.", [](int) {
                         const bool on = !g_vsync.load();
                         SetVSync(on);

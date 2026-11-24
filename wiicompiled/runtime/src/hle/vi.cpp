@@ -413,6 +413,8 @@ static std::atomic<bool> s_presentSequenceActive{false};
 static std::atomic<bool> s_presentSuppressed{false};
 } // namespace
 void VI_HLE_SetPresentSuppressed(bool suppressed) { s_presentSuppressed.store(suppressed, std::memory_order_relaxed); }
+static std::atomic<bool> s_rollbackSincePresent{false};
+void VI_HLE_NoteRollback() { s_rollbackSincePresent.store(true, std::memory_order_relaxed); }
 bool VI_HLE_PresentSuppressed() { return s_presentSuppressed.load(std::memory_order_relaxed); }
 static std::atomic<bool> s_keepDisplayCopy{false};
 void VI_HLE_SetKeepDisplayCopy(bool keep) { s_keepDisplayCopy.store(keep, std::memory_order_relaxed); }
@@ -1033,6 +1035,19 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         }
         s_lastPresentAnchorNanos = anchorNanos;
         aurora_set_present_schedule(anchorNanos, intervalNanos);
+    } else if (DetClock::Enabled() && presentedXfb) {
+        // Deterministic mode presents each frame as soon as it is sealed, with no retrace to anchor it, so frame
+        // interpolation times its frames from that moment (Predict shows the frame at once, its inserted frames over
+        // the next game frame). With no schedule at all Aurora sent every slot within a few milliseconds and the
+        // screen kept one in four at 240.
+        s_lastPresentAnchorNanos = 0;
+        if (s_rollbackSincePresent.exchange(false, std::memory_order_relaxed)) {
+            aurora_mark_frame_discontinuous();
+        }
+        aurora_set_seal_present_schedule(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()),
+            16'683'350);  // one NTSC field (59.94 Hz)
     } else {
         // Retrace-context presents (VI black, boot) have no display period of
         // their own to subdivide; present as soon as the frame is ready. The
@@ -1140,6 +1155,48 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
                         fi.targetSamples, fi.matches, fi.matchable, fi.candidates, fi.eligible,
                         (unsigned long long)fi.framesLowMatch, (unsigned long long)fi.framesSealed,
                         (unsigned long long)fi.slotReductions, (unsigned long long)fi.lateSealDrops);
+            }
+            {
+                // Frame latency (a game frame ready -> its own image's present call), Predict's counters, and the cost:
+                // the seal's interpolation work and the slots' encode per game frame, the whole process's CPU time
+                // per presented frame.
+                AuroraFrameInterpolationDiagnostics d{};
+                aurora_get_frame_interpolation_diagnostics(&d);
+                AuroraPresentTiming pt{};
+                aurora_get_present_timing(&pt);
+                static AuroraFrameInterpolationDiagnostics last{};
+                static uint64_t lastCpu100ns = 0, lastPresents = 0;
+                uint64_t cpu100ns = 0;
+#if defined(_WIN32)
+                FILETIME created{}, exited{}, kernel{}, user{};
+                if (::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+                    cpu100ns = ((uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+                               ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+                }
+#endif
+                const uint64_t frames = d.frameLatencyCount - last.frameLatencyCount;
+                const uint64_t encoded = d.encodedFrames - last.encodedFrames;
+                const uint64_t presents = pt.totalPresentCount - lastPresents;
+                const uint64_t draws = (d.predictDraws - last.predictDraws) + (d.predictHeld - last.predictHeld);
+                RT_LOGF(RT_TAG_VI,
+                        "frames: %s at %u fps, frame latency %.2f ms (%llu frames, max since start %.2f), seal %.3f ms + "
+                        "encode %.3f ms per game frame, process CPU %.2f ms per presented frame (%.1f presented/s), "
+                        "predict held %llu of %llu draws, glide %llu draws in %llu frames (largest %.2f), rollback frames "
+                        "%llu, camera jolt frames %llu, dropped for a newer frame %llu\n",
+                        d.mode == AURORA_FRAME_INTERPOLATION_PREDICT ? "predict" : "interpolate", d.targetFps,
+                        frames ? (d.frameLatencyNanos - last.frameLatencyNanos) / 1e6 / double(frames) : 0.0,
+                        (unsigned long long)frames, d.frameLatencyMaxNanos / 1e6, (d.sealNanos - last.sealNanos) / 1e6 / n,
+                        encoded ? (d.encodeNanos - last.encodeNanos) / 1e6 / double(encoded) : 0.0,
+                        presents ? (cpu100ns - lastCpu100ns) / 1e4 / double(presents) : 0.0, presents * 1000.0 / window,
+                        (unsigned long long)(d.predictHeld - last.predictHeld), (unsigned long long)draws,
+                        (unsigned long long)(d.glideDraws - last.glideDraws),
+                        (unsigned long long)(d.glideFrames - last.glideFrames), d.glideLargest,
+                        (unsigned long long)(d.discontinuousFrames - last.discontinuousFrames),
+                        (unsigned long long)(d.joltFrames - last.joltFrames),
+                        (unsigned long long)(d.supersededJobs - last.supersededJobs));
+                last = d;
+                lastCpu100ns = cpu100ns;
+                lastPresents = pt.totalPresentCount;
             }
             times = FrameTimes{};
             times.windowStart = now;

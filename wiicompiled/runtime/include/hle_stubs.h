@@ -25,6 +25,9 @@ void VI_HLE_SetXfbReady(uint32_t xfbAddr); // Called by GXCopyDisp to signal EFB
 // Rollback resimulation (brawl_rollback.cpp): while set, VI_HLE_PresentFrame ends Aurora frames without showing them
 // (aurora_end_frame_unpresented): the guest and Aurora's frame boundaries are unchanged, nothing is presented.
 void VI_HLE_SetPresentSuppressed(bool suppressed);
+// Brawl Online's core finished replaying frames after a rollback: the next presented frame is on another timeline
+// than the frame shown before it (aurora_mark_frame_discontinuous).
+void VI_HLE_NoteRollback();
 bool VI_HLE_PresentSuppressed();
 // Rollback (BRAWL_RESIM_LIGHT_LAST): while set, GXCopyDisp clears the EFB but leaves the display copy holding the image
 // already in it, which the next present shows.

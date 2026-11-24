@@ -7,7 +7,7 @@
 namespace aurora::gx {
 struct UniformRanges {
   gfx::Range current;
-  std::array<gfx::Range, MaxInterpolatedFrames> interpolated;
+  std::array<gfx::Range, MaxStagedSamples> interpolated;
 };
 
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept;

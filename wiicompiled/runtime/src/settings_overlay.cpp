@@ -131,6 +131,7 @@ int g_frameInterpolationMode = [] {
         return 0;
     }
 }();
+bool g_framePredict = RuntimeConfigFile::FrameInterpolationPredict(false);
 int g_displayMode = [] {
     const std::string mode = RuntimeConfigFile::DisplayMode("borderless");
     if (mode == "borderless") {
@@ -1966,6 +1967,8 @@ void InitializeRuntimeSettings() noexcept {
     const uint32_t targetFps = kFrameInterpolationTargetFps[static_cast<size_t>(g_frameInterpolationMode)];
     LimitResolutionForFrameRate();
     LimitResolutionForIntegratedGpu();
+    aurora_set_frame_interpolation_mode(g_framePredict ? AURORA_FRAME_INTERPOLATION_PREDICT
+                                                       : AURORA_FRAME_INTERPOLATION_INTERPOLATE);
     aurora_set_frame_interpolation_fps(targetFps);
     AuroraSetTexturePatches(RuntimeConfigFile::SpinningCoins(true));
     aurora_set_vsync(g_vsync.load());

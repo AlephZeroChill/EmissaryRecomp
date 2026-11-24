@@ -11,6 +11,7 @@
 #include "det_clock.h"
 #include "display_settings.h"
 #include "frame_input.h"
+#include "hle_stubs.h"
 #include "memory.h"
 #include "settings_overlay.h"
 
@@ -158,7 +159,12 @@ void DumpGuestCpu() {
 }
 
 uint64_t TimeBase() { return DetClock::Now(); }
-void SetResimulating(bool active) { DetClock::SetRollbackResimulating(active); }
+void SetResimulating(bool active) {
+    static bool s_active = false;
+    if (s_active && !active) VI_HLE_NoteRollback();
+    s_active = active;
+    DetClock::SetRollbackResimulating(active);
+}
 void ResetPacing() { DetClock::ResetPacing(); }
 
 Pad LocalPad(int chan) {

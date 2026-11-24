@@ -66,6 +66,20 @@ std::atomic<uint64_t> g_producerFrameWorkerWaitNanos{0};
 // deadlines derived from it, so the presenter cannot drift. Zero means present when ready.
 std::atomic<uint64_t> g_presentScheduleBaseNanos{0};
 std::atomic<uint64_t> g_presentScheduleIntervalNanos{0};
+// aurora_set_seal_present_schedule: the base is the frame's ready time, not a retrace boundary.
+std::atomic<bool> g_presentScheduleSealAnchored{false};
+std::atomic<uint64_t> g_interpEncodeNanos{0};
+std::atomic<uint64_t> g_interpEncodedFrames{0};
+std::atomic<uint64_t> g_supersededJobs{0};
+std::atomic<uint64_t> g_frameLatencyNanos{0};
+std::atomic<uint64_t> g_frameLatencyCount{0};
+std::atomic<uint64_t> g_frameLatencyMaxNanos{0};
+// The refresh period of the screen the window is on (window.cpp note_display_refresh), 0 when unknown.
+std::atomic<uint64_t> g_displayPeriodNanos{0};
+
+void note_display_refresh(float hz) noexcept {
+  g_displayPeriodNanos.store(hz > 1.0f ? static_cast<uint64_t>(1e9 / hz) : 0, std::memory_order_release);
+}
 std::atomic<bool> g_metalfxRequested{false};
 std::atomic<bool> g_metalfxSupported{false};
 std::atomic<AuroraMetalFXStatus> g_metalfxStatus{AURORA_METALFX_DISABLED};
@@ -778,6 +792,12 @@ struct PresentationJob {
   bool duplicated = false;
   // Whole display periods the group slid forward at encode time (late group).
   uint32_t slidPeriods = 0;
+  // The sealed frame (gx::sealed_frame_sequence) and this job's place in its group: 0 is the frame itself, k its
+  // k-th inserted frame in Predict (the glide starts from the last one shown).
+  uint64_t sequence = 0;
+  uint32_t slot = 0;
+  // When the frame was ready, on the frame's own image only (frame latency diagnostics).
+  PresentClock::time_point readyAt{};
 };
 
 std::array<std::vector<std::shared_ptr<PresentationImage>>, gx::MaxInterpolatedFrames + 1>
@@ -814,6 +834,8 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
 // means the flip queue is backed up (frames queued while V-Sync was switched on); with the game's
 // clock locked to the display that backlog never drains by itself, so the presenter drops a frame.
 std::atomic<int64_t> g_lastAcquireNanos{0};
+// When the presenter last called present (presenter thread only).
+PresentClock::time_point g_lastPresentCall{};
 
 bool present_presentation_job(const PresentationJob& job) {
   ZoneScoped;
@@ -901,6 +923,7 @@ bool present_presentation_job(const PresentationJob& job) {
               PresentClock::now() - scheduleWaitStarted);
         }
         const auto presentStarted = PresentClock::now();
+        g_lastPresentCall = presentStarted;
         {
           std::lock_guard submitLock(g_queueSubmitMutex);
           encoder.submit();
@@ -908,6 +931,17 @@ bool present_presentation_job(const PresentationJob& job) {
         presentDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
             PresentClock::now() - presentStarted);
         presented = true;
+        gx::note_presented_slot(job.sequence, job.slot);
+        if (job.readyAt != PresentClock::time_point{}) {
+          const uint64_t latency = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(presentStarted - job.readyAt).count());
+          g_frameLatencyNanos.fetch_add(latency, std::memory_order_relaxed);
+          g_frameLatencyCount.fetch_add(1, std::memory_order_relaxed);
+          uint64_t largest = g_frameLatencyMaxNanos.load(std::memory_order_relaxed);
+          while (latency > largest &&
+                 !g_frameLatencyMaxNanos.compare_exchange_weak(largest, latency, std::memory_order_relaxed)) {
+          }
+        }
         record_successful_present(
             job.interpolated, job.logicalFrame, acquireDuration, encodeDuration,
             finishDuration, submitDuration, presentDuration,
@@ -1029,7 +1063,46 @@ void presenter_main() noexcept {
           continue;
         }
       }
+      // An inserted frame presented less than a refresh after the previous present is often never shown: the
+      // compositor keeps the newer one, and when the previous one was the game's own frame, the screen shows the
+      // guess instead of the frame (PresentMon, 240 Hz: 3-3.9 ms after the previous present, 41% never displayed;
+      // 4.25 ms or more, under 2%). So it waits for a refresh (+3%) after the previous present; the game's own
+      // frames never wait.
+      if (job.interpolated && job.presentAt != PresentClock::time_point{} &&
+          g_lastPresentCall != PresentClock::time_point{}) {
+        const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
+        if (period != 0) {
+          const auto earliest = g_lastPresentCall + std::chrono::nanoseconds{period + period * 3 / 100};
+          if (job.presentAt < earliest) {
+            job.presentAt = earliest;
+          }
+        }
+      }
       g_presenter.presenting = true;
+      // A job due later waits here, where a newer frame's job can still overtake it: a newer frame whose first
+      // image is due no later than this one makes it obsolete (an inserted frame of a frame the game has already
+      // passed, which would put the picture back in time and, queued, behind every later frame).
+      if (job.presentAt != PresentClock::time_point{} && job.sequence != 0) {
+        const auto superseded = [&job] {
+          for (const auto& queued : g_presenter.jobs) {
+            if (queued.sequence > job.sequence &&
+                (queued.presentAt == PresentClock::time_point{} || queued.presentAt <= job.presentAt)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        constexpr auto kPrecisionWindow = std::chrono::milliseconds(1);
+        g_presenter.cv.wait_until(lock, job.presentAt - kPrecisionWindow,
+                                  [&] { return g_presenter.stop || superseded(); });
+        if (superseded()) {
+          g_supersededJobs.fetch_add(1, std::memory_order_relaxed);
+          g_presenter.presenting = false;
+          lock.unlock();
+          g_presenter.cv.notify_all();
+          continue;
+        }
+      }
     }
     g_presenter.cv.notify_all();
 
@@ -1093,6 +1166,17 @@ void enqueue_presentations(std::vector<PresentationJob>&& jobs) {
         lastWarning = now;
       }
     }
+  }
+  if (!jobs.empty() && jobs.front().sequence != 0) {
+    const auto firstAt = jobs.front().presentAt == PresentClock::time_point{} ? PresentClock::now()
+                                                                            : jobs.front().presentAt;
+    const uint64_t sequence = jobs.front().sequence;
+    const size_t before = g_presenter.jobs.size();
+    std::erase_if(g_presenter.jobs, [&](const PresentationJob& queued) {
+      return queued.sequence != 0 && queued.sequence < sequence &&
+             queued.presentAt != PresentClock::time_point{} && queued.presentAt >= firstAt;
+    });
+    g_supersededJobs.fetch_add(before - g_presenter.jobs.size(), std::memory_order_relaxed);
   }
   for (auto& job : jobs) {
     g_presenter.jobs.emplace_back(std::move(job));
@@ -1290,6 +1374,11 @@ struct SealedFrameContext {
   bool interpolationActive = false;
   bool replayInterpolatedFrames = false;
   bool present = true;  // false: render and submit only (aurora_end_frame_unpresented)
+  bool sealAnchored = false;  // aurora_set_seal_present_schedule
+  bool predicts = false;      // Predict, with inserted frames to show
+  bool arrivalGlide = false;  // Predict: the first image is the arrival replay (gx::predict_arrival_glide)
+  uint64_t sequence = 0;
+  PresentClock::time_point readyAt{};
   // Milliseconds of each seal stage, for the slow-frame log: async EFB downloads, staging upload and rotation
   // (gfx::end_frame), ImGui draw data, and detaching the recorded passes.
   double sealEfbMs = 0, sealStagingMs = 0, sealImguiMs = 0, sealPassesMs = 0;
@@ -1299,6 +1388,7 @@ struct SealedFrameContext {
 // a FIFO already drained into the recorded pass list.
 void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ZoneScopedN("Seal frame");
+  const auto readyAt = PresentClock::now();
   using SealClock = std::chrono::steady_clock;
   const auto msSince = [](SealClock::time_point t) {
     return std::chrono::duration<double, std::milli>(SealClock::now() - t).count();
@@ -1321,6 +1411,17 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ctx.replayInterpolatedFrames = ctx.interpolationActive && gx::frame_interpolation_replay_safe();
   ctx.scheduleBaseNanos = g_presentScheduleBaseNanos.load(std::memory_order_acquire);
   ctx.scheduleIntervalNanos = g_presentScheduleIntervalNanos.load(std::memory_order_acquire);
+  ctx.sealAnchored = g_presentScheduleSealAnchored.load(std::memory_order_acquire);
+  ctx.sequence = gx::sealed_frame_sequence();
+  ctx.readyAt = readyAt;
+  // Predict without a replayable stream would only repeat the frame: it shows the frame alone.
+  ctx.predicts = ctx.interpolationActive && gx::sealed_frame_predicts();
+  if (ctx.predicts && !ctx.replayInterpolatedFrames) {
+    ctx.predicts = false;
+    ctx.interpolationActive = false;
+    ctx.interpolatedFrameCount = 0;
+  }
+  ctx.arrivalGlide = ctx.predicts && gx::predict_arrival_glide();
   const auto windowSize = window::get_window_size();
   ctx.snapshotWidth = (std::max)(windowSize.native_fb_width, 1u);
   ctx.snapshotHeight = (std::max)(windowSize.native_fb_height, 1u);
@@ -1346,7 +1447,23 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
 
 // Phase 2: encode every presentation slot. Reads only `ctx` and the sealed passes, so it runs
 // without the renderer GPU mutex while the producer records the next frame.
+void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive);
+
+std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx);
+
 std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
+  const auto start = PresentClock::now();
+  auto jobs = encode_sealed_frame_impl(sealedFrame, ctx);
+  if (ctx.interpolationActive) {
+    g_interpEncodeNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      PresentClock::now() - start).count()),
+                                  std::memory_order_relaxed);
+    g_interpEncodedFrames.fetch_add(1, std::memory_order_relaxed);
+  }
+  return jobs;
+}
+
+std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   ZoneScopedN("Encode sealed frame");
   auto encoder = std::move(*ctx.encoder);
   ctx.encoder.reset();
@@ -1354,9 +1471,23 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // interpolation off, pace to the boundary that just passed plus 6.5 ms; late frames free-run.
   constexpr uint64_t kNativePresentOffsetNanos = 6'500'000;
   const uint32_t presentationJobCount = ctx.interpolatedFrameCount + 1;
+  // Seal-anchored (aurora_set_seal_present_schedule): Interpolate's slots start a lead after the frame was ready
+  // (the time to encode them, AURORA_INTERP_LEAD_US, 3 ms by default) and end with the frame itself.
+  static const uint64_t kSealLeadNanos = [] {
+    const char* v = std::getenv("AURORA_INTERP_LEAD_US");
+    return static_cast<uint64_t>(v != nullptr ? std::atoll(v) : 3000) * 1000u;
+  }();
   const auto slotPresentDeadline = [&](uint32_t slot) -> PresentClock::time_point {
     if (ctx.scheduleBaseNanos == 0 || ctx.scheduleIntervalNanos == 0) {
       return {};
+    }
+    if (ctx.sealAnchored) {
+      if (!ctx.interpolationActive) {
+        return {};
+      }
+      return PresentClock::time_point{std::chrono::nanoseconds{
+          ctx.scheduleBaseNanos + kSealLeadNanos +
+          (ctx.scheduleIntervalNanos * static_cast<uint64_t>(slot)) / presentationJobCount}};
     }
     if (!ctx.interpolationActive) {
       return PresentClock::time_point{std::chrono::nanoseconds{
@@ -1387,6 +1518,71 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     return presentationJobs;
   }
 
+  if (ctx.predicts) {
+    // Predict: the frame itself first, published the moment it is encoded, then its inserted frames. The native
+    // render keeps every side effect the game can see (depth peeks, EFB readbacks) on the game's own frame; it
+    // only leaves its passes alive for the replays, which recycle them at the end.
+    const uint32_t n = ctx.interpolatedFrameCount;
+    constexpr uint64_t kFieldNanos = 16'683'350;  // NTSC, 59.94 Hz
+    const uint64_t interval = ctx.scheduleIntervalNanos != 0 ? ctx.scheduleIntervalNanos : kFieldNanos;
+    // When the frame shows, and the origin of its inserted frames' times. Seal-anchored: at once, from when it
+    // was ready. Retrace-paced: as a frame without inserted slots (6.5 ms after the boundary it was made for),
+    // or at once when that has passed. No schedule: at once, from now.
+    PresentClock::time_point frameAt{};
+    PresentClock::time_point origin = PresentClock::now();
+    if (ctx.sealAnchored && ctx.scheduleBaseNanos != 0) {
+      origin = PresentClock::time_point{std::chrono::nanoseconds{ctx.scheduleBaseNanos}};
+    } else if (ctx.scheduleBaseNanos != 0 && ctx.scheduleIntervalNanos != 0) {
+      frameAt = PresentClock::time_point{std::chrono::nanoseconds{
+          ctx.scheduleBaseNanos - ctx.scheduleIntervalNanos + kNativePresentOffsetNanos}};
+      origin = (std::max)(origin, frameAt);
+    }
+    gfx::render(sealedFrame, encoder, -1, true, false);
+    gfx::efb_ram::encode_async_downloads(encoder);
+    if (ctx.arrivalGlide) {
+      // The arrival copy: the frame with each gliding draw still at its glide offset (gx::finalize_frame_interpolation).
+      gfx::render(sealedFrame, encoder, static_cast<int32_t>(n), false, false);
+    }
+    auto frameImage = acquire_presentation_image(n, ctx.snapshotWidth, ctx.snapshotHeight);
+    encode_presentation_snapshot(encoder, ctx.presentSource, *frameImage, true);
+    auto capture = encode_frame_capture(encoder, ctx.presentSource);
+    std::vector<PresentationJob> first;
+    first.push_back({
+        .image = std::move(frameImage),
+        .logicalFrame = ctx.logicalFrame,
+        .presentAt = frameAt,
+        .interpolated = false,
+        .sequence = ctx.sequence,
+        .slot = 0,
+        .readyAt = ctx.readyAt,
+    });
+    submitEncodedSlot(encoder);
+    if (capture.has_value()) {
+      complete_frame_capture(*capture);
+    }
+    publish_presentations(std::move(first), true);
+    for (uint32_t k = 0; k < n; ++k) {
+      encoder = gpu::Encoder{};
+      gfx::render(sealedFrame, encoder, static_cast<int32_t>(k), false, false);
+      auto image = acquire_presentation_image(k, ctx.snapshotWidth, ctx.snapshotHeight);
+      encode_presentation_snapshot(encoder, ctx.presentSource, *image, true);
+      presentationJobs.push_back({
+          .image = std::move(image),
+          .logicalFrame = ctx.logicalFrame,
+          .presentAt = origin + std::chrono::nanoseconds{(interval * (k + 1)) / (n + 1)},
+          .interpolated = true,
+          .sequence = ctx.sequence,
+          .slot = k + 1,
+      });
+      submitEncodedSlot(encoder);
+    }
+    gfx::recycle_sealed_passes(sealedFrame);
+    gfx::after_submit();
+    gfx::g_stats.presentedFrameCount = n + 1;
+    gfx::g_stats.interpolatedFrameCount = n;
+    return presentationJobs;
+  }
+
   if (ctx.replayInterpolatedFrames) {
     for (uint32_t interpolatedFrame = 0; interpolatedFrame < ctx.interpolatedFrameCount;
          ++interpolatedFrame) {
@@ -1399,6 +1595,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           .logicalFrame = ctx.logicalFrame,
           .presentAt = slotPresentDeadline(interpolatedFrame),
           .interpolated = true,
+          .sequence = ctx.sequence,
       });
       submitEncodedSlot(encoder);
       encoder = gpu::Encoder{};
@@ -1423,6 +1620,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           .presentAt = slotPresentDeadline(interpolatedFrame),
           .interpolated = true,
           .duplicated = true,
+          .sequence = ctx.sequence,
       });
       submitEncodedSlot(encoder);
       encoder = gpu::Encoder{};
@@ -1437,13 +1635,15 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
       .logicalFrame = ctx.logicalFrame,
       .presentAt = slotPresentDeadline(ctx.interpolatedFrameCount),
       .interpolated = false,
+      .sequence = ctx.sequence,
+      .readyAt = ctx.readyAt,
   });
   submitEncodedSlot(encoder);
 
   // A group that finished encoding past its anchor slides forward by whole display periods, never
   // per slot. The cursor keeps two groups off one anchor, which bursts then holds for a period.
   static PresentClock::time_point s_lastGroupAnchor{};
-  if (ctx.interpolationActive && ctx.scheduleIntervalNanos != 0 && !presentationJobs.empty() &&
+  if (!ctx.sealAnchored && ctx.interpolationActive && ctx.scheduleIntervalNanos != 0 && !presentationJobs.empty() &&
       presentationJobs.front().presentAt != PresentClock::time_point{}) {
     const std::chrono::nanoseconds interval{static_cast<int64_t>(ctx.scheduleIntervalNanos)};
     auto anchor = presentationJobs.front().presentAt;
@@ -1855,7 +2055,13 @@ extern "C" uint64_t aurora_take_frame_worker_wait_nanos() {
 bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
   return aurora::wait_for_frame_worker_for(std::chrono::microseconds(timeoutMicros));
 }
+void aurora_set_seal_present_schedule(uint64_t readyNanos, uint64_t intervalNanos) {
+  aurora::g_presentScheduleBaseNanos.store(readyNanos, std::memory_order_release);
+  aurora::g_presentScheduleIntervalNanos.store(intervalNanos, std::memory_order_release);
+  aurora::g_presentScheduleSealAnchored.store(true, std::memory_order_release);
+}
 void aurora_set_present_schedule(uint64_t baseNanos, uint64_t intervalNanos) {
+  aurora::g_presentScheduleSealAnchored.store(false, std::memory_order_release);
   aurora::g_presentScheduleBaseNanos.store(baseNanos, std::memory_order_release);
   aurora::g_presentScheduleIntervalNanos.store(intervalNanos, std::memory_order_release);
 }
@@ -1869,6 +2075,12 @@ void aurora_report_producer_paced(bool paced) {
 void aurora_get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnostics* diagnostics) {
   if (diagnostics != nullptr) {
     aurora::gx::get_frame_interpolation_diagnostics(*diagnostics);
+    diagnostics->encodeNanos = aurora::g_interpEncodeNanos.load(std::memory_order_relaxed);
+    diagnostics->encodedFrames = aurora::g_interpEncodedFrames.load(std::memory_order_relaxed);
+    diagnostics->supersededJobs = aurora::g_supersededJobs.load(std::memory_order_relaxed);
+    diagnostics->frameLatencyNanos = aurora::g_frameLatencyNanos.load(std::memory_order_relaxed);
+    diagnostics->frameLatencyCount = aurora::g_frameLatencyCount.load(std::memory_order_relaxed);
+    diagnostics->frameLatencyMaxNanos = aurora::g_frameLatencyMaxNanos.load(std::memory_order_relaxed);
   }
 }
 
@@ -1882,6 +2094,25 @@ bool aurora_get_vsync() { return aurora::gpu::vsync_enabled(); }
 namespace aurora::gx { extern std::atomic<bool> g_pacingExempt; }
 void aurora_set_frame_pacing_exempt(bool exempt) { aurora::gx::g_pacingExempt.store(exempt, std::memory_order_release); }
 
+void aurora_set_frame_interpolation_mode(uint32_t mode) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gx::set_frame_interpolation_mode(mode);
+#else
+  (void)mode;
+#endif
+}
+uint32_t aurora_get_frame_interpolation_mode() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gx::frame_interpolation_mode();
+#else
+  return 0;
+#endif
+}
+void aurora_mark_frame_discontinuous() {
+#ifdef AURORA_ENABLE_GX
+  aurora::gx::mark_frame_discontinuous();
+#endif
+}
 void aurora_set_frame_interpolation_fps(uint32_t targetFps) {
 #ifdef AURORA_ENABLE_GX
   aurora::gx::set_frame_interpolation_fps(targetFps);
