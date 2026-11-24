@@ -1181,6 +1181,7 @@ static bool WriteDisplayListBurst(const uint8_t* data, uint32_t sizeBytes) {
 }
 
 extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) {
+    GX_HLE_SyncGuestProjection();
     if (data == nullptr || sizeBytes == 0) {
         return;
     }
@@ -1206,6 +1207,7 @@ extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) 
 // load from the same array starts a new run). Recorded as the same FIFO bytes. Outside the parser's direct
 // conditions (see ApplyFifoPacketsDirect), or at any other command, it is GX_HLE_FIFO_WriteBurst.
 extern "C" void GX_HLE_FIFO_WritePackets_G3D(const uint8_t* data, uint32_t sizeBytes) {
+    GX_HLE_SyncGuestProjection();
     if (data == nullptr || sizeBytes == 0) {
         return;
     }

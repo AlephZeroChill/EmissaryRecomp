@@ -1360,6 +1360,7 @@ extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
 #endif
 
 extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes) {
+    GX_HLE_SyncGuestProjection();
     if (nbytes == 0 || listAddr == 0) return;
     // Recorded as the FIFO command GXFastCallDisplayList writes, so both ways of calling a list compare equal.
     const uint8_t g3dRecCall[9] = {0x40, uint8_t(listAddr >> 24), uint8_t(listAddr >> 16), uint8_t(listAddr >> 8),
@@ -1727,6 +1728,7 @@ extern "C" void GX__ClearShapeDisplayLists_G3D() {
 }
 
 extern "C" void GX__CallShapeDisplayList_G3D(uint32_t listAddr, uint32_t nbytes) {
+    GX_HLE_SyncGuestProjection();
     if (nbytes == 0 || listAddr == 0) return;
     const uint8_t g3dRecCall[9] = {0x40, uint8_t(listAddr >> 24), uint8_t(listAddr >> 16), uint8_t(listAddr >> 8),
                                    uint8_t(listAddr), uint8_t(nbytes >> 24), uint8_t(nbytes >> 16),

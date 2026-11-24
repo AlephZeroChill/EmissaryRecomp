@@ -112,6 +112,9 @@ extern int32_t g_scissorHeight;
 
 extern float g_viewportState[6];
 extern float g_projectionVector[7];
+// The GX state's projection to Aurora when code changed it there since GXSetProjection (gx_transform.cpp): before
+// every draw, as the SDK sends it with the next primitive.
+extern "C" void GX_HLE_SyncGuestProjection();
 }
 
 // Decoded guest GXTexObj metadata. The sampler half is
