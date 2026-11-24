@@ -21,6 +21,7 @@
 #include "BrawlOnline/Host.h"
 #include "BrawlOnline/Online/GameAlive.h"
 #include "BrawlOnline/Online/GameBridge.h"
+#include "BrawlOnline/Online/OnlineClient.h"
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
@@ -276,6 +277,11 @@ void CoreShutdown() {
     if (!s_started) return;
     BrawlOnline::NotifyStopping();
     Gprb::Replay::Playback::Shutdown();
+    // The recomp's window is both Dolphin's game and its app: closing it stops the game (above,
+    // Core::Stop's Stopping) and quits, as ~MainWindow does: Rooms' connection closed and
+    // game-status.json removed (the launcher's "is the game open"), Ranked's leave and reports
+    // still to send given their 2 s.
+    Online::Client::Shutdown();
 }
 
 Action CoreLoopTop(uint32_t* call_target) {

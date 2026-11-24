@@ -3,6 +3,7 @@
 #include "settings_overlay.h"
 #include "runtime_config.h"
 #include "display_settings.h"
+#include "brawl_online_core.h"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
@@ -10,7 +11,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -51,7 +54,31 @@ inline void Flush(bool force = false) {
 // process directly and do not run the crash/atexit paths.
 namespace SdCard { void Shutdown(); }  // hle/storage/sd_card.h
 
+// Brawl Online's core, if on, stops first as Dolphin's does when its window closes (Core::Stop,
+// then the app's Online::Client::Shutdown): a Ranked set left at once ("the game is closing"), the
+// replay finished, Rooms' connection closed, game-status.json removed. On a thread of its own (this
+// may be a guest fiber); the window closes anyway after 4 s.
+inline void StopBrawlOnlineForWindowClose() noexcept {
+    if (!BrawlOnlineCore::Enabled()) {
+        return;
+    }
+    static std::atomic<bool> done{false};
+    std::fputs("[brawl-online] the window closes: the core stops first\n", stderr);
+    std::thread([] {
+        BrawlOnlineCore::Shutdown();
+        done = true;
+    }).detach();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (!done && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!done) {
+        std::fputs("[brawl-online] the core's stop took over 4 s: closing anyway\n", stderr);
+    }
+}
+
 [[noreturn]] inline void ExitForAuroraWindowClose() noexcept {
+    StopBrawlOnlineForWindowClose();
     settings_overlay::ReleaseControllers();
     WindowPlacementPersistence::Flush(true);
     // What the game saved on the SD card (a mod's settings, replays) goes back into UserData/SD: the atexit handler
