@@ -47,6 +47,7 @@ using Socket = int;
 #include "BrawlOnline/Online/Rooms.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
+#include "BrawlOnline/UI/InputDisplayUI.h"
 #include "BrawlOnline/UI/OnScreenDisplay.h"
 #include "BrawlOnline/UI/OnlineChatUI.h"
 
@@ -352,6 +353,13 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         Object r;
         r["messages"] = picojson::value(texts);
         return r;
+    }
+    if (cmd == "input_display") {
+        // The input display as its last frame drew it (core/ui InputDisplayUI, as Dolphin's).
+        picojson::value v;
+        const std::string err = picojson::parse(v, BrawlOnline::UI::InputDisplay::Status());
+        if (!err.empty() || !v.is<Object>()) throw Error("input display status: " + err);
+        return v.get<Object>();
     }
     if (cmd == "chat_ui") {
         // The chat window as the UI drew it: each frame recorded since the last call (a subset of

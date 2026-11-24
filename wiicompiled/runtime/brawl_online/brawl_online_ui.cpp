@@ -22,6 +22,7 @@
 #include "BrawlOnline/Config/OnlineSettings.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
 #include "BrawlOnline/UI/Hooks.h"
+#include "BrawlOnline/UI/InputDisplayUI.h"
 #include "BrawlOnline/UI/OnScreenDisplay.h"
 #include "BrawlOnline/UI/OnlineChatUI.h"
 #include "BrawlOnline/UI/ReplayOverlayUI.h"
@@ -193,6 +194,7 @@ void CoreUiDraw(float top) {
 
     // The runtime's FPS box is in the top-right corner: the top-left one is free.
     ChatUI::SetTopLeftBoxRight(0.0f);
+    UI::InputDisplay::Display(1.0f);  // under the windows (the background draw list)
     ChatUI::Display(1.0f);
     VideoCommon::ReplayOverlayUI::Display(1.0f);  // while a replay or a spectated game plays
     OSD::DrawMessages(std::max(top, ChatUI::CornerBarBottom()));
