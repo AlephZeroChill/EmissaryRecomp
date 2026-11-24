@@ -117,7 +117,12 @@ void Initialize(const Settings& requested) {
     const Settings settings = Lockstep(requested);
     std::lock_guard<std::mutex> lock(g_mutex);
     g_current = settings;
-    g_bootWidescreen = settings.aspect != kAspect4x3;
+    // The game reads its aspect (SCGetAspectRatio) once, at boot, and frames its cameras, and so a screen KO, by it.
+    // With Brawl Online's core every machine boots it widescreen, as Dolphin pins SYSCONF IPL.AR on (brawlonline.net
+    // 18e14c7a: a Wii at 4:3 desynced at the first screen KO): a 4:3 picture is then the plugin's (PictureAspect), as
+    // Dolphin's Graphics > Aspect Ratio. The launcher writes a widescreen aspect_mode before each start, but a 4:3 one
+    // picked in game was saved and read back by any start it didn't make.
+    g_bootWidescreen = CoreDrawsShape() || settings.aspect != kAspect4x3;
     g_rendererDirty = true;
 }
 
@@ -171,6 +176,11 @@ Settings Latest() {
 bool GameWidescreen() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_bootWidescreen;
+}
+
+bool AspectNeedsRestart(int32_t aspect) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return !CoreDrawsShape() && (aspect != kAspect4x3) != g_bootWidescreen;
 }
 
 float PictureAspect() {
