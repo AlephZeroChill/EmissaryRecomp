@@ -36,7 +36,7 @@ struct RuntimeUserConfig {
     std::optional<std::string> graphicsApi;
     std::optional<std::string> displayMode;
     std::optional<uint32_t> frameInterpolationFps;
-    std::optional<std::string> frameInterpolationMode;  // [video] frame_interpolation_mode: interpolate | predict
+    std::optional<std::string> frameInterpolationMode;  // [video] frame_interpolation_mode: predict | interpolate
     std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
     std::optional<bool> disableCopyFilter;
@@ -1045,7 +1045,7 @@ inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
 }
 
 // How frame interpolation makes its frames: true = predict (ahead of the newest game frame), false = interpolate.
-inline bool FrameInterpolationPredict(bool fallback = false) {
+inline bool FrameInterpolationPredict(bool fallback = true) {
     const auto& mode = Get().frameInterpolationMode;
     return mode ? *mode == "predict" : fallback;
 }

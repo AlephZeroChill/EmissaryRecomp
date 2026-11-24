@@ -131,7 +131,8 @@ int g_frameInterpolationMode = [] {
         return 0;
     }
 }();
-bool g_framePredict = RuntimeConfigFile::FrameInterpolationPredict(false);
+// Predict until the player picks a mode: no added delay (see the Frame interpolation row).
+bool g_framePredict = RuntimeConfigFile::FrameInterpolationPredict(true);
 int g_displayMode = [] {
     const std::string mode = RuntimeConfigFile::DisplayMode("borderless");
     if (mode == "borderless") {
