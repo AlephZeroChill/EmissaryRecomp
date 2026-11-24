@@ -211,6 +211,32 @@ bool vsync_enabled() noexcept;
 // Applies a pending V-Sync change; true when the swapchain parameters must be set again.
 bool take_vsync_change() noexcept;
 bool vsync_change_pending() noexcept;
+// Multisampling of the EFB (1, 2, 4 or 8 samples): request_msaa takes effect at the next frame boundary, where
+// take_msaa_change applies it (clamped to what the device supports) and rebuilds the render targets.
+void request_msaa(uint32_t samples) noexcept;
+bool msaa_change_pending() noexcept;
+bool take_msaa_change() noexcept;
+// The sample count asked for (request_msaa or the config), before the device's clamp.
+uint32_t requested_msaa() noexcept;
+// Anisotropic filtering for the game's mipmapped, linearly filtered textures (1 = off, up to 16); read per draw.
+void set_texture_anisotropy(uint16_t value) noexcept;
+uint16_t texture_anisotropy() noexcept;
+// Display-only adjustments of the game picture in the present pass (draw_present_picture). Sharpening 0..1
+// (contrast-adaptive); brightness, contrast and vibrance 1 = as the game draws it.
+struct PictureAdjust {
+  float sharpening = 0.f;
+  float brightness = 1.f;
+  float contrast = 1.f;
+  float vibrance = 1.f;
+  bool neutral() const noexcept {
+    return sharpening <= 0.f && brightness == 1.f && contrast == 1.f && vibrance == 1.f;
+  }
+};
+void set_picture_adjust(const PictureAdjust& adjust) noexcept;
+PictureAdjust picture_adjust() noexcept;
+// The device's memory in bytes (its largest device-local heap) and whether it is an integrated GPU, from Vulkan's
+// own description of the device in use (0 / false when it could not be read).
+uint64_t adapter_memory_bytes() noexcept;
 void apply_present_mode() noexcept;
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                       bool force = false);
@@ -221,6 +247,10 @@ void set_present_source_override(Texture texture, Sampler sampler) noexcept;
 void clear_present_source_override() noexcept;
 // Draws `source` over the bound target with the XFB copy pipeline (a full-screen triangle).
 void draw_copy(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Texture& source, const Sampler& sampler);
+// draw_copy with the picture adjustments applied, over a viewport `width` x `height` pixels big (the
+// sharpening's pixel spacing). Plain draw_copy while they are neutral.
+void draw_present_picture(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Texture& source,
+                          const Sampler& sampler, float width, float height);
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept;
 Viewport calculate_present_viewport_for_aspect(uint32_t surface_width, uint32_t surface_height,

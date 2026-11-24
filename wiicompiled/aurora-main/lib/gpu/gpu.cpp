@@ -15,6 +15,7 @@
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <aurora/render_size_limits.hpp>
+#include <SDL3/SDL_vulkan.h>
 
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
@@ -34,6 +35,7 @@ TextureWithSampler g_frameBuffer;
 TextureWithSampler g_frameBufferResolved;
 TextureWithSampler g_depthBuffer;
 GraphicsPipeline g_CopyPipeline;
+GraphicsPipeline g_PicturePipeline;  // draw_present_picture: the copy with the picture adjustments
 bool g_bcTexturesSupported = false;
 bool g_safeVertexFetch = false;
 uint32_t g_shaderDebug = 0;
@@ -552,13 +554,110 @@ static void choose_gpu_compat() {
 
 const char* adapter_name() noexcept { return g_adapterName.c_str(); }
 
+namespace {
+// What Vulkan says about the device in use: its type (integrated or not) and its memory. SDL_GPU passes on
+// neither, so a separate instance reads them, matched to the device by name. Only the leading fields of
+// VkPhysicalDeviceProperties and VkPhysicalDeviceMemoryProperties are read, at their fixed offsets (Vulkan 1.0
+// ABI), so no Vulkan headers are needed.
+struct VulkanDeviceFacts {
+  bool read = false;
+  bool integrated = false;
+  uint64_t memoryBytes = 0;
+};
+VulkanDeviceFacts g_deviceFacts;
+
+VulkanDeviceFacts read_vulkan_device_facts(const std::string& name) {
+  VulkanDeviceFacts facts;
+#if !defined(__APPLE__)
+  if (name.empty() || !SDL_Vulkan_LoadLibrary(nullptr)) {
+    return facts;
+  }
+  using PFN_GetInstanceProcAddr = void* (*)(void*, const char*);
+  const auto getInstanceProc = reinterpret_cast<PFN_GetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+  using PFN_CreateInstance = int32_t (*)(const void*, const void*, void**);
+  using PFN_DestroyInstance = void (*)(void*, const void*);
+  using PFN_EnumerateDevices = int32_t (*)(void*, uint32_t*, void**);
+  using PFN_GetDeviceInfo = void (*)(void*, void*);
+  const auto createInstance =
+      getInstanceProc ? reinterpret_cast<PFN_CreateInstance>(getInstanceProc(nullptr, "vkCreateInstance")) : nullptr;
+  if (createInstance != nullptr) {
+    struct {
+      uint32_t sType = 1;  // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+      const void* pNext = nullptr;
+      uint32_t flags = 0;
+      const void* pApplicationInfo = nullptr;
+      uint32_t enabledLayerCount = 0;
+      const char* const* ppEnabledLayerNames = nullptr;
+      uint32_t enabledExtensionCount = 0;
+      const char* const* ppEnabledExtensionNames = nullptr;
+    } createInfo;
+    void* instance = nullptr;
+    if (createInstance(&createInfo, nullptr, &instance) == 0 && instance != nullptr) {
+      const auto destroy = reinterpret_cast<PFN_DestroyInstance>(getInstanceProc(instance, "vkDestroyInstance"));
+      const auto enumerate =
+          reinterpret_cast<PFN_EnumerateDevices>(getInstanceProc(instance, "vkEnumeratePhysicalDevices"));
+      const auto properties =
+          reinterpret_cast<PFN_GetDeviceInfo>(getInstanceProc(instance, "vkGetPhysicalDeviceProperties"));
+      const auto memory =
+          reinterpret_cast<PFN_GetDeviceInfo>(getInstanceProc(instance, "vkGetPhysicalDeviceMemoryProperties"));
+      uint32_t count = 0;
+      if (enumerate != nullptr && properties != nullptr && memory != nullptr &&
+          enumerate(instance, &count, nullptr) == 0 && count > 0) {
+        std::vector<void*> devices(count);
+        if (enumerate(instance, &count, devices.data()) >= 0) {
+          for (uint32_t i = 0; i < count; ++i) {
+            // VkPhysicalDeviceProperties: apiVersion, driverVersion, vendorID, deviceID, deviceType, deviceName[256].
+            alignas(16) unsigned char props[2048]{};
+            properties(devices[i], props);
+            uint32_t type = 0;
+            std::memcpy(&type, props + 16, sizeof(type));
+            const char* deviceName = reinterpret_cast<const char*>(props + 20);
+            if (std::string_view(deviceName, strnlen(deviceName, 256)) != name) {
+              continue;
+            }
+            // VkPhysicalDeviceMemoryProperties: memoryTypeCount, memoryTypes[32] (8 bytes each), memoryHeapCount,
+            // then memoryHeaps[16] at 264 (VkDeviceSize size, flags: 16 bytes each).
+            alignas(16) unsigned char mem[1024]{};
+            memory(devices[i], mem);
+            uint32_t heapCount = 0;
+            std::memcpy(&heapCount, mem + 260, sizeof(heapCount));
+            for (uint32_t h = 0; h < std::min<uint32_t>(heapCount, 16); ++h) {
+              uint64_t size = 0;
+              uint32_t flags = 0;
+              std::memcpy(&size, mem + 264 + h * 16, sizeof(size));
+              std::memcpy(&flags, mem + 264 + h * 16 + 8, sizeof(flags));
+              if ((flags & 1u) != 0) {  // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+                facts.memoryBytes = std::max(facts.memoryBytes, size);
+              }
+            }
+            facts.integrated = type == 1;  // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+            facts.read = true;
+            break;
+          }
+        }
+      }
+      if (destroy != nullptr) {
+        destroy(instance, nullptr);
+      }
+    }
+  }
+  SDL_Vulkan_UnloadLibrary();
+#else
+  (void)name;
+#endif
+  return facts;
+}
+} // namespace
+
 bool adapter_integrated() noexcept {
 #if defined(__APPLE__) && defined(__aarch64__)
   return true;  // Apple silicon: one memory for CPU and GPU
 #else
-  return false;
+  return g_deviceFacts.integrated;
 #endif
 }
+
+uint64_t adapter_memory_bytes() noexcept { return g_deviceFacts.memoryBytes; }
 
 const char* backend_name() noexcept { return g_backendName.c_str(); }
 
@@ -608,6 +707,12 @@ SDL_GPUPresentMode best_present_mode() {
     return SDL_GPU_PRESENTMODE_IMMEDIATE;
   }
   if (g_vsyncEnabled.load(std::memory_order_acquire)) {
+    // Mailbox: no tearing, and a frame waiting for the screen is replaced by a newer one instead of queueing behind
+    // it, so a hitch's catch-up frames never pile up as delay (Fifo's queue holds up to the swapchain's images).
+    // AURORA_GFX_FLAGS=fifo keeps Fifo (measurements).
+    if (!gfx_flag("fifo") && supports(SDL_GPU_PRESENTMODE_MAILBOX)) {
+      return SDL_GPU_PRESENTMODE_MAILBOX;
+    }
     return SDL_GPU_PRESENTMODE_VSYNC;
   }
   if (supports(SDL_GPU_PRESENTMODE_IMMEDIATE)) {
@@ -747,6 +852,48 @@ static void create_copy_pipeline() {
       .target_info = {.color_target_descriptions = &colorTarget, .num_color_targets = 1},
   };
   g_CopyPipeline = create_graphics_pipeline(info, "XFB copy pipeline");
+
+  // The same copy with the player's picture adjustments: contrast-adaptive sharpening over the four nearest
+  // neighbours (on the coarser of the picture's and the screen's pixel grids), then brightness, contrast and
+  // vibrance (saturation that lifts dull colours more than vivid ones), in the game's own gamma space.
+  shader::Interface pictureFs{
+      .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+      .uniforms = {{"adjust", "vec4 params; vec4 texel;"}},
+      .textures = {{"efb_texture"}},
+      .varyings = {{"vec2", "uv"}},
+  };
+  constexpr std::string_view pictureBody = R"(
+  vec3 e = SAMPLE(efb_texture, vin.uv).rgb;
+  vec3 color = e;
+  float sharpening = adjust.params.x;
+  if (sharpening > 0.0) {
+    vec2 dx = vec2(adjust.texel.x, 0.0);
+    vec2 dy = vec2(0.0, adjust.texel.y);
+    vec3 b = SAMPLE(efb_texture, vin.uv - dy).rgb;
+    vec3 d = SAMPLE(efb_texture, vin.uv - dx).rgb;
+    vec3 f = SAMPLE(efb_texture, vin.uv + dx).rgb;
+    vec3 h = SAMPLE(efb_texture, vin.uv + dy).rgb;
+    vec3 mn = min(min(min(b, d), min(e, f)), h);
+    vec3 mx = max(max(max(b, d), max(e, f)), h);
+    vec3 amp = sqrt(clamp(min(mn, vec3(1.0) - mx) / max(mx, vec3(0.0001)), vec3(0.0), vec3(1.0)));
+    vec3 w = amp * (-1.0 / mix(8.0, 5.0, sharpening));
+    color = clamp((b * w + d * w + f * w + h * w + e) / (vec3(1.0) + 4.0 * w), vec3(0.0), vec3(1.0));
+  }
+  color = color * adjust.params.y;
+  color = (color - vec3(0.5)) * adjust.params.z + vec3(0.5);
+  float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+  float saturation = clamp(max(color.r, max(color.g, color.b)) - min(color.r, min(color.g, color.b)), 0.0, 1.0);
+  float vibrance = adjust.params.w - 1.0;
+  float amount = sel(1.0 + vibrance * (1.0 - saturation), 1.0 + vibrance, vibrance < 0.0);
+  color = mix(vec3(luma), color, amount);
+  out_color = vec4(clamp(color, vec3(0.0), vec3(1.0)), 1.0);)";
+  const auto pictureFragment = shader::create(pictureFs, {}, pictureBody, "Picture adjust fragment");
+  if (!pictureFragment) {
+    return;
+  }
+  SDL_GPUGraphicsPipelineCreateInfo pictureInfo = info;
+  pictureInfo.fragment_shader = pictureFragment->handle;
+  g_PicturePipeline = create_graphics_pipeline(pictureInfo, "Picture adjust pipeline");
 }
 
 void draw_copy(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Texture& source, const Sampler& sampler) {
@@ -755,6 +902,28 @@ void draw_copy(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Texture
     return;
   }
   SDL_BindGPUGraphicsPipeline(pass, g_CopyPipeline->handle);
+  const SDL_GPUTextureSamplerBinding binding{.texture = source->handle, .sampler = sampler->handle};
+  SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+  SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+}
+
+void draw_present_picture(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Texture& source,
+                          const Sampler& sampler, float width, float height) {
+  const PictureAdjust adjust = picture_adjust();
+  if (adjust.neutral() || !g_PicturePipeline || !source || !sampler || width < 1.f || height < 1.f) {
+    draw_copy(cmd, pass, source, sampler);
+    return;
+  }
+  struct {
+    float params[4];
+    float texel[4];
+  } uniforms{
+      {std::clamp(adjust.sharpening, 0.f, 1.f), adjust.brightness, adjust.contrast, adjust.vibrance},
+      {1.f / std::min(width, static_cast<float>(source->width)),
+       1.f / std::min(height, static_cast<float>(source->height)), 0.f, 0.f},
+  };
+  SDL_BindGPUGraphicsPipeline(pass, g_PicturePipeline->handle);
+  SDL_PushGPUFragmentUniformData(cmd, 0, &uniforms, sizeof(uniforms));
   const SDL_GPUTextureSamplerBinding binding{.texture = source->handle, .sampler = sampler->handle};
   SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
   SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
@@ -802,6 +971,84 @@ void apply_present_mode() noexcept {
   }
 }
 
+namespace {
+std::atomic<uint32_t> g_msaaRequest{0};  // a sample count waiting for the next frame boundary; 0 = none
+std::atomic<uint16_t> g_textureAnisotropy{16};
+std::mutex g_pictureAdjustMutex;
+PictureAdjust g_pictureAdjust;
+
+uint32_t normalized_msaa(uint32_t samples) noexcept {
+  return samples >= 8 ? 8 : samples >= 4 ? 4 : samples >= 2 ? 2 : 1;
+}
+
+// The largest count up to `samples` that both the color and the depth target take.
+uint32_t supported_msaa(uint32_t samples) noexcept {
+  samples = normalized_msaa(samples);
+  while (samples > 1 && !(SDL_GPUTextureSupportsSampleCount(g_device, g_graphicsConfig.surfaceFormat,
+                                                            sample_count(samples)) &&
+                          SDL_GPUTextureSupportsSampleCount(g_device, g_graphicsConfig.depthFormat,
+                                                            sample_count(samples)))) {
+    samples /= 2;
+  }
+  return samples;
+}
+} // namespace
+
+void request_msaa(uint32_t samples) noexcept {
+  samples = normalized_msaa(samples);
+  g_config.msaa = samples;
+  if (g_initialized.load(std::memory_order_acquire)) {
+    g_msaaRequest.store(samples, std::memory_order_release);
+  }
+}
+
+bool msaa_change_pending() noexcept { return g_msaaRequest.load(std::memory_order_acquire) != 0; }
+
+uint32_t requested_msaa() noexcept { return normalized_msaa(g_config.msaa); }
+
+bool take_msaa_change() noexcept {
+  const uint32_t request = g_msaaRequest.exchange(0, std::memory_order_acq_rel);
+  if (request == 0) {
+    return false;
+  }
+  const uint32_t samples = supported_msaa(request);
+  if (samples == g_graphicsConfig.msaaSamples) {
+    return false;
+  }
+  Log.info("MSAA {}x (asked for {}x)", samples, request);
+  g_graphicsConfig.msaaSamples = samples;
+  // New targets at the new count, at today's sizes; recorded passes keep the old ones alive until they are done.
+  gx::clear_display_copy_cache();
+  gfx::clear_caches();
+  clear_present_source_override();
+  if (g_frameBuffer.texture) {
+    const uint32_t width = g_frameBuffer.texture->width;
+    const uint32_t height = g_frameBuffer.texture->height;
+    g_frameBuffer = create_render_texture(width, height, true);
+    g_frameBufferResolved = create_render_texture(width, height, false);
+    g_depthBuffer = create_depth_texture(width, height);
+  }
+  return true;
+}
+
+void set_texture_anisotropy(uint16_t value) noexcept {
+  value = std::clamp<uint16_t>(value, 1, 16);
+  g_config.maxTextureAnisotropy = value;
+  g_textureAnisotropy.store(value, std::memory_order_relaxed);
+}
+
+uint16_t texture_anisotropy() noexcept { return g_textureAnisotropy.load(std::memory_order_relaxed); }
+
+void set_picture_adjust(const PictureAdjust& adjust) noexcept {
+  std::lock_guard lock(g_pictureAdjustMutex);
+  g_pictureAdjust = adjust;
+}
+
+PictureAdjust picture_adjust() noexcept {
+  std::lock_guard lock(g_pictureAdjustMutex);
+  return g_pictureAdjust;
+}
+
 bool initialize(AuroraBackend auroraBackend) {
   load_gfx_flags();
   const char* driver = sdl_driver(auroraBackend);
@@ -824,6 +1071,13 @@ bool initialize(AuroraBackend auroraBackend) {
   const char* name = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, nullptr);
   g_adapterName = name != nullptr ? name : g_backendName;
   Log.info("Graphics device: {} on {}", g_adapterName, g_backendName);
+  if (g_backendName == "vulkan") {
+    g_deviceFacts = read_vulkan_device_facts(g_adapterName);
+    if (g_deviceFacts.read) {
+      Log.info("Graphics device: {} GPU, {} MiB of memory", g_deviceFacts.integrated ? "integrated" : "discrete",
+               g_deviceFacts.memoryBytes >> 20);
+    }
+  }
   choose_gpu_compat();
 
   {
@@ -847,11 +1101,9 @@ bool initialize(AuroraBackend auroraBackend) {
       .textureAnisotropy = g_config.maxTextureAnisotropy,
       .maxTextureDimension2D = 16384,
   };
-  while (g_graphicsConfig.msaaSamples > 1 &&
-         !SDL_GPUTextureSupportsSampleCount(g_device, g_graphicsConfig.surfaceFormat,
-                                            sample_count(g_graphicsConfig.msaaSamples))) {
-    g_graphicsConfig.msaaSamples /= 2;
-  }
+  g_graphicsConfig.msaaSamples = supported_msaa(g_config.msaa);
+  set_texture_anisotropy(g_config.maxTextureAnisotropy);
+  g_graphicsConfig.textureAnisotropy = texture_anisotropy();
   apply_present_mode();
   Log.info("Swapchain format {}, present mode {}, MSAA {}x", static_cast<int>(g_graphicsConfig.surfaceFormat),
            static_cast<int>(g_graphicsConfig.presentMode), g_graphicsConfig.msaaSamples);
@@ -872,6 +1124,7 @@ void shutdown() {
     SDL_WaitForGPUIdle(g_device);
   }
   g_CopyPipeline = {};
+  g_PicturePipeline = {};
   g_frameBuffer = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};

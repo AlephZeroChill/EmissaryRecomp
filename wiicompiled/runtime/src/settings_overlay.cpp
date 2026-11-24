@@ -28,6 +28,7 @@ extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint
 #include "music_attenuation.h"
 #include "runtime_config.h"
 #include "display_settings.h"
+#include "display_refresh.h"
 #include <dolphin/gx/GXAurora.h>
 #include "runtime_log.h"
 #include "memory.h"
@@ -108,7 +109,7 @@ bool g_exitPromptOpen = false;
 std::atomic<bool> g_fastForward{std::getenv("BRAWL_FAST_FORWARD") != nullptr};  // the env var: tests start with it on
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
-float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
+float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(2.25f);  // main.cpp's default too
 int g_audioVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::AudioVolume(1.0f) * 100.0f));
 int g_musicVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::MusicVolume(1.0f) * 100.0f));
 int g_soundEffectsVolumePercent =
@@ -1963,6 +1964,7 @@ void InitializeRuntimeSettings() noexcept {
 #if defined(__APPLE__)
     aurora_set_metalfx_spatial(g_metalFxSpatialUpscaling);
 #endif
+    InitializeVideoSettings();
     const uint32_t targetFps = kFrameInterpolationTargetFps[static_cast<size_t>(g_frameInterpolationMode)];
     LimitResolutionForFrameRate();
     LimitResolutionForIntegratedGpu();
@@ -2147,6 +2149,7 @@ void Draw() noexcept {
     WiiRemoteInput::Poll();
     ApplyConfiguredMappings();
     PersistDisplayModeIfChanged();
+    UpdateAutoVSync();
     UpdateCursorAutoHide();
     UpdateBootShaderState();
     UpdateStartupPress();

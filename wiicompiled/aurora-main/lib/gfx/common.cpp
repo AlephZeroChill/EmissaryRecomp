@@ -1317,7 +1317,13 @@ static void render_impl(std::vector<RenderPass>& renderPasses, gpu::Encoder& cmd
         resolveSource = passInfo.resolveSourceSnapshot->texture;
       }
       if (isDepth && passInfo.msaaSamples > 1) {
-        Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+        // SDL_GPU can neither sample nor resolve a multisampled depth target. With the player's anti-aliasing on, the
+        // copy keeps its last contents instead of ending the game.
+        static uint64_t s_skipped = 0;
+        if (s_skipped++ % 600 == 0) {
+          Log.warn("Depth tex copy from a multisampled EFB skipped ({} so far)", s_skipped);
+        }
+        continue;
       }
       const tex_copy_conv::ConvRequest convReq{
           .fmt = passInfo.resolveFormat,

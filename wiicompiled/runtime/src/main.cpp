@@ -80,6 +80,7 @@ extern "C" int HorizonDisplaySize(unsigned* width, unsigned* height);  // platfo
 #include "ppc_runtime.h"
 #include "aurora_events.h"
 #include "display_settings.h"
+#include "display_refresh.h"
 #include "graphics_info.h"
 #include "wii_remote_input.h"
 #include "discord_presence.h"
@@ -1444,7 +1445,10 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.allowTextureReplacements = RuntimeConfigFile::TextureReplacements(true);
         auroraConfig.allowTextureDumps = auroraConfig.allowTextureReplacements &&
                                          RuntimeConfigFile::TextureDumps(false);
-        // No vsync knob: aurora always configures a non-blocking present mode.
+        // Anti-aliasing and texture filtering as last chosen (the first start's preset changes them before the first
+        // frame: settings_video.inc).
+        auroraConfig.msaa = RuntimeConfigFile::Msaa(1);
+        auroraConfig.maxTextureAnisotropy = static_cast<uint16_t>(RuntimeConfigFile::Anisotropy(1));
         auroraConfig.desiredBackend = BACKEND_AUTO;
         // GPU driver workarounds: picked from the graphics adapter unless the player forced them.
         auroraConfig.gpuCompat = static_cast<AuroraGpuCompat>(RuntimeConfigFile::GpuCompat());
@@ -1541,6 +1545,9 @@ int RuntimeMain(int argc, char** argv) {
         GraphicsInfo::Set(auroraInfo.gpuName != nullptr ? auroraInfo.gpuName : "", auroraInfo.gpuCompatActive);
         // BRAWL_ASSUME_INTEGRATED_GPU=1 tests the integrated-GPU limits on a PC with a graphics card.
         GraphicsInfo::SetIntegrated(auroraInfo.gpuIntegrated || std::getenv("BRAWL_ASSUME_INTEGRATED_GPU") != nullptr);
+        GraphicsInfo::SetMemoryBytes(auroraInfo.gpuMemoryBytes);
+        // V-Sync's automatic setting needs to know whether the screen follows the frames (G-Sync, FreeSync).
+        DisplayRefresh::Start(auroraInfo.window);
         RT_LOG(RT_TAG_RUNTIME) << "graphics adapter: " << GraphicsInfo::Name() << ", compatibility fixes "
                   << (auroraInfo.gpuCompatActive ? "on" : "off") << std::endl;
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);

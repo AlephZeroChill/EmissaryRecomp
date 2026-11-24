@@ -75,6 +75,16 @@ void aurora_set_frame_pacing_exempt(bool exempt);
 // NSMBW: V-Sync on (Fifo) or off (Immediate, else Mailbox); off by default.
 void aurora_set_vsync(bool enabled);
 bool aurora_get_vsync();
+// Multisample anti-aliasing of the game's picture: 1 (off), 2, 4 or 8 samples per pixel, applied at the next frame
+// boundary and lowered to what the GPU takes. The EFB is resolved before every copy and display.
+void aurora_set_msaa(uint32_t samples);
+uint32_t aurora_get_msaa();  // the count in use
+// Anisotropic filtering of the game's mipmapped, linearly filtered textures: 1 (off) to 16. Takes effect at once.
+void aurora_set_texture_anisotropy(uint32_t maxAnisotropy);
+uint32_t aurora_get_texture_anisotropy();
+// Display only: the game picture as it is presented (not the menus over it). Sharpening 0..1 (contrast-adaptive);
+// brightness, contrast and vibrance 1 = as the game draws it.
+void aurora_set_picture_adjustments(float sharpening, float brightness, float contrast, float vibrance);
 uint32_t aurora_get_frame_interpolation_fps();
 
 // Newly encountered GX pipelines compile on the bounded worker queue. Draws whose pipeline is not

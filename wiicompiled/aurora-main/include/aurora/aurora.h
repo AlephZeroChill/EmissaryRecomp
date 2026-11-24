@@ -154,6 +154,7 @@ typedef struct {
   const char* gpuName;
   bool gpuCompatActive;
   bool gpuIntegrated;  // an integrated GPU: shares the CPU's memory, so high render scales cost far more
+  uint64_t gpuMemoryBytes;  // the GPU's memory (its largest device-local heap); 0 when unknown
 } AuroraInfo;
 
 AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config);

@@ -2209,9 +2209,9 @@ static u16 sampler_aniso(GXAnisotropy aniso) {
   case GX_MAX_ANISOTROPY:
     return 1;
   case GX_ANISO_2:
-    return std::max<u16>(aurora::gpu::g_graphicsConfig.textureAnisotropy / 2, 1);
+    return std::max<u16>(aurora::gpu::texture_anisotropy() / 2, 1);
   case GX_ANISO_4:
-    return std::max<u16>(aurora::gpu::g_graphicsConfig.textureAnisotropy, 1);
+    return std::max<u16>(aurora::gpu::texture_anisotropy(), 1);
   }
 }
 
@@ -2232,6 +2232,14 @@ SDL_GPUSamplerCreateInfo aurora::gfx::TextureBind::get_descriptor() const noexce
     maxLod = 0.f;
   }
   u16 maxAnisotropy = sampler_aniso(texObj.max_aniso());
+  // The player's anisotropic filtering, as Dolphin's enhancement does it: every mipmapped texture the game filters
+  // linearly gets it (with linear mip blending, which anisotropy needs), whatever the game asked for.
+  if (const u16 forced = aurora::gpu::texture_anisotropy(); forced > 1 && mipFilter != MipFilter::None &&
+                                                            minFilter == SDL_GPU_FILTER_LINEAR &&
+                                                            magFilter == SDL_GPU_FILTER_LINEAR) {
+    maxAnisotropy = forced;
+    mipFilter = MipFilter::Linear;
+  }
   // Anisotropy needs all-linear filtering.
   if (maxAnisotropy > 1 &&
       !(magFilter == SDL_GPU_FILTER_LINEAR && minFilter == SDL_GPU_FILTER_LINEAR && mipFilter == MipFilter::Linear)) {

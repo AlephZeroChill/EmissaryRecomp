@@ -47,6 +47,8 @@ void OpenFolder(const std::filesystem::path& folder) {
     if (!SDL_OpenURL(url.c_str())) Flash("Couldn't open " + RuntimeConfigFile::PathToUtf8(folder));
 }
 
+#include "settings_video.inc"  // quality presets, anti-aliasing, V-Sync's automatic setting, picture adjustments
+
 // ---- the rows of each tab ----
 void GraphicsRows(std::vector<MenuRow>& rows) {
     static constexpr const char* kModes[] = {"WINDOW", "BORDERLESS", "FULLSCREEN"};
@@ -57,6 +59,7 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
                         g_displayMode = static_cast<int>(aurora_get_display_mode());
                         RuntimeConfigFile::SetDisplayMode(std::string(kDisplayModeConfigNames[static_cast<size_t>(g_displayMode)]));
                     }});
+    QualityRow(rows);
     int res = 0;
     for (size_t i = 0; i < kResolutions.size(); ++i) if (std::fabs(kResolutions[i].scale - g_resolutionScale) < 0.001f) res = static_cast<int>(i);
     uint32_t pw = 0, ph = 0;
@@ -69,6 +72,7 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
                         while (IsHighFrameRateMode() && IsHighResolutionScale(kResolutions[static_cast<size_t>(i)].scale));
                         SetResolutionScale(kResolutions[static_cast<size_t>(i)].scale);
                     }});
+    AntiAliasingRows(rows);
     const DisplaySettings::Settings display = DisplaySettings::Latest();
     int aspect = 0;
     for (size_t i = 0; i < kAspects.size(); ++i) if (kAspects[i].mode == display.aspect) aspect = static_cast<int>(i);
@@ -88,17 +92,14 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
                         LimitResolutionForFrameRate();
                         if (aurora_get_display_mode() == AURORA_DISPLAY_MODE_EXCLUSIVE) aurora_set_display_mode(AURORA_DISPLAY_MODE_EXCLUSIVE);
                     }});
-    rows.push_back({"V-Sync", OnOff(g_vsync.load()), "No screen tearing; the game follows your screen's refresh.", [](int) {
-                        const bool on = !g_vsync.load();
-                        SetVSync(on);
-                        RuntimeConfigFile::SetVSync(on);
-                    }});
+    VSyncRow(rows);
     const bool bloom = (g_disabledPostProcessingPaths & 0x10u) == 0;
     rows.push_back({"Bloom", OnOff(bloom), "The glow around bright light. Applies from the next scene.", [bloom](int) {
                         g_disabledPostProcessingPaths = bloom ? (g_disabledPostProcessingPaths | 0x10u) : (g_disabledPostProcessingPaths & ~0x10u);
                         RuntimeGameGraphicsOptions::SetDisabledPostProcessingPaths(g_disabledPostProcessingPaths);
                         RuntimeConfigFile::SetDisabledPostProcessingPaths(g_disabledPostProcessingPaths);
                     }});
+    PictureRows(rows);
     rows.push_back({"Show FPS", OnOff(g_showFps), "Frames per second in the corner.", [](int) {
                         g_showFps = !g_showFps;
                         RuntimeConfigFile::SetShowFps(g_showFps);
@@ -645,24 +646,75 @@ bool TransitionOrInfo(const std::string& scene) {
 // Tests: BRAWL_OPTIONS_TAB=<n> opens the options menu on tab n once the game is up; BRAWL_STATE_TEST=1 saves 5 s
 // into the first match, then loads it at 9 s and 14 s.
 void RunTestHooks(const std::string& scene, double sceneSeconds) {
-    // A list ("3,5,6") shows each tab for 4 s.
+    // A list ("3,5,6") shows each tab for 4 s; "1:9" is tab 1 with its row 9 picked (the list scrolls to it).
     static const char* tabs = std::getenv("BRAWL_OPTIONS_TAB");
     static double openedAt = -1;
+    static size_t shown = SIZE_MAX;
     if (tabs != nullptr && !StartupScreenVisible() && scene == "muMenuMain") {
         if (openedAt < 0) openedAt = ImGui::GetTime();
-        std::vector<int> list;
+        std::vector<std::pair<int, int>> list;
         for (const char* p = tabs; *p != '\0';) {
-            list.push_back(std::atoi(p));
-            while (*p != '\0' && *p != ',') ++p;
+            const int tab = std::atoi(p);
+            while (*p != '\0' && *p != ',' && *p != ':') ++p;
+            int row = 0;
+            if (*p == ':') {
+                row = std::atoi(++p);
+                while (*p != '\0' && *p != ',') ++p;
+            }
+            list.emplace_back(tab, row);
             if (*p == ',') ++p;
         }
         const size_t i = static_cast<size_t>((ImGui::GetTime() - openedAt) / 4.0);
-        if (i < list.size() && g_menu.tab != list[i]) {
-            g_menu.tab = std::clamp(list[i], 0, kTabCount - 1);
+        if (i < list.size() && i != shown) {
+            shown = i;
+            g_menu.tab = std::clamp(list[i].first, 0, kTabCount - 1);
             g_menu.inRows = true;
-            g_menu.row = 0;
+            g_menu.row = list[i].second;
             SetTopBarVisible(true);
-            RT_LOGF(RT_TAG_RUNTIME, "[options test] tab %d\n", g_menu.tab);
+            RT_LOGF(RT_TAG_RUNTIME, "[options test] tab %d row %d\n", g_menu.tab, g_menu.row);
+        }
+    }
+    // Measurements: BRAWL_VIDEO_SWEEP="scale:msaa:anisotropy:bloom,..." applies each set for BRAWL_VIDEO_SWEEP_SECONDS
+    // (default 8) in turn over the matches' time (past each one's first 3 s), logging when (QueryPerformanceCounter, as
+    // PresentMon's --qpc_time) so a GPU timeline can be cut per set.
+    static const char* sweep = std::getenv("BRAWL_VIDEO_SWEEP");
+    static int sweepStep = -1;
+    static double meleeSeconds = 0, lastSceneSeconds = 0;
+    if (sweep != nullptr && scene == "scMelee" && sceneSeconds >= 3.0) {
+        if (sceneSeconds > lastSceneSeconds && sceneSeconds - lastSceneSeconds < 1.0) meleeSeconds += sceneSeconds - lastSceneSeconds;
+        lastSceneSeconds = sceneSeconds;
+        static const double seconds = std::getenv("BRAWL_VIDEO_SWEEP_SECONDS") ? std::atof(std::getenv("BRAWL_VIDEO_SWEEP_SECONDS")) : 8.0;
+        std::vector<std::string> sets;
+        for (const char* p = sweep; *p != '\0';) {
+            const char* end = p;
+            while (*end != '\0' && *end != ',') ++end;
+            sets.emplace_back(p, end);
+            p = *end == ',' ? end + 1 : end;
+        }
+        const int want = static_cast<int>(meleeSeconds / seconds);
+        if (want != sweepStep) {
+            sweepStep = want;
+            uint64_t qpc = 0;
+            unsigned long pid = 0;
+#if defined(_WIN32)
+            LARGE_INTEGER counter{};
+            ::QueryPerformanceCounter(&counter);
+            qpc = static_cast<uint64_t>(counter.QuadPart);
+            pid = ::GetCurrentProcessId();
+#endif
+            if (want < static_cast<int>(sets.size())) {
+                float scale = 2.25f;
+                unsigned msaa = 1, aniso = 1, bloom = 1;
+                std::sscanf(sets[static_cast<size_t>(want)].c_str(), "%f:%u:%u:%u", &scale, &msaa, &aniso, &bloom);
+                SetResolutionScale(scale);
+                SetMsaa(msaa);
+                SetAnisotropy(aniso);
+                if (BloomOn() != (bloom != 0)) SetBloom(bloom != 0);
+                RT_LOGF(RT_TAG_RUNTIME, "[video sweep] %d %s qpc %llu pid %lu\n", want,
+                        sets[static_cast<size_t>(want)].c_str(), static_cast<unsigned long long>(qpc), pid);
+            } else if (want == static_cast<int>(sets.size())) {
+                RT_LOGF(RT_TAG_RUNTIME, "[video sweep] end qpc %llu pid %lu\n", static_cast<unsigned long long>(qpc), pid);
+            }
         }
     }
     static const bool stateTest = std::getenv("BRAWL_STATE_TEST") != nullptr;
