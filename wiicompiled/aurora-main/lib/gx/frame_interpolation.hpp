@@ -10,6 +10,9 @@
 // guest frames by re-staging each perspective draw's uniform block with interpolated transforms.
 namespace aurora::gx {
 constexpr uint32_t MaxInterpolatedFrames = 3;
+// Uniform copies staged per draw: one per inserted frame, plus Predict's arrival copy (the newest frame with
+// its glide offset, see predict_arrival_glide).
+constexpr uint32_t MaxStagedSamples = MaxInterpolatedFrames + 1;
 
 // Identifies a draw across frames. `combined` includes the geometry signature and is exact, while
 // `pipeline`/`texture` is the material-only fallback for meshes whose vertex data changes.
@@ -48,6 +51,22 @@ inline uint32_t frame_interpolation_fps() noexcept {
 inline bool frame_interpolation_active() noexcept { return frame_interpolation_fps() != 0; }
 
 void set_frame_interpolation_fps(uint32_t targetFps) noexcept;
+// AURORA_FRAME_INTERPOLATION_INTERPOLATE or _PREDICT (aurora/gfx.h). Takes effect at the next frame.
+void set_frame_interpolation_mode(uint32_t mode) noexcept;
+uint32_t frame_interpolation_mode() noexcept;
+// The frame being recorded follows a rollback: Predict shows it without inserted frames (see
+// finalize_frame_interpolation).
+void mark_frame_discontinuous() noexcept;
+// The sealed frame's mode and Predict state, read by the encode right after the seal.
+bool sealed_frame_predicts() noexcept;
+// Predict: some draw of the sealed frame glides back from an overshoot, so its first presented slot is the
+// arrival replay (staged sample interpolated_frame_count()) rather than the native image.
+bool predict_arrival_glide() noexcept;
+// Sequence number of the sealed frame, carried by its presentation jobs.
+uint64_t sealed_frame_sequence() noexcept;
+// The presenter showed slot `slot` (0 = the frame itself, k = its k-th inserted frame) of sealed frame
+// `sequence`. Predict's glide starts from what was actually on screen.
+void note_presented_slot(uint64_t sequence, uint32_t slot) noexcept;
 
 // Feedback for the adaptive slot controller: whether the producer met its
 // retrace boundary for the frame that just presented.
@@ -67,7 +86,7 @@ bool frame_interpolation_replay_safe() noexcept;
 
 // Records one perspective draw and maps its intermediate uniform copies, returning the mapped
 // range per slot (empty when the draw has no counterpart). Called by build_uniform.
-std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
+std::array<gfx::Range, MaxStagedSamples> record_interpolation_draw(
     const FrameInterpolationDrawIdentity& identity, const Mat4x4<float>& projection,
     uint16_t usedPnMtxMask, const InterpolatedUniformLayout& uniformLayout) noexcept;
 

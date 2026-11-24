@@ -1229,7 +1229,7 @@ static void render_pass_impl(const PassContext& ctx, const std::vector<RenderPas
 
 static void render_impl(std::vector<RenderPass>& renderPasses, gpu::Encoder& cmd, const uint8_t* uniforms,
                         int32_t interpolatedFrame, bool finalize, DebugFrameData& debugFrame,
-                        const depth_peek::FrameMapping& depthMapping) {
+                        const depth_peek::FrameMapping& depthMapping, bool recycle = true) {
   ZoneScoped;
   // Palette conversions and EFB copies run in every slot, in pass order: replay slots are encoded
   // before the native render, so skipping them made a slot sample copies this frame had not made yet
@@ -1359,7 +1359,7 @@ static void render_impl(std::vector<RenderPass>& renderPasses, gpu::Encoder& cmd
       }
     }
   }
-  if (finalize) {
+  if (finalize && recycle) {
     recycle_render_passes(renderPasses);
   }
 
@@ -1401,10 +1401,12 @@ void seal_frame(SealedFrame& out) noexcept {
   g_currentRenderPass = UINT32_MAX;
 }
 
-void render(SealedFrame& frame, gpu::Encoder& cmd, int32_t interpolatedFrame, bool finalize) {
+void render(SealedFrame& frame, gpu::Encoder& cmd, int32_t interpolatedFrame, bool finalize, bool recycle) {
   render_impl(frame.data().passes, cmd, frame.data().uniforms, interpolatedFrame, finalize, frame.data().debug,
-              frame.data().depthMapping);
+              frame.data().depthMapping, recycle);
 }
+
+void recycle_sealed_passes(SealedFrame& frame) noexcept { recycle_render_passes(frame.data().passes); }
 
 void render(gpu::Encoder& cmd, int32_t interpolatedFrame, bool finalize) {
   render_impl(g_renderPasses, cmd, g_batchUniforms, interpolatedFrame, finalize, g_debugFrame,

@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -164,6 +165,12 @@ struct FrameTransformEntry {
   // on where they will be. Not for indexed draws: PNMTXIDX slot identity pairs those.
   Mat3x4<float> predictedPosition{};
   bool hasPrediction = false;
+  // Predict: this frame's motion (median translation step of its matrices since the previous frame), shown
+  // ahead of the frame in its inserted slots, and the glide offset its slots fade out (the glide in finalize_frame_interpolation).
+  std::array<float, 3> velocity{};
+  std::array<float, 3> glide{};
+  bool predicted = false;
+  bool glides = false;
 };
 
 struct Quaternion {
@@ -185,6 +192,7 @@ struct PendingUniformInterpolation {
   uint32_t numerator = 0;
   uint32_t denominator = 1;
   bool indexedMatrices = false;
+  bool arrival = false;  // Predict's arrival copy: the frame itself plus its glide offset
 };
 
 std::vector<FrameTransformEntry> s_previousFrameTransforms;
@@ -277,6 +285,48 @@ constexpr uint32_t kPacingReducePercent = 10;
 constexpr uint32_t kPacingMaxRestoreWindows = 32;
 std::atomic_uint32_t s_pacingCleanWindows{0};
 std::atomic_uint32_t s_pacingRestoreWindows{1};
+
+// Predict (AURORA_FRAME_INTERPOLATION_PREDICT). Interpolate shows the in-between frames of the last two game frames,
+// so the newest frame reaches the screen only after them, most of a frame late. Predict shows the newest frame the
+// moment it is ready and carries each matched draw forward from it by its last frame's motion in the slots after
+// it (weight 1 + t instead of t). Presentation only, as interpolation: no guest memory is read or written here.
+std::atomic_uint32_t s_requestedMode{AURORA_FRAME_INTERPOLATION_INTERPOLATE};
+uint32_t s_frameMode = AURORA_FRAME_INTERPOLATION_INTERPOLATE;  // latched at begin_frame_interpolation
+std::atomic_bool s_discontinuousPending{false};
+// The sealed frame's Predict state for the encode (sealed_frame_predicts, predict_arrival_glide).
+std::atomic_bool s_sealedPredicts{false};
+std::atomic_bool s_sealedArrivalGlide{false};
+std::atomic<uint64_t> s_sealSequence{0};
+uint32_t s_previousSlotDenominator = 1;  // inserted frames + 1 of the previous sealed frame
+// (sequence << 8) | slot of the last presented job (note_presented_slot).
+std::atomic<uint64_t> s_shownSlot{0};
+// A predicted pose past these is a cut, a teleport or a deformation, not motion that goes on: the draw keeps its
+// latest pose in the inserted frames (view-space units; a frame's rotation; a frame's scale change; the relative
+// change of a skinning matrix's 3x3).
+constexpr float kPredictMaxTranslation = 40.0f;
+constexpr float kPredictMinQuaternionDot = 0.82533561f;  // cos(0.6): 1.2 radians in one frame
+constexpr float kPredictMaxScaleRatio = 1.5f;
+constexpr float kPredictMaxLinearChange = 0.35f;
+// Glide (finalize_frame_interpolation): the overshoot undone over this fraction of a game frame; larger corrections snap.
+constexpr float kGlideFrames = 0.5f;
+constexpr float kGlideMax = 12.0f;
+constexpr float kGlideMin = 0.01f;
+std::atomic<uint64_t> s_diagPredictHeld{0};
+std::atomic<uint64_t> s_diagPredictDraws{0};
+std::atomic<uint64_t> s_diagGlideDraws{0};
+std::atomic<uint64_t> s_diagGlideFrames{0};
+std::atomic<uint32_t> s_diagGlideLargestBits{0};
+std::atomic<uint64_t> s_diagDiscontinuousFrames{0};
+std::atomic<uint64_t> s_diagJoltFrames{0};
+// A camera jolt (a KO's or a heavy hit's screen shake): most of the draws that moved in both frames moved back
+// against their last step. Carrying a shaking view forward overshoots every reversal, and the whole picture jumps
+// back and forth at 240 Hz; Predict shows such a frame as drawn. A fighter's dash dance reverses its own draws
+// only, never most of the scene.
+constexpr float kJoltMinStep = 0.05f;
+constexpr uint32_t kJoltMinDraws = 8;
+std::atomic<uint64_t> s_diagSealNanos{0};
+
+float glide_fade(float t) noexcept { return std::clamp(1.0f - t / kGlideFrames, 0.0f, 1.0f); }
 
 uint32_t maximum_interpolation_samples() noexcept {
   const uint32_t targetFps = frame_interpolation_fps();
@@ -593,6 +643,67 @@ bool evaluate_affine_pair(const PreparedAffinePair& pair, float weight,
   return true;
 }
 
+// Predict: whether carrying this pair's motion forward is unsafe, so the draw keeps its latest pose.
+bool predict_holds(const PreparedAffinePair& pair) noexcept {
+  if (!pair.valid) {
+    return true;
+  }
+  if (pair.identical) {
+    return false;
+  }
+  if (pair.linear) {
+    const std::array<const Vec4<float>*, 3> p{&pair.previous.m0, &pair.previous.m1, &pair.previous.m2};
+    const std::array<const Vec4<float>*, 3> c{&pair.current.m0, &pair.current.m1, &pair.current.m2};
+    float translation = 0.0f, change = 0.0f, size = 0.0f;
+    for (size_t row = 0; row < 3; ++row) {
+      const float dt = (*c[row])[3] - (*p[row])[3];
+      translation += dt * dt;
+      for (size_t column = 0; column < 3; ++column) {
+        const float d = (*c[row])[column] - (*p[row])[column];
+        change += d * d;
+        size += (*c[row])[column] * (*c[row])[column];
+      }
+    }
+    return !(translation <= kPredictMaxTranslation * kPredictMaxTranslation) ||
+           !(change <= kPredictMaxLinearChange * kPredictMaxLinearChange * size);
+  }
+  float translation = 0.0f;
+  for (size_t i = 0; i < 3; ++i) {
+    const float d = pair.currentTranslation[i] - pair.previousTranslation[i];
+    translation += d * d;
+  }
+  if (!(translation <= kPredictMaxTranslation * kPredictMaxTranslation)) {
+    return true;
+  }
+  // prepare_affine_pair put the current quaternion in the previous one's hemisphere.
+  const float dot = pair.previousQuaternion.x * pair.currentQuaternion.x +
+                    pair.previousQuaternion.y * pair.currentQuaternion.y +
+                    pair.previousQuaternion.z * pair.currentQuaternion.z +
+                    pair.previousQuaternion.w * pair.currentQuaternion.w;
+  if (!(dot >= kPredictMinQuaternionDot)) {
+    return true;
+  }
+  for (size_t i = 0; i < 3; ++i) {
+    const float ratio = pair.currentScale[i] / pair.previousScale[i];
+    if (!(ratio <= kPredictMaxScaleRatio && ratio >= 1.0f / kPredictMaxScaleRatio)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The translation step of a prepared pair (current - previous), in view space.
+std::array<float, 3> pair_step(const PreparedAffinePair& pair) noexcept {
+  return {pair.current.m0.w() - pair.previous.m0.w(), pair.current.m1.w() - pair.previous.m1.w(),
+          pair.current.m2.w() - pair.previous.m2.w()};
+}
+
+void add_translation(Mat3x4<float>& m, const std::array<float, 3>& offset, float weight) noexcept {
+  m.m0[3] += offset[0] * weight;
+  m.m1[3] += offset[1] * weight;
+  m.m2[3] += offset[2] * weight;
+}
+
 bool interpolate_affine_impl(const Mat3x4<float>& previous, const Mat3x4<float>& current,
                              float weight, Mat3x4<float>& output) noexcept {
   return evaluate_affine_pair(prepare_affine_pair(previous, current), weight, output);
@@ -730,6 +841,26 @@ float snapshot_match_distance_squared(const FrameTransformEntry& previousEntry,
   return static_cast<float>(distance / static_cast<double>(matchedMatrices));
 }
 
+void set_frame_interpolation_mode(uint32_t mode) noexcept {
+  s_requestedMode.store(mode == AURORA_FRAME_INTERPOLATION_PREDICT ? AURORA_FRAME_INTERPOLATION_PREDICT
+                                                                   : AURORA_FRAME_INTERPOLATION_INTERPOLATE,
+                        std::memory_order_release);
+}
+
+uint32_t frame_interpolation_mode() noexcept { return s_requestedMode.load(std::memory_order_acquire); }
+
+void mark_frame_discontinuous() noexcept { s_discontinuousPending.store(true, std::memory_order_release); }
+
+bool sealed_frame_predicts() noexcept { return s_sealedPredicts.load(std::memory_order_acquire); }
+
+bool predict_arrival_glide() noexcept { return s_sealedArrivalGlide.load(std::memory_order_acquire); }
+
+uint64_t sealed_frame_sequence() noexcept { return s_sealSequence.load(std::memory_order_acquire); }
+
+void note_presented_slot(uint64_t sequence, uint32_t slot) noexcept {
+  s_shownSlot.store((sequence << 8) | (slot & 0xFFu), std::memory_order_release);
+}
+
 void set_frame_interpolation_fps(uint32_t targetFps) noexcept {
   if (targetFps != 120 && targetFps != 180 && targetFps != 240) {
     targetFps = 0;
@@ -820,6 +951,7 @@ void begin_frame_interpolation() noexcept {
     recycle_transform_entries(s_previousFrameTransforms);
     s_previousInterpolationFps = targetFps;
   }
+  s_frameMode = s_requestedMode.load(std::memory_order_acquire);
   // Latch the slot count for the frame starting here; see s_activeInterpolationSamples
   // for why it cannot move again until the seal.
   s_activeInterpolationSamples.store(
@@ -849,10 +981,40 @@ void begin_frame_interpolation() noexcept {
 }
 
 void finalize_frame_interpolation() noexcept {
+  const auto sealStart = std::chrono::steady_clock::now();
+  struct SealTimer {
+    std::chrono::steady_clock::time_point start;
+    ~SealTimer() {
+      s_diagSealNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start).count()),
+                                std::memory_order_relaxed);
+    }
+  } sealTimer{sealStart};
+  const bool predicts = s_frameMode == AURORA_FRAME_INTERPOLATION_PREDICT;
+  // What the previous frame put on screen last, for the glide: its slot as a fraction of a game frame.
+  const uint64_t previousSequence = s_sealSequence.load(std::memory_order_relaxed);
+  float shownFraction = 0.0f;
+  {
+    const uint64_t shown = s_shownSlot.load(std::memory_order_acquire);
+    if ((shown >> 8) == previousSequence && s_previousSlotDenominator > 1) {
+      shownFraction = static_cast<float>(shown & 0xFFu) / static_cast<float>(s_previousSlotDenominator);
+    }
+  }
+  s_sealSequence.store(previousSequence + 1, std::memory_order_release);
+  s_sealedPredicts.store(predicts, std::memory_order_release);
+  s_sealedArrivalGlide.store(false, std::memory_order_release);
+  s_previousSlotDenominator = 1;
+  // A frame right after a rollback was not simulated from the frame shown before it, so the step between the two
+  // mixes two timelines: Predict shows it as drawn (no inserted frames). Its transforms still seed the next frame,
+  // which is on one timeline again.
+  const bool discontinuous = s_discontinuousPending.exchange(false, std::memory_order_acq_rel) && predicts;
+  if (discontinuous) {
+    s_diagDiscontinuousFrames.fetch_add(1, std::memory_order_relaxed);
+  }
   // A frame reported late seals without inserted slots, so the encode phase renders
   // the native frame only. Its transforms still seed the next frame's matching.
-  if (s_dropInterpolationAtSeal.exchange(false, std::memory_order_acq_rel)) {
-    s_diagLateSealDrops.fetch_add(1, std::memory_order_relaxed);
+  if (s_dropInterpolationAtSeal.exchange(false, std::memory_order_acq_rel) || discontinuous) {
+    if (!discontinuous) s_diagLateSealDrops.fetch_add(1, std::memory_order_relaxed);
     s_hasInterpolatedFrame.store(false, std::memory_order_release);
     s_pendingUniformInterpolations.clear();
     retire_frame_transforms();
@@ -1369,6 +1531,136 @@ void finalize_frame_interpolation() noexcept {
       }
     }
 
+    // Predict: which draws carry their motion forward, their step, and the glide back from what the previous frame
+    // showed ahead of the game.
+    std::vector<uint8_t> predictHold;
+    if (predicts) {
+      predictHold.assign(s_currentFrameTransforms.size(), 1);
+      const uint32_t sampleCount = s_activeInterpolationSamples.load(std::memory_order_acquire);
+      s_previousSlotDenominator = sampleCount + 1;
+      std::array<std::vector<float>, 3> steps;
+      uint64_t held = 0, predicted = 0, glided = 0;
+      uint32_t moving = 0, reversed = 0;
+      float largest = 0.0f;
+      for (size_t index = 0; index < s_currentFrameTransforms.size(); ++index) {
+        if (preparedTransformState[index] == 0) {
+          continue;
+        }
+        auto& entry = s_currentFrameTransforms[index];
+        const auto& prepared = preparedTransforms[index];
+        for (auto& v : steps) v.clear();
+        bool hold = false;
+        const auto addPair = [&](size_t offset) {
+          if (offset == kNoPreparedPair) {
+            hold = true;
+            return;
+          }
+          if (predict_holds(preparedPairs[offset])) {
+            hold = true;
+            return;
+          }
+          const auto step = pair_step(preparedPairs[offset]);
+          for (size_t c = 0; c < 3; ++c) steps[c].push_back(step[c]);
+        };
+        if (entry.transform.indexedMatrices) {
+          if (!prepared.indexedValid) {
+            hold = true;
+          } else {
+            for (size_t slot = 0; slot < MaxPnMtx && !hold; ++slot) {
+              if ((entry.transform.usedMatrixMask & (1u << slot)) != 0) addPair(prepared.indexedPairOffsets[slot]);
+            }
+          }
+        } else {
+          addPair(prepared.nonIndexedPairOffset);
+        }
+        if (hold || steps[0].empty()) {
+          ++held;
+          continue;
+        }
+        predictHold[index] = 0;
+        ++predicted;
+        for (size_t c = 0; c < 3; ++c) {
+          auto& v = steps[c];
+          std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+          entry.velocity[c] = v[v.size() / 2];
+        }
+        entry.predicted = true;
+        // Glide: the previous frame's last shown slot put this draw `overshoot` ahead of where the game had it. When
+        // this frame turns it back (a dash dance turning, a float starting), drawing it as the game has it now jumps
+        // back by up to a whole frame of motion in one presented frame, against the fraction of a frame every other
+        // presented frame moves. The part of that jump that undoes the overshoot is drawn as an offset instead and
+        // faded out over kGlideFrames. Motion that goes on, or starts from rest, was never shown ahead and does not
+        // glide; a large correction is a teleport or a respawn and snaps. One offset per draw (the median of its
+        // matrices'): gliding each bone by its own amount stretched skinned meshes in Melee Unlocked.
+        const size_t previousIndex = currentToPrevious[index];
+        if (previousIndex >= s_previousFrameTransforms.size()) {
+          continue;
+        }
+        const auto& previousEntry = s_previousFrameTransforms[previousIndex];
+        if (!previousEntry.predicted) {
+          continue;
+        }
+        {
+          const auto& p = previousEntry.velocity;
+          const auto& v = entry.velocity;
+          const float pp = p[0] * p[0] + p[1] * p[1] + p[2] * p[2], vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+          if (pp > kJoltMinStep * kJoltMinStep && vv > kJoltMinStep * kJoltMinStep) {
+            ++moving;
+            reversed += p[0] * v[0] + p[1] * v[1] + p[2] * v[2] < 0.0f ? 1u : 0u;
+          }
+        }
+        const float fade = previousEntry.glides ? glide_fade(shownFraction) : 0.0f;
+        std::array<float, 3> glide{};
+        bool any = false, snap = false;
+        for (size_t c = 0; c < 3; ++c) {
+          const float overshoot = previousEntry.velocity[c] * shownFraction + previousEntry.glide[c] * fade;
+          const float jump = overshoot - entry.velocity[c];
+          float g = 0.0f;
+          if (std::isfinite(overshoot) && std::isfinite(jump) && overshoot * jump > 0.0f &&
+              std::abs(jump) >= kGlideMin) {
+            g = jump > 0.0f ? std::min(jump, overshoot) : std::max(jump, overshoot);
+          }
+          if (std::abs(g) > kGlideMax) snap = true;
+          if (std::abs(g) < kGlideMin) g = 0.0f;
+          glide[c] = g;
+          any = any || g != 0.0f;
+        }
+        if (snap || !any) {
+          continue;
+        }
+        entry.glide = glide;
+        entry.glides = true;
+        ++glided;
+        for (const float g : glide) largest = std::max(largest, std::abs(g));
+      }
+      if (moving >= kJoltMinDraws && reversed * 2 > moving) {
+        s_diagJoltFrames.fetch_add(1, std::memory_order_relaxed);
+        for (auto& entry : s_currentFrameTransforms) {
+          entry.predicted = false;
+          entry.glides = false;
+        }
+        s_previousSlotDenominator = 1;
+        s_hasInterpolatedFrame.store(false, std::memory_order_release);
+        s_pendingUniformInterpolations.clear();
+        retire_frame_transforms();
+        return;
+      }
+      s_diagPredictHeld.fetch_add(held, std::memory_order_relaxed);
+      s_diagPredictDraws.fetch_add(predicted, std::memory_order_relaxed);
+      if (glided != 0) {
+        s_sealedArrivalGlide.store(true, std::memory_order_release);
+        s_diagGlideDraws.fetch_add(glided, std::memory_order_relaxed);
+        s_diagGlideFrames.fetch_add(1, std::memory_order_relaxed);
+        uint32_t bits = s_diagGlideLargestBits.load(std::memory_order_relaxed);
+        float stored = 0.0f;
+        std::memcpy(&stored, &bits, sizeof stored);
+        if (largest > stored) {
+          std::memcpy(&bits, &largest, sizeof bits);
+          s_diagGlideLargestBits.store(bits, std::memory_order_relaxed);
+        }
+      }
+    }
+
     const auto interpolatePendingUniform = [&](const auto& task) {
       if (task.currentTransformIndex >= s_currentFrameTransforms.size()) {
         return;
@@ -1377,6 +1669,71 @@ void finalize_frame_interpolation() noexcept {
       const auto& current = s_currentFrameTransforms[task.currentTransformIndex].transform;
       std::memcpy(task.uniformData, task.sourceUniformData, task.uniformSize);
       const auto& prepared = preparedTransforms[task.currentTransformIndex];
+      if (predicts) {
+        // Held draws keep the frame's own uniforms (the copy above) in every slot.
+        if (predictHold[task.currentTransformIndex] != 0) {
+          return;
+        }
+        const auto& entry = s_currentFrameTransforms[task.currentTransformIndex];
+        const float t = task.arrival ? 0.0f
+                                     : static_cast<float>(task.numerator) / static_cast<float>(task.denominator);
+        const float glideWeight = entry.glides ? glide_fade(t) : 0.0f;
+        if (task.arrival && glideWeight == 0.0f) {
+          return;
+        }
+        const size_t previousEntryIndex = prepared.previousProjectionEntry;
+        if (!task.arrival && previousEntryIndex < s_previousFrameTransforms.size()) {
+          // The lens carried forward too, unless it changed by more than a tenth (a camera cut or a zoom snap).
+          const auto& previousProjection = s_previousFrameTransforms[previousEntryIndex].transform.projection;
+          bool smooth = true;
+          for (size_t row = 0; row < 4 && smooth; ++row) {
+            for (size_t column = 0; column < 4; ++column) {
+              const float a = previousProjection[row][column], b = current.projection[row][column];
+              if (!(std::abs(b - a) <= 0.1f * std::max(std::abs(a), std::abs(b)) + 1e-6f)) {
+                smooth = false;
+                break;
+              }
+            }
+          }
+          if (smooth) {
+            const auto projection = interpolate_projection(previousProjection, current.projection, 1.0f + t);
+            std::memcpy(task.uniformData + task.projectionOffset, &projection, sizeof(projection));
+          }
+        }
+        const auto predictMatrixSlot = [&](size_t currentIndex, size_t pairOffset) {
+          if (pairOffset == kNoPreparedPair) {
+            return;
+          }
+          Mat3x4<float> position{};
+          if (task.arrival) {
+            position = preparedPairs[pairOffset].current;
+          } else {
+            Mat3x4<float> normal{};
+            evaluate_affine_pair(preparedPairs[pairOffset], 1.0f + t, position);
+            evaluate_affine_pair(preparedPairs[pairOffset + 1], 1.0f + t, normal);
+            std::memcpy(task.uniformData + task.normalOffset + currentIndex * sizeof(Mat3x4<float>), &normal,
+                        sizeof(normal));
+          }
+          if (glideWeight > 0.0f) {
+            add_translation(position, entry.glide, glideWeight);
+          }
+          std::memcpy(task.uniformData + task.positionOffset + currentIndex * sizeof(Mat3x4<float>), &position,
+                      sizeof(position));
+        };
+        if (task.indexedMatrices) {
+          if (!current.indexedMatrices) {
+            return;
+          }
+          for (size_t currentIndex = 0; currentIndex < MaxPnMtx; ++currentIndex) {
+            if ((current.usedMatrixMask & (1u << currentIndex)) != 0) {
+              predictMatrixSlot(currentIndex, prepared.indexedPairOffsets[currentIndex]);
+            }
+          }
+        } else {
+          predictMatrixSlot(task.currentMatrix, prepared.nonIndexedPairOffset);
+        }
+        return;
+      }
       if (task.indexedMatrices && !prepared.indexedValid) {
         return;
       }
@@ -1455,6 +1812,18 @@ void get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnostics& di
   diagnostics.framesReplayUnsafe = s_diagFramesReplayUnsafe.load(std::memory_order_relaxed);
   diagnostics.slotReductions = s_diagSlotReductions.load(std::memory_order_relaxed);
   diagnostics.lateSealDrops = s_diagLateSealDrops.load(std::memory_order_relaxed);
+  diagnostics.mode = s_requestedMode.load(std::memory_order_relaxed);
+  diagnostics.predictDraws = s_diagPredictDraws.load(std::memory_order_relaxed);
+  diagnostics.predictHeld = s_diagPredictHeld.load(std::memory_order_relaxed);
+  diagnostics.glideDraws = s_diagGlideDraws.load(std::memory_order_relaxed);
+  diagnostics.glideFrames = s_diagGlideFrames.load(std::memory_order_relaxed);
+  {
+    const uint32_t bits = s_diagGlideLargestBits.load(std::memory_order_relaxed);
+    std::memcpy(&diagnostics.glideLargest, &bits, sizeof bits);
+  }
+  diagnostics.discontinuousFrames = s_diagDiscontinuousFrames.load(std::memory_order_relaxed);
+  diagnostics.joltFrames = s_diagJoltFrames.load(std::memory_order_relaxed);
+  diagnostics.sealNanos = s_diagSealNanos.load(std::memory_order_relaxed);
 }
 
 bool has_interpolated_frame() noexcept {
@@ -1514,7 +1883,7 @@ void extend_interpolation_draw(uint16_t usedPnMtxMask) noexcept {
   snapshot.usedMatrixMask |= addedSlots;
 }
 
-std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
+std::array<gfx::Range, MaxStagedSamples> record_interpolation_draw(
     const FrameInterpolationDrawIdentity& drawIdentity, const Mat4x4<float>& projection,
     uint16_t usedPnMtxMask, const InterpolatedUniformLayout& uniformLayout) noexcept {
   // Split-screen cameras can draw identical meshes in unrelated view spaces.
@@ -1561,7 +1930,7 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
   const HashType stableIdentity = stable_identity(identity);
   s_currentStableTransformIndices[stableIdentity].push_back(currentTransformIndex);
 
-  std::array<gfx::Range, MaxInterpolatedFrames> interpolatedRanges{};
+  std::array<gfx::Range, MaxStagedSamples> interpolatedRanges{};
   ++s_perspectiveCandidates;
   const auto exactPrevious = s_previousTransformIndices.find(identity.combined);
   const auto stablePrevious = s_previousStableTransformIndices.find(stableIdentity);
@@ -1580,7 +1949,9 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
   // replaying, so staging copies for the resumed suffix would only waste space.
   if (frame_interpolation_replay_safe() && stageInterpolation) {
     const uint32_t sampleCount = s_activeInterpolationSamples.load(std::memory_order_acquire);
-    for (uint32_t sample = 0; sample < sampleCount; ++sample) {
+    // Predict also stages the arrival copy (sample `sampleCount`), used only when the frame glides.
+    const bool arrival = s_frameMode == AURORA_FRAME_INTERPOLATION_PREDICT && sampleCount != 0;
+    for (uint32_t sample = 0; sample < sampleCount + (arrival ? 1u : 0u); ++sample) {
       auto [interpolatedBuffer, interpolatedRange] = gfx::map_uniform(uniformLayout.uniformSize);
       s_pendingUniformInterpolations.push_back({
           .currentTransformIndex = currentTransformIndex,
@@ -1594,6 +1965,7 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
           .numerator = sample + 1,
           .denominator = sampleCount + 1,
           .indexedMatrices = uniformLayout.indexedMatrices,
+          .arrival = sample == sampleCount,
       });
       interpolatedRanges[sample] = interpolatedRange;
     }

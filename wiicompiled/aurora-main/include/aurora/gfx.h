@@ -63,6 +63,27 @@ typedef struct {
   uint64_t framesReplayUnsafe;
   uint64_t slotReductions;
   uint64_t lateSealDrops;
+  // Mode and Predict counters (AURORA_FRAME_INTERPOLATION_PREDICT), since start: draws carried forward and held,
+  // draws and frames that glided back from an overshoot, the largest glide (view-space units), frames shown
+  // without inserted frames because a rollback had just rewritten them.
+  uint32_t mode;
+  uint64_t predictDraws;
+  uint64_t predictHeld;
+  uint64_t glideDraws;
+  uint64_t glideFrames;
+  float glideLargest;
+  uint64_t discontinuousFrames;
+  uint64_t joltFrames;  // frames shown as drawn because the camera jolted (screen shake)
+  // Cost and latency, since start: CPU time of the seal's interpolation work and of encoding every slot, the
+  // frames encoded, presentation jobs dropped for a newer frame, and from a frame being ready to its own image's
+  // present call (sum, count, largest).
+  uint64_t sealNanos;
+  uint64_t encodeNanos;
+  uint64_t encodedFrames;
+  uint64_t supersededJobs;
+  uint64_t frameLatencyNanos;
+  uint64_t frameLatencyCount;
+  uint64_t frameLatencyMaxNanos;
 } AuroraFrameInterpolationDiagnostics;
 
 void aurora_get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnostics* diagnostics);
@@ -70,6 +91,18 @@ void aurora_get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnost
 // Generates transform-interpolated perspective frames between consecutive 60 Hz logical frames.
 // Supported targets are 0 (off), 120, 180 and 240. Guest simulation and VI timing are unchanged.
 void aurora_set_frame_interpolation_fps(uint32_t targetFps);
+// How the inserted frames are made. INTERPOLATE: between the previous and the newest game frame, which is shown
+// after them (most of a frame later). PREDICT: the newest game frame is shown as soon as it is ready and the
+// inserted frames carry each draw forward by its last frame's motion.
+enum { AURORA_FRAME_INTERPOLATION_INTERPOLATE = 0, AURORA_FRAME_INTERPOLATION_PREDICT = 1 };
+void aurora_set_frame_interpolation_mode(uint32_t mode);
+uint32_t aurora_get_frame_interpolation_mode();
+// The frame being recorded follows a rollback (its previous frame was on another timeline).
+void aurora_mark_frame_discontinuous();
+// Like aurora_set_present_schedule, for a producer that presents each frame as soon as it is ready (no retrace to
+// pace to): `readyNanos` is when the frame being sealed was ready, `intervalNanos` the game frame. Interpolate's
+// slots start a short lead after it, Predict shows the frame at once and its inserted frames over the interval.
+void aurora_set_seal_present_schedule(uint64_t readyNanos, uint64_t intervalNanos);
 // While true (a game's loading screens), late frames don't lower the interpolated frame rate.
 void aurora_set_frame_pacing_exempt(bool exempt);
 // NSMBW: V-Sync on (Fifo) or off (Immediate, else Mailbox); off by default.

@@ -42,6 +42,10 @@ extern "C" void Android_UnlockActivityMutex(void);
 
 #include "dolphin/vi/vi_internal.hpp"
 
+namespace aurora {
+void note_display_refresh(float hz) noexcept;  // aurora.cpp: inserted frames keep a refresh apart
+} // namespace aurora
+
 namespace aurora::window {
 namespace {
 Module Log("aurora::window");
@@ -218,6 +222,13 @@ void set_window_icon() noexcept {
   SDL_DestroySurface(iconSurface);
 }
 
+// The refresh rate of the screen the window is on, for the presenter's spacing of inserted frames.
+void update_display_refresh() noexcept {
+  const SDL_DisplayID display = g_window != nullptr ? SDL_GetDisplayForWindow(g_window) : 0;
+  const SDL_DisplayMode* mode = display != 0 ? SDL_GetCurrentDisplayMode(display) : nullptr;
+  note_display_refresh(mode != nullptr ? mode->refresh_rate : 0.0f);
+}
+
 bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
   switch (event->type) {
   case SDL_EVENT_WINDOW_RESIZED:
@@ -270,6 +281,10 @@ void process_event(SDL_Event& event) {
       set_display_mode(get_fullscreen() ? AURORA_DISPLAY_MODE_WINDOWED : AURORA_DISPLAY_MODE_BORDERLESS);
       g_nativeResizePending.store(true, std::memory_order_release);
     }
+    break;
+  case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+  case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+    update_display_refresh();
     break;
   case SDL_EVENT_WINDOW_MOVED: {
     g_events.push_back(AuroraEvent{
@@ -443,6 +458,7 @@ bool create_window(AuroraBackend backend) {
   install_window_proc_hook();
 #endif
   set_window_icon();
+  update_display_refresh();
   return true;
 }
 

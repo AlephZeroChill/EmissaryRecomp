@@ -36,6 +36,7 @@ struct RuntimeUserConfig {
     std::optional<std::string> graphicsApi;
     std::optional<std::string> displayMode;
     std::optional<uint32_t> frameInterpolationFps;
+    std::optional<std::string> frameInterpolationMode;  // [video] frame_interpolation_mode: predict | interpolate
     std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
     std::optional<bool> disableCopyFilter;
@@ -460,6 +461,10 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
             config.frameInterpolationFps = *value;
         }
     }
+    if (auto value = FindConfigValue<std::string>(document, "video", "frame_interpolation_mode");
+        value && (*value == "interpolate" || *value == "predict")) {
+        config.frameInterpolationMode = *value;
+    }
     config.metalFxSpatialUpscaling =
         FindConfigValue<bool>(document, "video", "metalfx_spatial_upscaling");
     config.skipUnreadyPipelines = FindConfigValue<bool>(document, "video", "skip_unready_pipelines");
@@ -699,6 +704,14 @@ inline bool SetFrameInterpolationFps(uint32_t value) {
 inline bool SetMetalFxSpatialUpscaling(bool value) {
     Mutable().metalFxSpatialUpscaling = value;
     return WriteSetting("video", "metalfx_spatial_upscaling", value ? "true" : "false");
+}
+
+inline bool SetFrameInterpolationMode(std::string value) {
+    if (value != "interpolate" && value != "predict") {
+        return false;
+    }
+    Mutable().frameInterpolationMode = value;
+    return WriteSetting("video", "frame_interpolation_mode", FormatString(value));
 }
 
 inline bool SetDisplayMode(std::string value) {
@@ -1029,6 +1042,12 @@ inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
         ok = WriteSetting("controller", keys[i], formatted.str()) && ok;
     }
     return ok;
+}
+
+// How frame interpolation makes its frames: true = predict (ahead of the newest game frame), false = interpolate.
+inline bool FrameInterpolationPredict(bool fallback = true) {
+    const auto& mode = Get().frameInterpolationMode;
+    return mode ? *mode == "predict" : fallback;
 }
 
 // Target frame rate for frame interpolation, or 0 to disable it.

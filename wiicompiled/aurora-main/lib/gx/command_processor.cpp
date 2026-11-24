@@ -3026,7 +3026,7 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
   const auto& info = resolve_pipeline_state(prim, fmt).shaderInfo;
   demand[1] = gfx::staging_uniform_bytes(info.uniformSize);
   if (frame_interpolation_identity_needed() && frame_interpolation_replay_safe())
-    demand[1] *= 1 + MaxInterpolatedFrames;
+    demand[1] *= 1 + MaxStagedSamples;
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
     if ((g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16) &&
         g_gxState.arrays[i].cachedRange.size == 0)

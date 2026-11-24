@@ -12,6 +12,7 @@
 #include "display_settings.h"
 #include "frame_input.h"
 #include "guest_code_patch.h"
+#include "hle_stubs.h"
 #include "memory.h"
 #include "settings_overlay.h"
 #include "aurora_events.h"
@@ -163,7 +164,12 @@ void DumpGuestCpu() {
 }
 
 uint64_t TimeBase() { return DetClock::Now(); }
-void SetResimulating(bool active) { DetClock::SetRollbackResimulating(active); }
+void SetResimulating(bool active) {
+    static bool s_active = false;
+    if (s_active && !active) VI_HLE_NoteRollback();
+    s_active = active;
+    DetClock::SetRollbackResimulating(active);
+}
 void ResetPacing() { DetClock::ResetPacing(); }
 void SetSpeed(double factor) { DetClock::SetSpeed(factor); }
 void AdvancePacing(int64_t ns) { DetClock::AdvanceSchedule(std::chrono::nanoseconds(ns)); }

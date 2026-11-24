@@ -9,7 +9,7 @@ struct DrawData {
   gfx::Range vertRange;
   gfx::Range idxRange;
   gfx::Range uniformRange;
-  std::array<gfx::Range, MaxInterpolatedFrames> interpolatedUniformRanges;
+  std::array<gfx::Range, MaxStagedSamples> interpolatedUniformRanges;
   uint32_t vtxCount;
   uint32_t indexCount;
   uint32_t instanceCount;

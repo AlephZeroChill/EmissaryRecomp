@@ -88,6 +88,19 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
                         LimitResolutionForFrameRate();
                         if (aurora_get_display_mode() == AURORA_DISPLAY_MODE_EXCLUSIVE) aurora_set_display_mode(AURORA_DISPLAY_MODE_EXCLUSIVE);
                     }});
+    // How the frames above 60 are made, only when there are any. Predict first: it is the recommended one (and the
+    // default until a player picks), since interpolating costs a frame of delay.
+    if (IsHighFrameRateMode()) {
+        rows.push_back({"Frame interpolation", g_framePredict ? "PREDICT" : "INTERPOLATE",
+                        g_framePredict ? "Recommended. Adds no delay; may glitch briefly during fast motion."
+                                       : "More accurate in-between frames. Adds 1 frame of input delay.",
+                        [](int) {
+                            g_framePredict = !g_framePredict;
+                            aurora_set_frame_interpolation_mode(g_framePredict ? AURORA_FRAME_INTERPOLATION_PREDICT
+                                                                               : AURORA_FRAME_INTERPOLATION_INTERPOLATE);
+                            RuntimeConfigFile::SetFrameInterpolationMode(g_framePredict ? "predict" : "interpolate");
+                        }});
+    }
     rows.push_back({"V-Sync", OnOff(g_vsync.load()), "No screen tearing; the game follows your screen's refresh.", [](int) {
                         const bool on = !g_vsync.load();
                         SetVSync(on);
@@ -645,24 +658,32 @@ bool TransitionOrInfo(const std::string& scene) {
 // Tests: BRAWL_OPTIONS_TAB=<n> opens the options menu on tab n once the game is up; BRAWL_STATE_TEST=1 saves 5 s
 // into the first match, then loads it at 9 s and 14 s.
 void RunTestHooks(const std::string& scene, double sceneSeconds) {
-    // A list ("3,5,6") shows each tab for 4 s.
+    // A list ("3,5,6") shows each tab for 4 s; "1:9" is tab 1 with its row 9 picked (the list scrolls to it).
     static const char* tabs = std::getenv("BRAWL_OPTIONS_TAB");
     static double openedAt = -1;
+    static size_t shown = SIZE_MAX;
     if (tabs != nullptr && !StartupScreenVisible() && scene == "muMenuMain") {
         if (openedAt < 0) openedAt = ImGui::GetTime();
-        std::vector<int> list;
+        std::vector<std::pair<int, int>> list;
         for (const char* p = tabs; *p != '\0';) {
-            list.push_back(std::atoi(p));
-            while (*p != '\0' && *p != ',') ++p;
+            const int tab = std::atoi(p);
+            while (*p != '\0' && *p != ',' && *p != ':') ++p;
+            int row = 0;
+            if (*p == ':') {
+                row = std::atoi(++p);
+                while (*p != '\0' && *p != ',') ++p;
+            }
+            list.emplace_back(tab, row);
             if (*p == ',') ++p;
         }
         const size_t i = static_cast<size_t>((ImGui::GetTime() - openedAt) / 4.0);
-        if (i < list.size() && g_menu.tab != list[i]) {
-            g_menu.tab = std::clamp(list[i], 0, kTabCount - 1);
+        if (i < list.size() && i != shown) {
+            shown = i;
+            g_menu.tab = std::clamp(list[i].first, 0, kTabCount - 1);
             g_menu.inRows = true;
-            g_menu.row = 0;
+            g_menu.row = list[i].second;
             SetTopBarVisible(true);
-            RT_LOGF(RT_TAG_RUNTIME, "[options test] tab %d\n", g_menu.tab);
+            RT_LOGF(RT_TAG_RUNTIME, "[options test] tab %d row %d\n", g_menu.tab, g_menu.row);
         }
     }
     static const bool stateTest = std::getenv("BRAWL_STATE_TEST") != nullptr;
