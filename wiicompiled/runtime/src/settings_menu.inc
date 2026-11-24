@@ -76,7 +76,7 @@ void GraphicsRows(std::vector<MenuRow>& rows) {
     const DisplaySettings::Settings display = DisplaySettings::Latest();
     int aspect = 0;
     for (size_t i = 0; i < kAspects.size(); ++i) if (kAspects[i].mode == display.aspect) aspect = static_cast<int>(i);
-    const bool restart = (display.aspect != DisplaySettings::kAspect4x3) != DisplaySettings::GameWidescreen();
+    const bool restart = DisplaySettings::AspectNeedsRestart(display.aspect);
     rows.push_back({"Aspect ratio", kAspects[static_cast<size_t>(aspect)].label,
                     restart ? "Switching between 4:3 and widescreen takes effect after a restart."
                             : "Fill Window uses the whole screen, ultrawide included (up to 32:9): more of the stage to the sides, the HUD kept in the middle 16:9, never stretched.",
@@ -435,21 +435,47 @@ void SystemRows(std::vector<MenuRow>& rows) {
                     [](int step) { if (step == 0) NetplayStart::RestartGame(); }});
 }
 
+// Brawl Online's build plays Project+ online only, started and updated by Brawl Online's launcher: no recomp netplay
+// (Online), no fast-forward, fast menus or save states (Gameplay), no cheats or mod builds (they would differ from the
+// other player's game), no updater or restart of its own (System: a restart is a new process the launcher doesn't know,
+// started without the core's stop). The mod support underneath stays; only its menus are left out.
+bool TabShown(int tab) {
+#if MKW_BRAWL_ONLINE_CORE
+    return tab == kTabResume || tab == kTabGraphics || tab == kTabAudio || tab == kTabControls || tab == kTabQuit;
+#else
+    (void)tab;
+    return true;
+#endif
+}
+
+// The next tab shown, from `tab` in `step`'s direction (+1 / -1).
+int StepTab(int tab, int step) {
+    for (int i = 0; i < kTabCount; ++i) {
+        tab = (tab + step + kTabCount) % kTabCount;
+        if (TabShown(tab)) break;
+    }
+    return tab;
+}
+
 std::vector<MenuRow> TabRows(int tab) {
     std::vector<MenuRow> rows;
     switch (tab) {
     case kTabGraphics: GraphicsRows(rows); break;
     case kTabAudio: AudioRows(rows); break;
     case kTabControls: ControlsRows(rows); break;
+#if !MKW_BRAWL_ONLINE_CORE
     case kTabGameplay: GameplayRows(rows); break;
     case kTabCheats: CheatRows(rows); break;
     case kTabMods: ModRows(rows); break;
     case kTabSystem: SystemRows(rows); break;
+#endif
     default: break;
     }
+#if !MKW_BRAWL_ONLINE_CORE
     if (g_menu.restartNeeded && (tab == kTabMods || tab == kTabControls || tab == kTabGraphics))
         rows.push_back({"Restart now", "RESTART", "Some changes here take effect after a restart.",
                         [](int step) { if (step == 0) NetplayStart::RestartGame(); }});
+#endif
     return rows;
 }
 
@@ -518,9 +544,11 @@ void DrawOptionsMenu() {
         MK::SmashBall(c, 380, 194, 56, c.t * 0.35f);
 
         // Tabs.
+        if (!TabShown(g_menu.tab)) g_menu.tab = kTabGraphics;
         int tabFocus = g_menu.inRows ? -1 : g_menu.tab;
-        for (int i = 0; i < kTabCount; ++i) {
-            const float y = 146 - i * 37.0f;
+        for (int i = 0, shown = 0; i < kTabCount; ++i) {
+            if (!TabShown(i)) continue;
+            const float y = 146 - shown++ * 37.0f;
             const uint32_t color = i == kTabQuit ? MK::kPlayer[0] : i == g_menu.tab ? 0x3A4670FFu : 0x232A42FFu;
             const std::string label = i == kTabQuit && g_menu.quitArmed ? "QUIT? PRESS AGAIN" : kTabNames[i];
             int focus = tabFocus;
@@ -579,8 +607,8 @@ void DrawOptionsMenu() {
 
         // Navigation.
         if (!g_menu.inRows) {
-            if (nav.up) g_menu.tab = (g_menu.tab + kTabCount - 1) % kTabCount, g_menu.quitArmed = false;
-            if (nav.down) g_menu.tab = (g_menu.tab + 1) % kTabCount, g_menu.quitArmed = false;
+            if (nav.up) g_menu.tab = StepTab(g_menu.tab, -1), g_menu.quitArmed = false;
+            if (nav.down) g_menu.tab = StepTab(g_menu.tab, 1), g_menu.quitArmed = false;
             if (nav.confirm || nav.right) {
                 if (g_menu.tab == kTabResume) SetTopBarVisible(false);
                 else if (g_menu.tab == kTabOnline) { OnlineMenu::SetOpen(true); SetTopBarVisible(false); }
@@ -752,6 +780,7 @@ void UpdateGameSpeed() {
     }
     RunTestHooks(scene, ImGui::GetTime() - sceneStart);
     // #26: a new release is announced once, past the title card (the check runs in the background).
+#if !MKW_BRAWL_ONLINE_CORE  // Brawl Online's launcher updates its build
     static bool updateTold = false;
     if (!updateTold && !StartupScreenVisible()) {
         if (const std::string newer = Updates::Available(); !newer.empty()) {
@@ -760,6 +789,7 @@ void UpdateGameSpeed() {
             g_noticeFrames = 60 * 10;
         }
     }
+#endif
     // Loading and scene changes run long frames by nature: they don't count against the frame rate (aurora's pacing).
     // Menus count neither: the stage select reads the saved custom stages as it opens, a one-time hitch that should cost
     // its own frames only, not seconds at 60.
@@ -767,8 +797,10 @@ void UpdateGameSpeed() {
                       scene == "scMemoryChange" || scene.empty();
     aurora_set_frame_pacing_exempt(StartupScreenVisible() || TransitionOrInfo(scene) || menu);
     int speed = 1;
+#if !MKW_BRAWL_ONLINE_CORE  // Brawl Online's build: the game runs at its own speed, always (no fast-forward or fast menus)
     if (NetplaySession::Active()) speed = 1;
     else if (g_fastForward.load()) speed = RuntimeConfigFile::FastForwardSpeed();
     else if (RuntimeConfigFile::FastMenus() && TransitionOrInfo(scene)) speed = 3;
+#endif
     g_gameSpeed.store(speed, std::memory_order_relaxed);
 }

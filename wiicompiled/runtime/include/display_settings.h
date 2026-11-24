@@ -42,6 +42,9 @@ Settings Current();
 Settings Latest();
 // What SCGetAspectRatio reports for the whole run.
 bool GameWidescreen();
+// Picking this aspect now shows it only after a restart (4:3 versus widescreen against the aspect the game booted
+// in). Never with Brawl Online's core: the game always boots widescreen there, and a 4:3 picture is the plugin's.
+bool AspectNeedsRestart(int32_t aspect);
 // The window (or screen) is wider than 16:9, so Fill shows more of the game than 16:9 does.
 bool SurfaceWide();
 // The width over height the picture is shown at (Brawl Online's core: the game draws for it, the plugin rescaling

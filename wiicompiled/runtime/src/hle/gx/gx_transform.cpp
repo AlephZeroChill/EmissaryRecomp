@@ -36,6 +36,67 @@ namespace {
         std::memcpy(g_projectionVector, projV, sizeof(g_projectionVector));
     }
 
+    // The SDK keeps the projection and the viewport in __GXData and sends the projection to XF with the next
+    // primitive; code between the set and the draw can change it there, and that is what is drawn. Brawl Online's
+    // plugin draws for this machine's screen shape exactly that way (brawlonline.net docs/game-code.md, "Any screen
+    // shape"): right after the two camera functions it scales the six numbers in the GX state (only for a viewport
+    // the size of the picture, read there too), and around a HUD model's draw it moves them. The HLE sent the
+    // projection to Aurora at once and kept neither in the GX state, so none of that reached the picture: a 4:3 or
+    // a 21:9 picture showed the game's 16:9 drawing squeezed or stretched into it, the menus' circles as ovals. Now
+    // both are kept in the GX state as the SDK keeps them, and before each draw (GX_HLE_SyncGuestProjection: GXBegin,
+    // display lists, FIFO writes) the GX state's projection goes to Aurora when it is not the one Aurora has.
+    constexpr uint32_t kGxProjectionKind = 0x528;  // 0 perspective, 1 orthographic; then the six numbers at +0x52C:
+                                                   // {m00, m02 or m03, m11, m12 or m13, m22, m23}
+    constexpr uint32_t kGxProjectionBytes = 28;
+    constexpr uint32_t kGxViewport = 0x544;  // left, top, width, height, near, far
+    uint8_t g_sentProjection[kGxProjectionBytes];  // the GX state's projection bytes (big-endian) that Aurora has
+    bool g_sentProjectionValid = false;            // game thread
+
+    // GXSetProjection(v)'s numbers into the GX state, as the SDK writes them; they are then what Aurora has.
+    static void KeepProjectionInGuest(GXProjectionType type, const float six[6]) {
+        try {
+            const uint32_t gd = Memory::Read32(kGXDataPtrAddr);
+            if (gd == 0) return;
+            // Through Memory's writes, which keep the snapshots' dirty marks; the bytes are then read back as sent.
+            Memory::Write32(gd + kGxProjectionKind, type == GX_ORTHOGRAPHIC ? 1u : 0u);
+            for (int i = 0; i < 6; ++i) Memory::WriteFloat32(gd + kGxProjectionKind + 4 + 4 * i, six[i]);
+            const uint8_t* state = Memory::GetPointer(gd + kGxProjectionKind, kGxProjectionBytes);
+            if (state == nullptr) return;
+            std::memcpy(g_sentProjection, state, kGxProjectionBytes);
+            g_sentProjectionValid = true;
+        } catch (...) {
+        }
+    }
+
+    static void KeepViewportInGuest(float l, float t, float w, float h, float nz, float fz) {
+        try {
+            const uint32_t gd = Memory::Read32(kGXDataPtrAddr);
+            if (gd == 0) return;
+            const float vp[6] = {l, t, w, h, nz, fz};
+            for (int i = 0; i < 6; ++i) Memory::WriteFloat32(gd + kGxViewport + 4 * i, vp[i]);
+        } catch (...) {
+        }
+    }
+
+}
+
+extern "C" void GX_HLE_SyncGuestProjection() {
+    // The game thread only: the draw worker replays draws the game thread deferred, after it synced for them, and
+    // leaves guest memory alone (gx_texture.cpp).
+    if (!g_sentProjectionValid || t_gxDrawWorker) return;
+    try {
+        const uint32_t gd = Memory::Read32(kGXDataPtrAddr);
+        if (gd == 0) return;
+        const uint8_t* state = Memory::GetPointer(gd + kGxProjectionKind, kGxProjectionBytes);
+        if (state == nullptr || std::memcmp(state, g_sentProjection, kGxProjectionBytes) == 0) return;
+        std::memcpy(g_sentProjection, state, kGxProjectionBytes);
+        float v[7];
+        v[0] = BigEndian::Read32(state) != 0 ? 1.0f : 0.0f;
+        for (int i = 0; i < 6; ++i) v[1 + i] = BigEndian::ReadFloat32(state + 4 + 4 * i);
+        GXSetProjectionv(v);
+        UpdateProjectionVectorFromProjV(v);
+    } catch (...) {
+    }
 }
 
 // ============================================================================
@@ -47,12 +108,14 @@ namespace {
 // transform double-transformed menu viewports and broke 640x480 overscan, so it was removed.
 extern "C" void GX__SetViewportJitter_HLE(float l, float t, float w, float h, float nz, float fz, uint32_t f) {
     g_viewportState[0]=l; g_viewportState[1]=t; g_viewportState[2]=w; g_viewportState[3]=h; g_viewportState[4]=nz; g_viewportState[5]=fz;
+    KeepViewportInGuest(l, f == 0 ? t - 0.5f : t, w, h, nz, fz);  // the SDK keeps the even field's top half a line up
     GXSetViewportJitter(l, t, w, h, nz, fz, f);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F5448, GX__SetViewportJitter_HLE, (float l, float t, float w, float h, float nz, float fz, uint32_t f), (l, t, w, h, nz, fz, f));
 
 extern "C" void GX__SetViewport_HLE(float l, float t, float w, float h, float nz, float fz) {
     g_viewportState[0]=l; g_viewportState[1]=t; g_viewportState[2]=w; g_viewportState[3]=h; g_viewportState[4]=nz; g_viewportState[5]=fz;
+    KeepViewportInGuest(l, t, w, h, nz, fz);
     GXSetViewport(l, t, w, h, nz, fz);
 }
 PPC_NATIVE_OVERRIDE_VOID(801f5484, GX__SetViewport_HLE, (float l, float t, float w, float h, float nz, float fz), (l, t, w, h, nz, fz));
@@ -155,6 +218,7 @@ extern "C" void GX__SetProjection_HLE(uint32_t ma, uint32_t pt) {
     }
     GXSetProjection(m, (GXProjectionType)pt);
     UpdateProjectionVectorFromMatrix(m, (GXProjectionType)pt);
+    KeepProjectionInGuest((GXProjectionType)pt, g_projectionVector + 1);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F50EC, GX__SetProjection_HLE, (uint32_t ma, uint32_t pt), (ma, pt));
 
@@ -207,10 +271,12 @@ extern "C" void GX__SetProjectionv_HLE(uint32_t pa) {
     if (SpmDumpFrame()) RT_LOGF(RT_TAG_GX, "[drawdump] setprojv type %d %.4f %.4f %.4f %.4f %.4f %.4f\n", pt == GX_ORTHOGRAPHIC ? 1 : 0, v[1], v[2], v[3], v[4], v[5], v[6]);
     GXSetProjection(m, pt);
     UpdateProjectionVectorFromProjV(v);
+    KeepProjectionInGuest(pt, v + 1);
 }
 PPC_NATIVE_OVERRIDE_VOID(801F5150, GX__SetProjectionv_HLE, (uint32_t pa), (pa));
 
 extern "C" void GX__GetProjectionv_HLE(uint32_t pa) {
+    GX_HLE_SyncGuestProjection();  // the SDK reads the GX state's: what was changed there since the set too
     uint8_t* out = static_cast<uint8_t*>(GuestToHostPtr(pa, 28));
     for (int i = 0; i < 7; ++i) {
         BigEndian::WriteFloat32(out + i * sizeof(float), g_projectionVector[i]);

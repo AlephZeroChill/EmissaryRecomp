@@ -204,6 +204,12 @@ uint64_t g_presentedFrame = 0;
 std::atomic_bool g_strapInputAccepted = false;
 std::atomic_uint64_t g_startupDismissFrame = UINT64_MAX;
 constexpr uint64_t kStrapTransitionCoverFrames = 60;
+// Brawl Online's build lifts the title card by itself (UpdateBootShaderState): it never asks for a press.
+#if MKW_BRAWL_ONLINE_CORE
+constexpr bool kStartsByItself = true;
+#else
+constexpr bool kStartsByItself = false;
+#endif
 std::atomic_bool g_bootShadersReady = false;
 bool g_bootShaderNotice = false;
 Clock::time_point g_bootShaderWaitStart{};
@@ -1483,7 +1489,15 @@ void DrawStartupScreen() {
         char shaderLine[96] = {};
         if (!g_busyLabel.empty()) {
             std::snprintf(shaderLine, sizeof(shaderLine), "%s", g_busyLabel.c_str());
-        } else if (g_bootShaderNotice && !g_bootShadersReady.load(std::memory_order_relaxed)) {
+        } else if (!g_bootShadersReady.load(std::memory_order_relaxed) &&
+#if MKW_BRAWL_ONLINE_CORE
+                   // Brawl Online's build starts by itself once the boot shaders are ready (UpdateBootShaderState):
+                   // the card says what it waits for, from the first one, instead of asking for a press.
+                   aurora_get_queued_pipeline_count() > 0
+#else
+                   g_bootShaderNotice
+#endif
+        ) {
             std::snprintf(shaderLine, sizeof(shaderLine), "Compiling shaders... %u to go",
                           aurora_get_queued_pipeline_count());
         }
@@ -1619,7 +1633,7 @@ void DrawStartupScreen() {
                 const auto u = GameLayout::Utf16(shaderLine);
                 GameLayout::DrawText(list, view, small, u, 0.0f, by - 26.0f + bob, Fit(small, u, 15.0f), 0xD6D9E4FFu,
                                      0xD6D9E4FFu, 1.0f, 1, 1);
-            } else {
+            } else if (!kStartsByItself) {
                 // Press start: A on a GameCube controller (any gamepad's bottom face button), Enter on the keyboard
                 // pad, A or 2 on a Wii Remote (frame_input.cpp lifts the cover).
                 const float pop = 1.0f + 0.06f * std::sin(t * 5.0f), py = cardY - 82.0f + bob;
@@ -1827,7 +1841,7 @@ void DrawTopBar() {
             }
         }
         // The game reads 4:3 versus widescreen once, at boot.
-        if ((display.aspect != DisplaySettings::kAspect4x3) != DisplaySettings::GameWidescreen()) {
+        if (DisplaySettings::AspectNeedsRestart(display.aspect)) {
             ImGui::Separator();
             ImGui::TextDisabled("Switching between 4:3 and widescreen takes effect after a restart.");
         }

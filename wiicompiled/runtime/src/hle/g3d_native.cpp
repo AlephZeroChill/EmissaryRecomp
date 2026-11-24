@@ -52,6 +52,7 @@ extern "C" __attribute__((visibility("hidden"))) MkwNativeHookFn g_mkwNativeHook
 // GX HLE entry points (hle/gx): what the translated nw4r code reaches.
 extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes);
 extern "C" void GX__CallDisplayList_HLE(uint32_t listAddr, uint32_t nbytes);
+extern "C" void GX_HLE_SyncGuestProjection();  // gx_transform.cpp
 // Their shortcuts for this path's own calls (G3D_NATIVE_FAST, default on): the same effects, less parsing and probing.
 extern "C" void GX_HLE_FIFO_WritePackets_G3D(const uint8_t* data, uint32_t sizeBytes);  // gx_fifo.cpp
 extern "C" void GX__CallRegisterDisplayList_G3D(uint32_t listAddr, uint32_t nbytes);     // gx_dl.cpp
@@ -1980,6 +1981,9 @@ uint32_t s_sceneChangesSeen = 0;
 std::atomic<bool> s_drawSuppressed{false};  // SetDrawSuppressed
 
 bool DrawResMdlDirectlyHook(CpuContext* ctx) {
+    // The projection the model is drawn with: what code (Brawl Online's plugin, around a HUD model's draw) left in the
+    // GX state since GXSetProjection, before the draw is recorded or deferred to the worker (gx_transform.cpp).
+    GX_HLE_SyncGuestProjection();
     if (const uint32_t n = s_sceneChanges.load(std::memory_order_relaxed); n != s_sceneChangesSeen) {
         s_sceneChangesSeen = n;
         s_models.clear();

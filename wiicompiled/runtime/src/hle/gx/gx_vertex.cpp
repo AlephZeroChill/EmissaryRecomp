@@ -415,6 +415,7 @@ static void SpmDumpBegin(uint32_t t, uint32_t vf, uint32_t nv) {
 }
 
 extern "C" void GX__Begin_HLE(uint32_t t, uint32_t vf, uint32_t nv) {
+    GX_HLE_SyncGuestProjection();
     // The vertex-state carry, here and not only in the thunk: also reached directly (native_cpu_calls.inc:
     // InvokeDirectCpu calls this by name). Without it a text quad (ms::CharWriter::PrintGlyph) began with a deferred
     // model's descriptors (a crash; an earlier take-back at a fog/Z-mode call used to hide it). No take-back
