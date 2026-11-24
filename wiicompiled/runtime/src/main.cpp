@@ -146,8 +146,14 @@ void ConfigureWindowsFatalDialogBehavior() {
 // A busy PC (browsers, launchers, sync and antivirus tools) delays the game's threads when they wake
 // for a frame, which shows as dropped frames at 60. Run above normal priority, and opt out of
 // Windows' power throttling (EcoQoS), which can slow the process down and coarsen its timers.
+// A process started below normal on purpose (Brawl Online's test harness runs every game that way,
+// so none starves the others or the servers) keeps that: raised above the Dolphins it plays against,
+// the recomp's waits for their inputs starved them on a busy PC.
 void RaiseWindowsProcessPriority() {
-    if (!::SetPriorityClass(::GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
+    const DWORD started = ::GetPriorityClass(::GetCurrentProcess());
+    if (started == BELOW_NORMAL_PRIORITY_CLASS || started == IDLE_PRIORITY_CLASS) {
+        RT_LOG(RT_TAG_RUNTIME) << "started below normal priority: kept" << std::endl;
+    } else if (!::SetPriorityClass(::GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
         RT_LOG(RT_TAG_RUNTIME) << "SetPriorityClass failed: " << ::GetLastError() << std::endl;
     }
     struct PowerThrottlingState {
