@@ -1,16 +1,19 @@
 # EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines and the Linux
-# program, the downloads EmissaryRecomp-<tag>-Windows.zip / -Linux.tar.gz, manifest.json and SHA256SUMS, published
-# as the GitHub release <tag> (a tag with a suffix, v0.7.0-rc.1, is a prerelease: never /releases/latest, so no
-# launcher installs it by itself).
+# program, built on GitHub's own runners; the downloads EmissaryRecomp-<tag>-Windows.zip / -Linux.tar.gz,
+# manifest.json and SHA256SUMS, published as the GitHub release <tag>. A tag with a suffix (v0.7.0-rc.1) is a
+# prerelease; a release is published without becoming /releases/latest (what launchers install) until a maintainer
+# makes it so (gh release edit <tag> --latest).
 #
-# Runs only when a maintainer starts it: a pushed version tag (pushing tags needs write access) or a manual run
-# (Actions > Release > Run workflow, also write access). Never on pull_request or pull_request_target: the job runs on
-# a self-hosted runner, and a fork's code must never run there.
+# Runs only when a maintainer starts it: a pushed version tag or Actions > Release > Run workflow (both need write
+# access). Never on pull_request or pull_request_target: these jobs decrypt the game's code.
 #
-# The runner (docs/releases.md, "The release runner"): a Windows PC with the labels self-hosted, Windows, X64 and
-# emissary-release; Python 3.12, Git, PowerShell, gh; the WSL distro EmissaryRecomp-Build (Ubuntu 24.04,
-# tools/linux-build-deps.sh); and an extracted disc, whose DATA folder is in the runner's environment as EMISSARY_GAME
-# (the runner's .env file). The disc never leaves that PC: only the built program is uploaded.
+# Only in a repository set up for it (docs/releases.md, "CI"), elsewhere every job is skipped:
+#   variable EMISSARY_GAME_REPO   the private repository (owner/name) holding game-code.tar.gz.gpg
+#                                 (tools/ci/game_code.py pack)
+#   environment release (deployments from the release branch and v* tags only), with the secrets
+#     EMISSARY_GAME_KEY           the key game-code.tar.gz.gpg (and the build caches) are encrypted with
+#     EMISSARY_GAME_DEPLOY_KEY    the private half of EMISSARY_GAME_REPO's read-only deploy key (SSH)
+#   variable EMISSARY_BUILD_CACHE off: build from scratch every time (no cache kept)
 name: Release
 
 on:
@@ -23,53 +26,208 @@ on:
         required: false
         default: ''
       publish:
-        description: 'Publish the GitHub release (off: build and keep the files as a workflow artifact)'
+        description: 'Publish the GitHub release (off: keep the files as a workflow artifact for 7 days)'
         type: boolean
         default: false
 
 permissions:
-  contents: write  # gh release create
+  contents: read
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  PYTHONUNBUFFERED: '1'
+
 jobs:
-  release:
-    # Only in this repository: forks have no such runner, and a fork's copy must not wait for one forever.
-    if: github.repository == 'kalomaze/EmissaryRecomp'
-    runs-on: [self-hosted, Windows, X64, emissary-release]
-    timeout-minutes: 600
-    env:
-      PYTHONUNBUFFERED: '1'
+  build:
+    if: vars.EMISSARY_GAME_REPO != ''
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-24.04
+          - name: windows
+            os: windows-2025
+          - name: windows-v2
+            os: windows-2025
+            old-cpu: true
+    runs-on: ${{ matrix.os }}
+    environment: release
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
     steps:
-      # The runner keeps its workspace: build/ (two engine builds, the fetched core), toolchain/ and
-      # wiicompiled/Dependencies are ignored files that make the next release incremental instead of hours. Untracked
-      # files that are not ignored are removed, since the build copies every one it finds (tools/build.py).
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          clean: false
           persist-credentials: false
-      - name: Remove untracked files (keeping the ignored build folders)
-        run: git clean -ffd
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Release
+      - name: Release tag
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]]; then tag=$GITHUB_REF_NAME
+          else tag="v$(tr -d '\r\n ' < VERSION)${PRERELEASE:+-$PRERELEASE}"; fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "Building $tag from $GITHUB_SHA"
+          df -h . || true
+
+      # The game's code: decrypted into the runner's temporary folder for this job, deleted at its end.
+      - name: The game's code
+        env:
+          DEPLOY_KEY: ${{ secrets.EMISSARY_GAME_DEPLOY_KEY }}
+          EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
+          GAME_REPO: ${{ vars.EMISSARY_GAME_REPO }}
+        run: |
+          ssh_dir="$RUNNER_TEMP/game-ssh"
+          mkdir -p "$ssh_dir"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key" && chmod 600 "$ssh_dir/key"
+          # GitHub's own host key (https://api.github.com/meta), not whatever answers.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$ssh_dir/known_hosts"
+          GIT_SSH_COMMAND="ssh -i '$ssh_dir/key' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$ssh_dir/known_hosts'" \
+            git clone -q --depth 1 "git@github.com:$GAME_REPO.git" "$RUNNER_TEMP/encrypted"
+          python tools/ci/game_code.py unpack --in "$RUNNER_TEMP/encrypted/game-code.tar.gz.gpg" --out "$RUNNER_TEMP/game/DATA"
+          python -c "import os, shutil; [shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'], d), ignore_errors=True) for d in ('encrypted', 'game-ssh')]"
+          echo "EMISSARY_GAME=$RUNNER_TEMP/game/DATA" >> "$GITHUB_ENV"
+
+      # Builds are incremental between runs: the last build folder (translated code, objects; encrypted with the same
+      # key, since it is the game's code too), restored at the same path, so only what changed is built again. A
+      # cache saved by a run on the default branch is what tag runs and other branches start from.
+      - name: Restore the build cache
+        id: cache
+        if: vars.EMISSARY_BUILD_CACHE != 'off'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
+          key: build-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: build-${{ matrix.name }}-
+      - name: Unpack the build cache
+        if: steps.cache.outputs.cache-matched-key != ''
+        env:
+          EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
+        run: |
+          python tools/ci/game_code.py cache-restore --in "$RUNNER_TEMP/cache/build-${{ matrix.name }}.tar.gz.gpg" --dir build
+          rm -f "$RUNNER_TEMP/cache/build-${{ matrix.name }}.tar.gz.gpg"
+
+      - name: Windows toolchain
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain
+            wiicompiled/Dependencies
+          key: toolchain-${{ hashFiles('wiicompiled/Launcher/Prepare-PortableTools.ps1', 'wiicompiled/Launcher/Prepare-Dependencies.ps1') }}
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo bash tools/linux-build-deps.sh
+          EMISSARY_RELEASE_IN_PLACE=1 EMISSARY_RELEASE_WORK="$PWD/build/ci" \
+            bash tools/release-linux.sh "$PWD" "$EMISSARY_GAME" "$PWD/out/linux-native" 4 "$TAG" "$GITHUB_SHA"
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
+        run: |
+          $old = @(if ('${{ matrix.old-cpu }}' -eq 'true') { '-OldCpu' })
+          & ./tools/build-brawl.ps1 -NoPlay -BrawlOnline lock -ReleaseVersion $env:TAG -Game $env:EMISSARY_GAME -Jobs 4 @old
+          if ($LASTEXITCODE -ne 0) { throw "build-brawl.ps1 failed ($LASTEXITCODE)" }
+
+      - name: Remove the game's code
+        if: always()
+        run: python -c "import os, shutil; shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'], 'game'), ignore_errors=True)"
+
+      - name: Save the build cache
+        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        env:
+          EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
+        run: |
+          # Not the .NET SDK and the downloads (fetched again in a minute), only what took long to make.
+          skip=()
+          while IFS= read -r d; do skip+=(--skip "${d#build/}"); done < <(find build -maxdepth 3 -type d \
+            \( -name dotnet -o -name downloads -o -name nuget -o -name dotnet-home \) -prune)
+          python tools/ci/game_code.py cache-save --dir build --out "$RUNNER_TEMP/cache/build-${{ matrix.name }}.tar.gz.gpg" "${skip[@]}"
+      - name: Upload the build cache
+        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
+          key: build-${{ matrix.name }}-${{ github.run_id }}
+
+      # The program only (what the release holds), for the package job.
+      - name: Keep the program (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/linux-native/
+          retention-days: 3
+      - name: Keep the program (Windows)
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          # Rooted at the checkout: build/release/native/... and the dependencies' license files.
+          path: |
+            build/release/native/WiiCompiled.exe
+            build/release/native/*.dll
+            build/release/native/dsp_coef.bin
+            build/release/native/wii_bootstrap/
+            build/release/native/Sys/
+            wiicompiled/Dependencies/*/LICENSE*
+            wiicompiled/Dependencies/*/LICENCE*
+            wiicompiled/Dependencies/*/COPYING*
+            wiicompiled/Dependencies/*/NOTICE*
+          retention-days: 3
+      - name: Keep the program (Windows, older CPUs)
+        if: matrix.name == 'windows-v2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-v2
+          path: build/release-v2/native/engine_usa_v2.dll
+          retention-days: 3
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # gh release create
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-v2
+          path: build/release-v2/native
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist/release/linux-native
+      - name: Package (and publish)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           PRERELEASE: ${{ inputs.prerelease }}
           PUBLISH: ${{ github.ref_type == 'tag' || inputs.publish }}
         run: |
-          if (-not $env:EMISSARY_GAME) { throw 'EMISSARY_GAME (the extracted disc) is not set on this runner' }
-          $release = @('tools/release.py', '--game', $env:EMISSARY_GAME, '--out', 'dist/release')
-          if ($env:TAG) { $release += @('--tag', $env:TAG) }
-          elseif ($env:PRERELEASE) { $release += @('--prerelease', $env:PRERELEASE) }
-          if ($env:PUBLISH -eq 'true') { $release += '--publish' }
-          python @release
-          if ($LASTEXITCODE -ne 0) { throw "release.py failed ($LASTEXITCODE)" }
-
+          release=(tools/release.py --skip-build --out dist/release)
+          if [[ $GITHUB_REF_TYPE == tag ]]; then release+=(--tag "$GITHUB_REF_NAME")
+          elif [[ -n $PRERELEASE ]]; then release+=(--prerelease "$PRERELEASE"); fi
+          [[ $PUBLISH != true ]] || release+=(--publish)
+          python "${release[@]}"
       - name: Keep the files
         if: always()
         uses: actions/upload-artifact@v4

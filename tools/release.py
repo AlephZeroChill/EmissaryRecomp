@@ -220,8 +220,13 @@ def publish(args, tag, prerelease, commit, files):
         encoding='utf-8')
     command = ['gh', 'release', 'create', tag, *map(str, files['assets']), '--repo', repo, '--target', commit,
                '--title', f'{PRODUCT} {tag}', '--notes-file', str(notes)]
-    command += ['--prerelease', '--latest=false'] if prerelease else ['--latest']
+    # Never /releases/latest by itself (what every launcher installs): a prerelease never is, a release only with
+    # --latest (or later: gh release edit <tag> --latest).
+    command += ['--prerelease', '--latest=false'] if prerelease else ['--latest' if args.latest else '--latest=false']
     run(*command)
+    if not prerelease and not args.latest:
+        log(f'{tag} is published but not the latest release: launchers install it once it is '
+            f'(gh release edit {tag} --repo {repo} --latest)')
 
 
 def write_sums(out: Path, files: list[Path]):
@@ -268,6 +273,8 @@ def main():
     parser.add_argument('--allow-dirty', action='store_true', help='build a tree with uncommitted changes (no publish)')
     parser.add_argument('--out', type=Path, help='output folder (default: dist/<tag>)')
     parser.add_argument('--publish', action='store_true', help='create the GitHub release (gh, GH_TOKEN or gh auth)')
+    parser.add_argument('--latest', action='store_true',
+                        help="make a published release (not a prerelease) /releases/latest, what launchers install")
     parser.add_argument('--publish-existing', action='store_true',
                         help='publish the files already in the output folder (built and tested before), unchanged')
     parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', REPO))
@@ -277,8 +284,8 @@ def main():
     platforms = [p.strip() for p in args.platforms.split(',') if p.strip()]
     if not platforms or any(p not in PLATFORMS for p in platforms):
         parser.error(f'--platforms: {", ".join(PLATFORMS)}')
-    if 'windows' in platforms and os.name != 'nt':
-        parser.error('the Windows engines build on Windows')
+    if 'windows' in platforms and os.name != 'nt' and not args.skip_build:
+        parser.error('the Windows engines build on Windows (--skip-build packages builds made there)')
     tag, prerelease = release_tag(args)
     dirty = git_out('status', '--porcelain', '--untracked-files=no')
     if dirty and not args.allow_dirty:
@@ -298,7 +305,7 @@ def main():
             raise RuntimeError('a tree with uncommitted changes is never published')
         publish_existing(args, tag, prerelease, commit)
         return
-    if not args.game or not (args.game / 'sys/main.dol').is_file():
+    if not args.skip_build and (not args.game or not (args.game / 'sys/main.dol').is_file()):
         raise RuntimeError(f'--game {args.game}: no sys/main.dol (the extracted disc: DATA)')
     log(f'{PRODUCT} {tag} from {commit}{" (with uncommitted changes)" if dirty else ""}; Brawl Online '
         f'{lock["appVersion"]} at {lock["commit"]}; {", ".join(platforms)}')

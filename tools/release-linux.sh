@@ -4,6 +4,8 @@
 # times slower), and copies what the download needs to <out>: WiiCompiled (finding its libraries beside it), the
 # libraries the build made itself, if it links any, dsp_coef.bin, cacert.pem, wii_bootstrap/ and Sys/ (Brawl Online's region sets).
 #   tools/release-linux.sh <repo> <extracted disc DATA> <out> <jobs> <tag> <commit>
+# EMISSARY_RELEASE_IN_PLACE=1 builds <repo> itself, a checkout of <commit> on Linux's own disk (CI), in
+# $EMISSARY_RELEASE_WORK/build.
 # Build on Ubuntu 24.04 (tools/linux-build-deps.sh): the program needs the glibc and libstdc++ it was built with or newer.
 set -euo pipefail
 repo=$1 game=$2 out=$3 jobs=$4 tag=$5 commit=$6
@@ -11,12 +13,18 @@ work=${EMISSARY_RELEASE_WORK:-$HOME/emissary-release}
 src=$work/src build=$work/build
 
 mkdir -p "$work"
-if [[ ! -d $src/.git ]]; then
-    git clone -q --no-checkout "$repo" "$src"
+if [[ ${EMISSARY_RELEASE_IN_PLACE:-} == 1 ]]; then
+    src=$(cd "$repo" && pwd)
+    [[ $(git -C "$src" rev-parse HEAD) == "$(git -C "$src" rev-parse "$commit^{commit}")" ]] ||
+        { echo "$src is not at $commit" >&2; exit 1; }
+else
+    if [[ ! -d $src/.git ]]; then
+        git clone -q --no-checkout "$repo" "$src"
+    fi
+    git -C "$src" fetch -q "$repo" "$commit" 2>/dev/null || git -C "$src" fetch -q "$repo"
+    git -C "$src" -c advice.detachedHead=false checkout -q -f "$commit"
+    git -C "$src" clean -q -fdx -e /build/
 fi
-git -C "$src" fetch -q "$repo" "$commit" 2>/dev/null || git -C "$src" fetch -q "$repo"
-git -C "$src" -c advice.detachedHead=false checkout -q -f "$commit"
-git -C "$src" clean -q -fdx -e /build/
 echo "Linux build of $tag: $(git -C "$src" log -1 --format='%h %s' | cut -c1-100)"
 echo "$(. /etc/os-release && echo "$PRETTY_NAME"); $(clang --version | head -1); $(cmake --version | head -1)"
 

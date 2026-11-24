@@ -43,7 +43,15 @@ PATHS = [
     'dolphin/Source/Core/Core/Rollback/ReplayPlayback.h',
     'dolphin/Source/Core/Core/Rollback/GameplayOnlineBackend.cpp',
     'dolphin/Source/Core/Core/Rollback/GameplayOnlineBackend.h',
+    'dolphin/Source/Core/Core/Rollback/InputTrace.cpp',
+    'dolphin/Source/Core/Core/Rollback/InputTrace.h',
+    'dolphin/Source/Core/Core/Online/MatchQoS.cpp',
+    'dolphin/Source/Core/Core/Online/MatchQoS.h',
     'dolphin/Data/Sys/Rollback/',
+    # The in-game UI's fonts (runtime/cmake/PublicProducts.cmake copies them to Sys/Resources).
+    'dolphin/Data/Sys/Resources/OSD_Font.ttf',
+    'dolphin/Data/Sys/Resources/NotoSans-Regular.ttf',
+    'dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf',
     'dolphin/Externals/SFML/',
     'dolphin/Externals/curl/',
     'dolphin/Externals/enet/',
@@ -136,6 +144,10 @@ def fetch(dest: Path, repo: str, commit: str, app_version: str | None) -> Path:
     git('-c', 'protocol.version=2', 'fetch', '-q', '--depth', '1', '--no-tags', '--filter=blob:none', 'origin', commit,
         cwd=dest)
     git('checkout', '-q', 'FETCH_HEAD', cwd=dest)
+    # A path the commit does not have is left out silently by the sparse checkout: fail here, not in CMake.
+    missing = [p for p in PATHS if not (dest / p).exists()]
+    if missing:
+        raise RuntimeError(f'{repo} {commit} has no {", ".join(missing)} (tools/fetch_brawl_online.py PATHS)')
     with concurrent.futures.ThreadPoolExecutor(len(SUBMODULES)) as pool:
         for done in [pool.submit(fetch_submodule, dest, path) for path in SUBMODULES]:
             done.result()
