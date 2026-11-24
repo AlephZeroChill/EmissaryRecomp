@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -42,11 +43,14 @@ using Socket = int;
 
 #include "BrawlOnline/Online/Chat.h"
 #include "BrawlOnline/Online/GameBridge.h"
+#include "BrawlOnline/Online/GameSetup.h"
 #include "BrawlOnline/Online/OnlineClient.h"
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Online/Rooms.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
+#include "BrawlOnline/Rollback/ReplayRecorder.h"
+#include "Common/Logging/Log.h"
 #include "BrawlOnline/UI/OnScreenDisplay.h"
 #include "BrawlOnline/UI/OnlineChatUI.h"
 
@@ -340,6 +344,34 @@ Object Dispatch(const std::string& cmd, const Object& a) {
     }
     if (cmd == "game_bridge_status") return Online::GameBridge::Status();
     if (cmd == "rooms_status") return Online::Rooms::Status();
+    // The room CSS's ops as a test sends them (Dolphin's CmdRoomsRequest; the launcher's requests too).
+    if (cmd == "rooms_request") {
+        if (const auto error = Online::Rooms::HarnessRequest(a)) throw Error(*error);
+        return Online::Rooms::Status();
+    }
+    // A stage step acted on as the stage select would (Dolphin's CmdGameSetupAct).
+    if (cmd == "game_setup_act") {
+        const uint64_t kind = U64(a, "kind");
+        if (kind < 1 || kind > 0xFF) throw Error("kind must be a stage kind (1-255)");
+        const uint64_t asl = U64(a, "asl", 0);
+        if (asl > 0xFF) throw Error("asl must be 0-255");
+        Object r;
+        r["ok"] = picojson::value(Online::GameSetup::Act(uint8_t(kind), uint8_t(asl)));
+        r["setup"] = picojson::value(Online::GameSetup::Status());
+        return r;
+    }
+    // The replay being recorded (Dolphin's CmdReplayRecording).
+    if (cmd == "replay_recording") {
+        if (Bool(a, "flush", false)) Gprb::Replay::Flush();
+        Object r;
+        r["path"] = picojson::value(Gprb::Replay::CurrentPath());
+        r["recording"] = picojson::value(Gprb::Replay::Active());
+        return r;
+    }
+    if (cmd == "log_mark") {
+        NOTICE_LOG_FMT(BRAWLBACK, "[HARNESS] {}", Str(a, "text"));
+        return {};
+    }
     // Chat and the UI (Dolphin's HarnessServer.cpp, the same core and core/ui calls).
     if (cmd == "chat_status") return Online::Chat::Status();
     if (cmd == "chat_send" || cmd == "chat_hide" || cmd == "chat_report" || cmd == "chat_leave") {
@@ -398,7 +430,9 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         return r;
     }
     if (cmd == "screenshot") return {};  // the recomp draws its own window; no capture here yet
-    if (cmd == "quit" || cmd == "stop_game") {
+    // emu_stop is closing the game's window (Dolphin: MainWindow::ForceStop); the recomp's window
+    // closing ends the program after the core's stop, as quit does.
+    if (cmd == "quit" || cmd == "stop_game" || cmd == "emu_stop") {
         std::thread([] { std::this_thread::sleep_for(std::chrono::milliseconds(100)); B::StopGame(); }).detach();
         return {};
     }
@@ -698,9 +732,72 @@ void CoreGameThreadStack(char* out, size_t size) {
 #endif
 }
 
+namespace {
+// Dolphin's "record" session backend (Core/Harness/HarnessOnline.cpp), the same: for tests of the
+// game's online menus and the launcher's hand-offs, it records the hand-off and holds the P2P link
+// open, so the game stays on its character select with the opponent shown.
+class RecordOnlineBackend final : public Online::SessionBackend {
+public:
+    const char* Name() const override { return "record"; }
+
+    std::optional<std::string> Start(const Online::Match& match, Online::P2PLink link,
+                                     const picojson::object& selections) override {
+        std::lock_guard lk(m_mutex);
+        m_match = match;
+        m_selections = selections;
+        m_link = std::move(link);
+        m_phase = "held";
+        ++m_starts;
+        NOTICE_LOG_FMT(NETPLAY, "Online session (record): Start match {} ({})", match.match_id,
+                       match.is_host ? "host" : "guest");
+        return std::nullopt;
+    }
+
+    void Stop() override {
+        Online::P2PLink link;
+        {
+            std::lock_guard lk(m_mutex);
+            link = std::move(m_link);
+            if (!m_phase.empty()) m_phase = "ended";
+        }
+        if (link.IsOpen()) link.Release(200);
+    }
+
+    Online::SessionStatus Status() const override {
+        Online::SessionStatus status;
+        std::lock_guard lk(m_mutex);
+        status.phase = m_phase;
+        status.detail["starts"] = picojson::value(static_cast<double>(m_starts));
+        status.detail["link_open"] = picojson::value(m_link.IsOpen());
+        if (m_match) {
+            status.detail["role"] = picojson::value(m_match->is_host ? "host" : "guest");
+            status.detail["local_port"] = picojson::value(static_cast<double>(m_match->local_port));
+            status.detail["match_id"] = picojson::value(m_match->match_id);
+            for (const auto& p : m_match->players) {
+                if (!p.is_local) {
+                    status.detail["peer_name"] = picojson::value(p.display_name);
+                    status.detail["peer_code"] = picojson::value(p.connect_code);
+                }
+            }
+            status.detail["selections"] = picojson::value(m_selections);
+        }
+        return status;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::optional<Online::Match> m_match;
+    picojson::object m_selections;
+    Online::P2PLink m_link;
+    std::string m_phase;
+    int m_starts = 0;
+};
+}  // namespace
+
 void CoreHarnessStart() {
     const char* port = std::getenv("BRAWL_ONLINE_HARNESS_PORT");
     if (!port || !*port) return;
+    Online::Session::RegisterFactory("record", [] { return std::make_unique<RecordOnlineBackend>(); });
     std::thread(Serve, uint16_t(std::atoi(port))).detach();
 }
 
