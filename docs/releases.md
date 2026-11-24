@@ -128,8 +128,8 @@ python tools\release.py --game D:\path\to\extracted\DATA --prerelease rc.1 --pub
    `--latest` makes it the latest, or later `gh release edit <tag> --latest`.
 
 Builds are incremental: only what changed is translated or compiled again. A full build is short: translating the
-game takes about a minute, and the Linux program compiled from scratch in 10 minutes with 6 jobs on an 8-core PC
-(2026-11-23). `--skip-build` packages the builds already there (also on Linux, from Windows builds copied in: CI's
+game takes about a minute, the Linux program compiled from scratch in 10 minutes with 6 jobs and a Windows engine in
+10 minutes with 4 jobs, on an 8-core PC (2026-11-23). `--skip-build` packages the builds already there (also on Linux, from Windows builds copied in: CI's
 last job); `--platforms windows` or `linux` makes one; `--allow-dirty` builds uncommitted changes for a local try
 (never published). `dist/` is also a feed for the launcher's test switch `PPO_EMISSARY_RELEASES=<repo>\dist`
 (`<dir>/<tag>/` with the assets).
@@ -158,8 +158,11 @@ The Linux program plays Brawl Online's harness tests from Windows in this distro
 `harness/ppharness/recomp.py`, `PPHARNESS_RECOMP_WSL=EmissaryRecomp-Build:<its build/native>`): against Windows
 Dolphin or a Windows recomp, it needs WSL's mirrored networking (`%USERPROFILE%\.wslconfig`, `[wsl2]`
 `networkingMode=mirrored`, then `wsl --shutdown`, which stops every distro), so the servers, the harness and the other
-game reach it on 127.0.0.1. WSL renders with llvmpipe (software Vulkan): the game runs slowly there; judge a set by its
-checksums.
+game reach it on 127.0.0.1. WSL renders with llvmpipe (software Vulkan): the game runs slowly there (give the harness
+`PPHARNESS_TIMEOUT_SCALE=6` and `PPHARNESS_RECOMP_TOML=video.resolution_multiplier=0.25`); judge a set by its
+checksums. 2026-11-23, the Linux program in WSL (3 processors) played
+`test_direct_set_under_the_gameplay_session` against Windows Dolphin (3 games, 7,446 confirmed checksums) and against
+the Windows recomp (6,958), 0 mismatches.
 
 ## CI: `.github/workflows/release.yml`
 
