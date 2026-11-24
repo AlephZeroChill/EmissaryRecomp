@@ -46,6 +46,14 @@ struct RuntimeUserConfig {
     std::optional<bool> spinningCoins;  // NSMBW: [video] spinning_coins, animated tiles
     std::optional<bool> frameGraph;     // NSMBW: [video] frame_graph, frame times under the FPS counter
     std::optional<bool> vsync;          // NSMBW: [video] vsync, presents wait for the display (Windows)
+    // [video] vsync = "auto" (or no key): V-Sync on, except while the screen follows the frames (G-Sync, FreeSync).
+    bool vsyncAuto = true;
+    std::optional<uint32_t> msaa;         // [video] msaa: 1 (off), 2, 4 or 8 samples
+    std::optional<uint32_t> anisotropy;   // [video] anisotropy: 1 (off), 2, 4, 8 or 16
+    std::optional<int32_t> sharpening;    // [video] sharpening: 0-100 (percent), display only
+    std::optional<int32_t> brightness;    // [video] brightness, contrast, vibrance: -50..50, 0 = as the game draws it
+    std::optional<int32_t> contrast;
+    std::optional<int32_t> vibrance;
     std::optional<uint32_t> disabledPostProcessingPaths;
     std::optional<float> audioVolume;
     std::optional<float> audioMusicVolume;
@@ -251,12 +259,14 @@ inline void EnsureConfigFile() {
               "[video]\n"
               "widescreen = true\n"
               "force_16_9 = false\n"
-              "# render height = 480 x resolution_multiplier: 1.5 = 720p, 2.25 = 1080p, 4.5 = 4K, 0 = screen size\n"
-              "resolution_multiplier = 2.25\n"
+              "# render height = 480 x resolution_multiplier: 1.5 = 720p, 2.25 = 1080p, 4.5 = 4K, 0 = screen size.\n"
+              "# Left out, with msaa and anisotropy: the first start sets them for the GPU (a quality preset)\n"
+              "# resolution_multiplier = 2.25\n"
               "# 0 (off), 120 or 180\n"
               "frame_interpolation_fps = 0\n"
-              "# wait for the display when presenting: no screen tearing\n"
-              "vsync = true\n"
+              "# wait for the display when presenting: no screen tearing. \"auto\": on, except on a G-Sync or\n"
+              "# FreeSync screen that follows the frames (nothing tears there, and nothing waits)\n"
+              "vsync = \"auto\"\n"
               "# 0 = original 4:3, 1 = 16:9, 2 = fill the screen, 3 = cinematic 2.39:1\n"
               "aspect_mode = 1\n"
               "display_mode = \"borderless\"\n"
@@ -473,6 +483,25 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.spinningCoins = FindConfigValue<bool>(document, "video", "spinning_coins");
     config.frameGraph = FindConfigValue<bool>(document, "video", "frame_graph");
     config.vsync = FindConfigValue<bool>(document, "video", "vsync");
+    config.vsyncAuto = !config.vsync.has_value();
+    if (auto value = FindConfigUint(document, "video", "msaa");
+        value && (*value == 1 || *value == 2 || *value == 4 || *value == 8)) {
+        config.msaa = *value;
+    }
+    if (auto value = FindConfigUint(document, "video", "anisotropy");
+        value && (*value == 1 || *value == 2 || *value == 4 || *value == 8 || *value == 16)) {
+        config.anisotropy = *value;
+    }
+    if (auto value = FindConfigInt(document, "video", "sharpening"); value && *value >= 0 && *value <= 100) {
+        config.sharpening = *value;
+    }
+    const auto readAdjust = [&](std::string_view key) -> std::optional<int32_t> {
+        auto value = FindConfigInt(document, "video", key);
+        return value && *value >= -50 && *value <= 50 ? value : std::nullopt;
+    };
+    config.brightness = readAdjust("brightness");
+    config.contrast = readAdjust("contrast");
+    config.vibrance = readAdjust("vibrance");
     config.textureReplacements = FindConfigValue<bool>(document, "video", "texture_replacements");
     config.textureDumps = FindConfigValue<bool>(document, "video", "texture_dumps");
     if (auto value = FindConfigUint(document, "video", "disabled_post_processing_paths");
@@ -756,7 +785,70 @@ inline bool VSync(bool fallback = false) {
 
 inline bool SetVSync(bool value) {
     Mutable().vsync = value;
+    Mutable().vsyncAuto = false;
     return WriteSetting("video", "vsync", value ? "true" : "false");
+}
+
+// V-Sync left to the runtime: on, except on a screen that follows the frames.
+inline bool VSyncAuto() {
+    return Get().vsyncAuto;
+}
+
+inline bool SetVSyncAuto() {
+    Mutable().vsync.reset();
+    Mutable().vsyncAuto = true;
+    return WriteSetting("video", "vsync", "\"auto\"");
+}
+
+inline uint32_t Msaa(uint32_t fallback = 1) {
+    return Get().msaa.value_or(fallback);
+}
+
+inline bool SetMsaa(uint32_t value) {
+    Mutable().msaa = value;
+    return WriteSetting("video", "msaa", std::to_string(value));
+}
+
+inline uint32_t Anisotropy(uint32_t fallback = 1) {
+    return Get().anisotropy.value_or(fallback);
+}
+
+inline bool SetAnisotropy(uint32_t value) {
+    Mutable().anisotropy = value;
+    return WriteSetting("video", "anisotropy", std::to_string(value));
+}
+
+// Picture adjustments (display only): sharpening 0-100, the others -50..50 with 0 = as the game draws it.
+inline int32_t Sharpening(int32_t fallback = 0) { return Get().sharpening.value_or(fallback); }
+inline int32_t Brightness(int32_t fallback = 0) { return Get().brightness.value_or(fallback); }
+inline int32_t Contrast(int32_t fallback = 0) { return Get().contrast.value_or(fallback); }
+inline int32_t Vibrance(int32_t fallback = 0) { return Get().vibrance.value_or(fallback); }
+
+inline bool SetSharpening(int32_t value) {
+    Mutable().sharpening = value;
+    return WriteSetting("video", "sharpening", std::to_string(value));
+}
+
+inline bool SetBrightness(int32_t value) {
+    Mutable().brightness = value;
+    return WriteSetting("video", "brightness", std::to_string(value));
+}
+
+inline bool SetContrast(int32_t value) {
+    Mutable().contrast = value;
+    return WriteSetting("video", "contrast", std::to_string(value));
+}
+
+inline bool SetVibrance(int32_t value) {
+    Mutable().vibrance = value;
+    return WriteSetting("video", "vibrance", std::to_string(value));
+}
+
+// Whether the player (or an earlier start) has chosen how the game looks: no resolution, anti-aliasing or
+// texture filtering in Config.toml means a first start, whose quality preset the runtime picks by GPU.
+inline bool HasQualitySettings() {
+    const auto& config = Get();
+    return config.resolutionMultiplier.has_value() || config.msaa.has_value() || config.anisotropy.has_value();
 }
 
 inline bool SetShowFps(bool value) {

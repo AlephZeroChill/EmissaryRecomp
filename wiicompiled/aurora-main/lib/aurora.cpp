@@ -3,6 +3,7 @@
 #ifdef AURORA_ENABLE_GX
 #include "gfx/common.hpp"
 #include "gfx/efb_ram_copy.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "gfx/texture_replacement.hpp"
 #include "gx/gx.hpp"
 #include "gx/fifo.hpp"
@@ -771,6 +772,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
       .gpuName = gpu::adapter_name(),
       .gpuCompatActive = gpu::g_safeVertexFetch,
       .gpuIntegrated = gpu::adapter_integrated(),
+      .gpuMemoryBytes = gpu::adapter_memory_bytes(),
 #endif
   };
 }
@@ -1236,7 +1238,8 @@ void encode_presentation_snapshot(gpu::Encoder& encoder, const gpu::PresentSourc
   const SDL_GPUViewport gameViewport{viewport.left, viewport.top, viewport.width, viewport.height,
                                      viewport.znear, viewport.zfar};
   SDL_SetGPUViewport(pass, &gameViewport);
-  gpu::draw_copy(encoder.cmd(), pass, presentSource.texture, presentSource.sampler);
+  gpu::draw_present_picture(encoder.cmd(), pass, presentSource.texture, presentSource.sampler, viewport.width,
+                            viewport.height);
   if (includeImGui) {
     const SDL_GPUViewport fullViewport{0.f, 0.f, static_cast<float>(target.width), static_cast<float>(target.height),
                                        0.f, 1.f};
@@ -1283,7 +1286,8 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
   const bool surfaceReconfigurePending =
       g_surfaceReconfigurePending.load(std::memory_order_acquire);
   const bool surfaceMutationRequired =
-      surfaceReconfigurePending || gpu::vsync_change_pending() || !window::is_presentable() || !gpu::has_surface() ||
+      surfaceReconfigurePending || gpu::vsync_change_pending() || gpu::msaa_change_pending() ||
+      !window::is_presentable() || !gpu::has_surface() ||
       window::native_resize_pending() ||
       !window::native_window_size_matches(
           gpu::g_graphicsConfig.surfaceWidth,
@@ -1326,6 +1330,10 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
     if (gpu::take_vsync_change()) {
       const auto size = window::get_window_size();
       gpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+    }
+    // So does an anti-aliasing change: new render targets, and the cached pipelines at the new sample count.
+    if (gpu::take_msaa_change()) {
+      gfx::prewarm_for_sample_count(gpu::g_graphicsConfig.msaaSamples);
     }
   } else if (window::is_paused()) {
     return false;
@@ -1629,7 +1637,13 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
   auto finalImage =
       acquire_presentation_image(ctx.interpolatedFrameCount, ctx.snapshotWidth, ctx.snapshotHeight);
   encode_presentation_snapshot(encoder, ctx.presentSource, *finalImage, true);
-  auto pendingFrameCapture = encode_frame_capture(encoder, ctx.presentSource);
+  // AURORA_CAPTURE_PRESENTED=1 (test captures): the picture as presented, window-sized with the picture adjustments
+  // and the menus, instead of the game's own frame.
+  static const bool capturePresented = std::getenv("AURORA_CAPTURE_PRESENTED") != nullptr;
+  auto pendingFrameCapture = encode_frame_capture(
+      encoder, capturePresented ? gpu::PresentSource{.texture = finalImage->texture.texture,
+                                                     .sampler = finalImage->texture.sampler}
+                                : ctx.presentSource);
   presentationJobs.push_back({
       .image = std::move(finalImage),
       .logicalFrame = ctx.logicalFrame,
@@ -2091,6 +2105,16 @@ void aurora_get_present_timing(AuroraPresentTiming* timing) {
 }
 void aurora_set_vsync(bool enabled) { aurora::gpu::request_vsync(enabled); }
 bool aurora_get_vsync() { return aurora::gpu::vsync_enabled(); }
+void aurora_set_msaa(uint32_t samples) { aurora::gpu::request_msaa(samples); }
+uint32_t aurora_get_msaa() { return aurora::gpu::g_graphicsConfig.msaaSamples; }
+void aurora_set_texture_anisotropy(uint32_t maxAnisotropy) {
+  aurora::gpu::set_texture_anisotropy(static_cast<uint16_t>(std::min<uint32_t>(maxAnisotropy, 16)));
+}
+uint32_t aurora_get_texture_anisotropy() { return aurora::gpu::texture_anisotropy(); }
+void aurora_set_picture_adjustments(float sharpening, float brightness, float contrast, float vibrance) {
+  aurora::gpu::set_picture_adjust({.sharpening = sharpening, .brightness = brightness, .contrast = contrast,
+                                   .vibrance = vibrance});
+}
 namespace aurora::gx { extern std::atomic<bool> g_pacingExempt; }
 void aurora_set_frame_pacing_exempt(bool exempt) { aurora::gx::g_pacingExempt.store(exempt, std::memory_order_release); }
 

@@ -17,6 +17,8 @@ namespace aurora::gfx {
 using NewPipelineCallback = std::function<gpu::GraphicsPipeline()>;
 
 void initialize_pipeline_cache();
+// Queues the cached pipelines again at `samples` (the EFB's new MSAA count), in the background.
+void prewarm_for_sample_count(uint32_t samples);
 void shutdown_pipeline_cache();
 void begin_pipeline_frame();
 void end_pipeline_frame();

@@ -576,9 +576,16 @@ static size_t pipeline_worker_count() {
   return std::clamp(availableWorkers, size_t{1}, MaxPipelineWorkers);
 }
 
+// Every loaded record, kept for prewarm_for_sample_count: the boot prewarm drops g_loadedPipelineRecords.
+static std::vector<PipelineCacheWrite> g_knownPipelineRecords;
+
+// Queues each cached configuration at `samples`, the EFB's sample count: a record keeps the count it was first drawn
+// with, and that changes with the player's anti-aliasing setting. (Only GXCreateFrameBuffer's offscreen passes draw
+// single-sampled whatever the setting; no game of ours uses them.)
 template <typename PipelineConfig, typename CreateFn>
-static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion, CreateFn&& create) {
-  for (const auto& record : g_loadedPipelineRecords) {
+static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion, CreateFn&& create,
+                                        const std::vector<PipelineCacheWrite>& records, uint32_t samples) {
+  for (const auto& record : records) {
     if (record.type != type || record.configVersion != configVersion ||
         record.config.size() != sizeof(PipelineConfig)) {
       continue;
@@ -599,6 +606,7 @@ static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion,
       }
     }
 
+    config.msaaSamples = samples;
     find_pipeline_impl(type, config, [=] { return create(config); }, false, record.firstFrameUsed);
   }
 }
@@ -607,10 +615,12 @@ static void load_pipeline_cache() {
   if (!prepare_pipeline_cache_file()) {
     return;
   }
+  const uint32_t samples = gpu::g_graphicsConfig.msaaSamples;
   load_pipeline_cache_entries<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion,
-                                                     clear::create_pipeline);
-  load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion,
-                                                  gx::create_pipeline);
+                                                     clear::create_pipeline, g_loadedPipelineRecords, samples);
+  load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion, gx::create_pipeline,
+                                                  g_loadedPipelineRecords, samples);
+  g_knownPipelineRecords = std::move(g_loadedPipelineRecords);
   std::vector<PipelineCacheWrite>().swap(g_loadedPipelineRecords);
   const auto queued = queuedPipelines.load();
   if (queued > 0) {
@@ -679,6 +689,13 @@ void initialize_pipeline_cache() {
   }
 }
 
+void prewarm_for_sample_count(uint32_t samples) {
+  load_pipeline_cache_entries<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion,
+                                                     clear::create_pipeline, g_knownPipelineRecords, samples);
+  load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion, gx::create_pipeline,
+                                                  g_knownPipelineRecords, samples);
+}
+
 void shutdown_pipeline_cache() {
   if (g_hasPipelineThread) {
     {
@@ -700,6 +717,7 @@ void shutdown_pipeline_cache() {
   g_pipelineFrameActive = false;
   g_pipelinesPerFrame = 0;
   g_pipelines.clear();
+  std::vector<PipelineCacheWrite>().swap(g_knownPipelineRecords);
   g_priorityPipelines.clear();
   g_backgroundPipelines.clear();
   g_pendingPipelines.clear();
