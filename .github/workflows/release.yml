@@ -8,12 +8,13 @@
 # access). Never on pull_request or pull_request_target: these jobs decrypt the game's code.
 #
 # Only in a repository set up for it (docs/releases.md, "CI"), elsewhere every job is skipped:
-#   variable EMISSARY_GAME_REPO   the private repository (owner/name) holding game-code.tar.gz.gpg
+#   variable EMISSARY_GAME_REPO   the private repository (owner/name) holding game-code.tar.gz.gpg at its top
 #                                 (tools/ci/game_code.py pack)
-#   environment release (deployments from the release branch and v* tags only), with the secrets
-#     EMISSARY_GAME_KEY           the key game-code.tar.gz.gpg (and the build caches) are encrypted with
-#     EMISSARY_GAME_DEPLOY_KEY    the private half of EMISSARY_GAME_REPO's read-only deploy key (SSH)
+#   secret EMISSARY_GAME_KEY      the key game-code.tar.gz.gpg (and the build caches) are encrypted with
+#   secret EMISSARY_GAME_DEPLOY_KEY  the private half of a read-only deploy key of EMISSARY_GAME_REPO (SSH)
 #   variable EMISSARY_BUILD_CACHE off: build from scratch every time (no cache kept)
+# (Settings > Secrets and variables > Actions. Everyone with write access can start a release, and so read the game's
+# code; to limit that, move the secrets into an environment with deployment rules and add `environment:` below.)
 name: Release
 
 on:
@@ -56,7 +57,6 @@ jobs:
             os: windows-2025
             old-cpu: true
     runs-on: ${{ matrix.os }}
-    environment: release
     timeout-minutes: 355
     defaults:
       run:

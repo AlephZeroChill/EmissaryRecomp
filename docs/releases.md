@@ -182,19 +182,18 @@ The build translates Brawl's `sys/main.dol` and `files/module/*.rel`: 127 files,
   (gpg, AES-256; GnuPG is on both runners: Ubuntu's, and Git for Windows' on the Windows ones).
 - That file is in a **private** repository (`EMISSARY_GAME_REPO`), which the jobs clone with a read-only deploy key
   of that one repository.
-- The key and the deploy key's private half are secrets of the environment `release`, which runs only from the release
-  branch and `v*` tags. Each build job decrypts the files into the runner's temporary folder and deletes them when it
+- The key and the deploy key's private half are secrets of the CI repository. Each build job decrypts the files into the runner's temporary folder and deletes them when it
   ends (a GitHub runner is a new machine for every job anyway).
 - What is uploaded is only the program, the same files a release has. The build caches (below) are the game's code too
   (translated, compiled), so they are encrypted with the same key.
 
-Anyone who can run the workflow with the secrets can read the game's files: that is whoever can push to the release
-branch or push a tag in the CI repository, and the code of the commit built (it could copy the decrypted files
+Anyone who can run the workflow with the secrets can read the game's files: that is whoever has write access to the
+CI repository, and the code of the commit built (it could copy the decrypted files
 anywhere). So only build commits whose changes you know. GitHub masks the secrets in the logs, not files made with them;
 the workflow never prints the files, but a compile error in translated code would show that line of it in a log, and in
 a public repository the logs and workflow artifacts can be seen by anyone (artifacts by anyone signed in to GitHub).
 
-A new key: `game_code.py keygen` (or `setup_ci.py` with a new `--key-file`) and pack again; old caches then fail to
+A new key: `game_code.py keygen` and pack again (and the secret updated); old caches then fail to
 decrypt and are built again.
 
 ### Build caches
@@ -202,40 +201,43 @@ decrypt and are built again.
 Each job keeps its build folder (the translated game, the objects, the fetched core; not the .NET SDK or the downloads)
 encrypted in GitHub's Actions cache after a run on a branch, and the next run restores the newest one at the same path,
 so Ninja builds only what changed. A cache from the default branch is what tag runs and other branches start from
-(caches saved by a tag's run are only that tag's), so the CI repository's default branch is the release branch.
+(caches saved by a tag's run are only that tag's): runs on the release branch keep their own caches, and a tag run whose
+branch is not the default one builds from scratch.
 GitHub keeps 10 GB of caches per repository and drops one unused for 7 days; the repository variable
 `EMISSARY_BUILD_CACHE=off` turns them off. Since a full build takes well under an hour, a cache only saves time.
 
 ### Setting it up
 
-`tools/ci/setup_ci.py` does it with `gh` logged in as the owner of both repositories; it says what it would do, and
-does it with `--apply`:
+Chosen (Sarah, 2026-11-24): option B below, in kalomaze/EmissaryRecomp, its owner setting it up once; everyone with
+write access there is trusted, so the secrets are plain repository secrets (no environment or reviewers).
 
-```powershell
-python tools\ci\setup_ci.py --ci-repo <owner>/EmissaryRecomp --game-repo <owner>/emissary-game-code `
-    --branch emissary-brawlonline --from <ref to push> --game D:\path\to\extracted\DATA `
-    --key-file <a private file for the key> --apply
-```
+1. A **private** repository (e.g. `kalomaze/emissary-game-code`) with `game-code.tar.gz.gpg` at its top: made from an
+   extracted disc with `python tools/ci/game_code.py pack --game <DATA> --out game-code.tar.gz.gpg --key-file <key>`
+   (`keygen --key-file <key>` first for a new key; keep that file private).
+2. A deploy key for it: `ssh-keygen -t ed25519 -N "" -f deploykey`, and `deploykey.pub` added to the private repository
+   (Settings > Deploy keys, without write access).
+3. In EmissaryRecomp, Settings > Secrets and variables > Actions: the secrets `EMISSARY_GAME_KEY` (the key file's
+   text) and `EMISSARY_GAME_DEPLOY_KEY` (the text of `deploykey`, the private half), and the variable
+   `EMISSARY_GAME_REPO` (`owner/name` of the private repository).
 
-1. The CI repository (public: GitHub's runners are free and 4-core for a public repository), made as a fork of
-   kalomaze/EmissaryRecomp when missing; Actions on; the release branch pushed and made its default branch.
-2. The private game repository, made when missing (refused if public), with `game-code.tar.gz.gpg` packed from
-   `--game` with the key in `--key-file` (made when missing; that file is the only copy outside GitHub).
-3. A new read-only deploy key on the game repository; its private half goes only into the secret.
-4. The environment `release` of the CI repository, deployable from the release branch and `v*` tags only, with the
-   secrets `EMISSARY_GAME_KEY` and `EMISSARY_GAME_DEPLOY_KEY`, and the repository variable `EMISSARY_GAME_REPO`.
+Then Actions > Release > Run workflow (the button shows once `.github/workflows/release.yml` is on the default branch),
+or push a `v*` tag. Every job is skipped in a repository without `EMISSARY_GAME_REPO` (forks, or this one until it is
+set up). Brawl Online's launcher installs releases from the repository its `EMISSARY_REPO` names (brawlonline.net
+`launcher/src/dolphin/emissary/types.ts`): kalomaze/EmissaryRecomp.
 
-Every job is skipped in a repository without `EMISSARY_GAME_REPO` (forks of it, kalomaze/EmissaryRecomp until it is
-set up there). Brawl Online's launcher installs releases from the repository its `EMISSARY_REPO` names
-(brawlonline.net `launcher/src/dolphin/emissary/types.ts`): the CI repository's.
+To let only some people release, move the two secrets into an environment whose deployment rules allow only the release
+branch and `v*` tags (and, if wanted, required reviewers), and give the workflow's build job `environment: <name>`.
+`tools/ci/setup_ci.py` does steps 1-3 for a repository its `gh` user owns (`--ci-repo`, `--game-repo`, `--game` or a
+packed `--game-file`, `--key-file`; it only says what it would do without `--apply`), forking kalomaze/EmissaryRecomp
+when the CI repository does not exist.
 
 ### Ways to build releases, and what each costs
 
 | | Where | Needs | Risks and costs |
 |---|---|---|---|
 | **A** | A self-hosted runner on a PC with the disc (the first design) | the PC on; registering the runner (an admin of the repository) | the disc's files never leave that PC; but every collaborator's workflow code runs on it, and a release waits for it and takes its CPU |
-| **B** | GitHub's runners in kalomaze/EmissaryRecomp, the game's code encrypted | an admin there to add the environment, secrets and variable (`setup_ci.py` run by one) | as below; no fork, the launcher's repository stays; but everyone with write access there can run the workflow and so read the game's files |
-| **C** (built) | GitHub's runners in a public repository Sarah owns (a fork), the game's code encrypted in a private one | the two repositories, the deploy key and the secrets (`setup_ci.py`, as their owner) | free, three platforms at once, about half an hour to an hour from scratch; only Sarah (and what she pushes) can run it; the game's files are on GitHub, encrypted, in a private repository, decrypted on GitHub's runners for each build; the launcher points at the fork's releases |
+| **B** (chosen) | GitHub's runners in kalomaze/EmissaryRecomp, the game's code encrypted in a private repository | its owner adding two secrets and a variable, and the deploy key | as C; no fork, the launcher's repository stays; everyone with write access there can run the workflow and so read the game's files (all trusted) |
+| C | GitHub's runners in a public repository Sarah owns (a fork), the game's code encrypted in a private one | the two repositories, the deploy key and the secrets (`setup_ci.py`, as their owner) | free, three platforms at once, about half an hour to an hour from scratch; only Sarah (and what she pushes) can run it; the game's files are on GitHub, encrypted, in a private repository, decrypted on GitHub's runners for each build; the launcher points at the fork's releases |
 | D | GitHub's runners in a private repository | as C | logs and artifacts private, but 2-core runners and 2,000 free minutes a month (Windows minutes count twice): a few releases a month at most; players cannot download a private repository's releases, so they would be published elsewhere |
 | E | A runner on a home server or VPS | the machine; a Linux runner | one OS (Linux); those machines are already busy. The Windows engines are built with llvm-mingw, which also runs on Linux, so a Linux machine could cross-compile them, but the build (`build-brawl.ps1`, `Prepare-PortableTools.ps1`) is Windows-only today |
 | F | macOS (later) | `macos-15` runners (arm64, 3 cores, 7 GB, free in a public repository) | the game builds for macOS upstream; Brawl Online's core and the launcher do not play on macOS yet |

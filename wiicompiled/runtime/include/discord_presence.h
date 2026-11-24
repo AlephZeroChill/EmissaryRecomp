@@ -21,9 +21,7 @@ struct Activity {
     uint32_t partyMax = 0;
 };
 
-// The basic activity shows while the game has not set its own client; its start timestamp is
-// filled in here.
-void Initialize(const std::string& basicClientId, Activity basicActivity);
+void Initialize(const std::string& basicClientId, const std::string& basicTitle);
 void SetClient(const std::string& clientId);
 void SetActivity(Activity activity);
 void Reset();
