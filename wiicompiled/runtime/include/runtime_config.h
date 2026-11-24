@@ -1143,7 +1143,14 @@ inline bool SetDvdRoot(const std::filesystem::path& path) {
 }
 
 inline bool DiscordPresenceEnabled(bool fallback = true) {
+#if defined(MKW_BRAWL_ONLINE_CORE)
+    // Brawl Online's build: the Brawl Online launcher shows the player's Discord activity, so the
+    // runtime shows none of its own (its basic presence and the game's /dev/dolphin requests).
+    (void)fallback;
+    return false;
+#else
     return Get().discordPresenceEnabled.value_or(fallback);
+#endif
 }
 
 inline std::string DiscordClientId(std::string fallback = "1543984562369990706") {
