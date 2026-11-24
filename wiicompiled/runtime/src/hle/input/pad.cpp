@@ -8,6 +8,7 @@
 #include "runtime_config.h"
 #include "save_states.h"
 #include "settings_overlay.h"
+#include "pplus_si_codes.h"
 
 #include <algorithm>
 #include <atomic>
@@ -653,6 +654,8 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
         rumbleMask = ReadLocalPads(statuses);
         ApplyPadScript(statuses[0]);
     }
+    // P+'s codes in the SDK's SI path, which this PADRead replaces (pplus_si_codes.h).
+    PplusSiCodes::Apply(statuses);
 
     // Which ports report a controller, and the device behind each: logged whenever that changes.
     static std::string lastPorts;
