@@ -13,20 +13,22 @@ int g_contrast = RuntimeConfigFile::Contrast(0);
 int g_vibrance = RuntimeConfigFile::Vibrance(0);
 bool g_vsyncAuto = RuntimeConfigFile::VSyncAuto();
 
-// Each preset sets these together; any other combination is Custom. The frame rate stays 60 in every preset: the
-// frames in between are experimental and add a frame of delay.
+// Each preset sets these together; any other combination is Custom. The frame rate is the player's (it follows the
+// screen): Medium, High and Ultra keep frames above 60 and make them with Predict, the sub-frame mode that adds no
+// delay (card 771); Low goes back to 60, as each inserted frame is drawn again.
 struct QualityPreset {
     const char* name;
     float scale;  // resolution multiplier (kResolutions)
     uint32_t msaa;
     uint32_t anisotropy;
     bool bloom;
+    bool aboveSixty;  // keeps a frame rate above 60 (with Predict)
 };
 constexpr std::array<QualityPreset, 4> kQualityPresets = {{
-    {"LOW", 1.0f, 1, 1, false},
-    {"MEDIUM", 1.5f, 1, 4, true},
-    {"HIGH", 2.25f, 4, 4, true},
-    {"ULTRA", 4.5f, 4, 16, true},
+    {"LOW", 1.0f, 1, 1, false, false},
+    {"MEDIUM", 1.5f, 1, 4, true, true},
+    {"HIGH", 2.25f, 4, 4, true, true},
+    {"ULTRA", 4.5f, 4, 16, true, true},
 }};
 constexpr int kQualityPresetHigh = 2;
 constexpr std::array<uint32_t, 4> kMsaaChoices = {1, 2, 4, 8};
@@ -52,12 +54,17 @@ void SetAnisotropy(uint32_t value) {
     RuntimeConfigFile::SetAnisotropy(value);
 }
 
+// A preset's resolution at the current frame rate (above 60, 4K is the most: LimitResolutionForFrameRate).
+float PresetScale(const QualityPreset& p) {
+    return IsHighFrameRateMode() && IsHighResolutionScale(p.scale) ? 4.0f : p.scale;
+}
+
 // The preset the current settings are, or -1 (Custom).
 int CurrentQualityPreset() {
-    if (g_frameInterpolationMode != 0) return -1;
     for (size_t i = 0; i < kQualityPresets.size(); ++i) {
         const QualityPreset& p = kQualityPresets[i];
-        if (std::fabs(g_resolutionScale - p.scale) < 0.001f && g_msaa == p.msaa && g_anisotropy == p.anisotropy &&
+        if (g_frameInterpolationMode != 0 && !(p.aboveSixty && g_framePredict)) continue;
+        if (std::fabs(g_resolutionScale - PresetScale(p)) < 0.001f && g_msaa == p.msaa && g_anisotropy == p.anisotropy &&
             BloomOn() == p.bloom) {
             return static_cast<int>(i);
         }
@@ -71,10 +78,15 @@ void ApplyQualityPreset(int index) {
     SetMsaa(p.msaa);
     SetAnisotropy(p.anisotropy);
     if (BloomOn() != p.bloom) SetBloom(p.bloom);
-    if (g_frameInterpolationMode != 0) {
+    if (g_frameInterpolationMode != 0 && !p.aboveSixty) {
         g_frameInterpolationMode = 0;
         aurora_set_frame_interpolation_fps(0);
         RuntimeConfigFile::SetFrameInterpolationFps(0);
+    } else if (g_frameInterpolationMode != 0) {
+        g_framePredict = true;
+        aurora_set_frame_interpolation_mode(AURORA_FRAME_INTERPOLATION_PREDICT);
+        RuntimeConfigFile::SetFrameInterpolationMode("predict");
+        LimitResolutionForFrameRate();
     }
 }
 
