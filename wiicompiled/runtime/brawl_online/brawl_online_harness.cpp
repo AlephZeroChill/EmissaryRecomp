@@ -38,13 +38,20 @@ using Socket = int;
 #define closesocket close
 #endif
 
+#include <aurora/aurora.h>
 #include <picojson.h>
+#include <zlib.h>
 
 #include "BrawlOnline/Online/Chat.h"
 #include "BrawlOnline/Online/GameBridge.h"
 #include "BrawlOnline/Online/OnlineClient.h"
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Online/Rooms.h"
+#include "BrawlOnline/Online/Spectate.h"
+#include "BrawlOnline/Config/OnlineSettings.h"
+#include "BrawlOnline/Rollback/ReplayRecorder.h"
+#include "Common/Config/Config.h"
+#include "Core/Rollback/ReplayPlayback.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
 #include "BrawlOnline/UI/OnScreenDisplay.h"
@@ -129,6 +136,94 @@ B::Pad ParsePad(const Object& o) {
     pad.triggerL = uint8_t(U64(o, "l", (pad.button & 0x40) ? 255 : 0));
     pad.triggerR = uint8_t(U64(o, "r", (pad.button & 0x20) ? 255 : 0));
     return pad;
+}
+
+// screenshot {path}: the next frame the game presents (aurora reads it back from the GPU: the game's
+// picture, without the UI over it), as a PNG at `path`. Presents come from the game's thread: in a
+// match, at every frame; standing still (a replay paused, a live game buffering), from the core's
+// Engine::WhileStandingStill. `captured` false when none came in 5 s.
+uint32_t Le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
+void PutBe32(std::string& out, uint32_t v) {
+    for (int i = 3; i >= 0; --i) out.push_back(char(v >> (8 * i)));
+}
+void PngChunk(std::string& out, const char* type, const std::string& data) {
+    PutBe32(out, uint32_t(data.size()));
+    const std::string body = std::string(type, 4) + data;
+    out += body;
+    PutBe32(out, uint32_t(crc32(0, reinterpret_cast<const Bytef*>(body.data()), uInt(body.size()))));
+}
+// aurora's capture (write_bmp: 32-bit BGRA rows, bottom-up, 54-byte header) to an RGB PNG.
+bool BmpToPng(const std::string& bmp_path, const std::string& png_path, uint32_t* w, uint32_t* h) {
+    std::FILE* f = std::fopen(bmp_path.c_str(), "rb");
+    if (!f) return false;
+    std::vector<uint8_t> bmp;
+    uint8_t buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) bmp.insert(bmp.end(), buf, buf + n);
+    std::fclose(f);
+    if (bmp.size() < 54 || bmp[0] != 'B' || bmp[1] != 'M') return false;
+    const uint32_t off = Le32(&bmp[10]), width = Le32(&bmp[18]), height = Le32(&bmp[22]);
+    if (width == 0 || height == 0 || width > 16384 || height > 16384 || bmp.size() < off + size_t(width) * height * 4)
+        return false;
+    std::vector<uint8_t> raw((size_t(width) * 3 + 1) * height);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* src = &bmp[off + size_t(height - 1 - y) * width * 4];
+        uint8_t* dst = &raw[size_t(y) * (size_t(width) * 3 + 1)];
+        *dst++ = 0;  // no filter
+        for (uint32_t x = 0; x < width; ++x, src += 4) {
+            *dst++ = src[2];
+            *dst++ = src[1];
+            *dst++ = src[0];
+        }
+    }
+    uLongf packed_size = compressBound(uLong(raw.size()));
+    std::string packed(packed_size, '\0');
+    if (compress2(reinterpret_cast<Bytef*>(packed.data()), &packed_size, raw.data(), uLong(raw.size()), 6) != Z_OK)
+        return false;
+    packed.resize(packed_size);
+    std::string png("\x89PNG\r\n\x1a\n", 8), ihdr;
+    PutBe32(ihdr, width);
+    PutBe32(ihdr, height);
+    ihdr += std::string("\x08\x02\x00\x00\x00", 5);  // 8 bits, RGB
+    PngChunk(png, "IHDR", ihdr);
+    PngChunk(png, "IDAT", packed);
+    PngChunk(png, "IEND", {});
+    std::FILE* o = std::fopen(png_path.c_str(), "wb");
+    if (!o) return false;
+    const bool ok = std::fwrite(png.data(), 1, png.size(), o) == png.size();
+    std::fclose(o);
+    *w = width;
+    *h = height;
+    return ok;
+}
+Object Screenshot(const std::string& path) {
+    const std::string bmp = path + ".capture.bmp";
+    std::remove(bmp.c_str());
+    aurora_request_frame_capture(0, bmp.c_str());
+    Object r;
+    r["path"] = picojson::value(path);
+    uint32_t w = 0, h = 0;
+    bool captured = false;
+    // The file is written once the GPU is done with the frame; read it once its size holds.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    long last = -1;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::FILE* f = std::fopen(bmp.c_str(), "rb");
+        if (!f) continue;
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fclose(f);
+        if (size > 54 && size == last) {
+            captured = BmpToPng(bmp, path, &w, &h);
+            break;
+        }
+        last = size;
+    }
+    std::remove(bmp.c_str());
+    r["captured"] = picojson::value(captured);
+    r["width"] = Num(double(w));
+    r["height"] = Num(double(h));
+    return r;
 }
 
 std::string Hex(const uint8_t* p, size_t n) {
@@ -340,6 +435,74 @@ Object Dispatch(const std::string& cmd, const Object& a) {
     }
     if (cmd == "game_bridge_status") return Online::GameBridge::Status();
     if (cmd == "rooms_status") return Online::Rooms::Status();
+    // Rooms' requests (watch_leave, watch_hold, ...: Rooms::HarnessRequest, as Dolphin's rooms_request).
+    if (cmd == "rooms_request") {
+        if (const auto error = Online::Rooms::HarnessRequest(a)) throw Error(*error);
+        return Online::Rooms::Status();
+    }
+    // Replays and spectating (Dolphin's HarnessServer.cpp: replay_play, replay_comm, replay_status,
+    // replay_control, replay_recording, spectate_status, spectate_config; the same core calls).
+    if (cmd == "replay_play") {
+        if (const auto error = Gprb::Replay::Playback::PlayFile(Str(a, "path"), Bool(a, "play_anyway", false),
+                                                               Bool(a, "hold_at_end", false)))
+            throw Error(*error);
+        return Gprb::Replay::Playback::Status();
+    }
+    if (cmd == "replay_comm") {
+        Gprb::Replay::Playback::SetCommFile(Str(a, "path"));
+        return Gprb::Replay::Playback::Status();
+    }
+    if (cmd == "replay_status") {
+        Object r = Gprb::Session::PlaybackStatus();
+        r["comm"] = picojson::value(Gprb::Replay::Playback::Status());
+        return r;
+    }
+    if (cmd == "replay_control") {
+        using Gprb::Session::PlaybackCommand;
+        const std::string action = Str(a, "action");
+        double arg = 0;
+        if (const picojson::value* v = Find(a, "arg")) {
+            if (!v->is<double>()) throw Error("'arg' must be a number");
+            arg = v->get<double>();
+        }
+        static const std::pair<const char*, PlaybackCommand> commands[] = {
+            {"pause", PlaybackCommand::Pause},        {"play", PlaybackCommand::Play},
+            {"toggle", PlaybackCommand::TogglePause}, {"step", PlaybackCommand::StepForward},
+            {"back", PlaybackCommand::StepBack},      {"jump", PlaybackCommand::Jump},
+            {"seek", PlaybackCommand::Seek},          {"speed", PlaybackCommand::Speed},
+            {"faster", PlaybackCommand::Faster},      {"slower", PlaybackCommand::Slower},
+            {"live", PlaybackCommand::GoLive},        {"highlight", PlaybackCommand::PlayHighlight},
+        };
+        if (action == "stop") {
+            Gprb::Session::SetPlaybackStop(static_cast<s64>(arg));
+            return Gprb::Session::PlaybackStatus();
+        }
+        for (const auto& [name, command] : commands) {
+            if (action == name) {
+                Gprb::Session::PlaybackControl(command, arg);
+                return Gprb::Session::PlaybackStatus();
+            }
+        }
+        throw Error("unknown replay command " + action);
+    }
+    if (cmd == "replay_recording") {
+        if (Bool(a, "flush", false)) Gprb::Replay::Flush();
+        Object r;
+        r["path"] = picojson::value(Gprb::Replay::CurrentPath());
+        r["recording"] = picojson::value(Gprb::Replay::Active());
+        return r;
+    }
+    if (cmd == "spectate_status") return Online::Spectate::Status();
+    if (cmd == "spectate_config") {
+        if (Find(a, "stream")) Config::SetCurrent(Config::ONLINE_STREAM_GAMES, Bool(a, "stream", true));
+        if (Find(a, "forced")) Online::Spectate::SetForced(Bool(a, "forced", false));
+        if (const picojson::value* v = Find(a, "start_rate"))
+            Online::Spectate::SetStartRate(v->is<picojson::null>() ? std::nullopt
+                                                                   : std::optional<double>(double(U64(a, "start_rate"))));
+        Object r = Online::Spectate::Status();
+        r["stream"] = picojson::value(Config::Get(Config::ONLINE_STREAM_GAMES));
+        return r;
+    }
     // Chat and the UI (Dolphin's HarnessServer.cpp, the same core and core/ui calls).
     if (cmd == "chat_status") return Online::Chat::Status();
     if (cmd == "chat_send" || cmd == "chat_hide" || cmd == "chat_report" || cmd == "chat_leave") {
@@ -397,7 +560,7 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         r["rollback"] = picojson::value();
         return r;
     }
-    if (cmd == "screenshot") return {};  // the recomp draws its own window; no capture here yet
+    if (cmd == "screenshot") return Screenshot(Str(a, "path"));
     if (cmd == "quit" || cmd == "stop_game") {
         std::thread([] { std::this_thread::sleep_for(std::chrono::milliseconds(100)); B::StopGame(); }).detach();
         return {};

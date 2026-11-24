@@ -1,5 +1,6 @@
 #include "frame_input.h"
 #include "brawl_online_ipc.h"
+#include "brawl_online_core.h"
 
 #include "det_clock.h"
 #include "input_bindings.h"
@@ -59,6 +60,7 @@ Frame SampleLocal() {
             remote.sample.hasClassic = held.hasClassic;
         }
     }
+    BrawlOnlineCore::NoteLocalPads(&frame);
     return frame;
 }
 

@@ -462,6 +462,13 @@ static void copy_disp_decoded(GXBool clear, bool keep);
 static std::atomic<bool> g_keepDisplayCopyOnce{false};
 extern "C" void aurora_gx_keep_display_copy_once() { g_keepDisplayCopyOnce.store(true, std::memory_order_relaxed); }
 
+// A frame presented with no display copy of its own (the game standing still between two frames: a replay paused, a
+// live playback waiting for frames) shows the last display copy again instead of the cleared frame buffer. Ordered on
+// the GX thread like the copy itself, so it takes effect for the frame being built now.
+extern "C" void aurora_gx_present_last_display_copy() {
+  aurora::gx::worker::run_ordered([] { aurora::gx::set_display_copy_present_source(); });
+}
+
 void GXCopyDisp(void* dest, GXBool clear) {
   g_spmBBoxArmed = 0;  // a box cleared but never read this frame stops costing CPU projection
   (void)dest;
