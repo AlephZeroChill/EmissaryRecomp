@@ -21,6 +21,7 @@
 #include "aurora/profiling.hpp"
 
 namespace aurora::imgui {
+static Module Log("aurora::imgui");
 static float g_scale;
 static std::string g_imguiLog{};
 static bool g_useSdlRenderer = false;
@@ -174,6 +175,7 @@ void new_frame(const AuroraWindowSize& size) noexcept {
   } else {
     if (g_scale != size.scale) {
       if (g_scale > 0.f) {
+        Log.info("Display scale {} -> {}: ImGui's device objects recreated", g_scale, size.scale);
         recreate_device_objects();
       }
       g_scale = size.scale;

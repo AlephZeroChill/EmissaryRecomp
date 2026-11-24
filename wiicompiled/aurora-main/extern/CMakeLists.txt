@@ -276,6 +276,8 @@ if (AURORA_ENABLE_GX)
       URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz
       URL_HASH SHA256=da3d453cce74e0fb3d67f8d798a2a8d04fcaf0b33ce0e0131d0695dfc4f64191
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      # The SDL_GPU backend's transfer buffer after its device objects are recreated (the patch's comment).
+      PATCH_COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/imgui-sdlgpu3-transfer-buffer.cmake"
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(imgui)
