@@ -32,6 +32,18 @@ void RestoreRegs(const void* key);
 uint64_t TimeBase();
 void SetResimulating(bool active);
 void ResetPacing();
+// Time sync and frame pacing (det_clock.h; the core's Engine time calls, as Dolphin's CoreTiming throttle does them).
+// Times are std::chrono::steady_clock nanoseconds since its epoch (one clock in the process).
+void SetSpeed(double factor);
+void AdvancePacing(int64_t ns);
+void BeginBurst();
+void SetLoadWait(bool waiting);
+bool ScheduledHostTime(int64_t* steady_ns);
+int64_t TakeMaxBehindNs();
+// The match's frame pacing on or off; `lead`: a pacing wait may end early by CorePacedSleepLeadNs().
+void SetPresentPacing(bool on, bool lead);
+// The pacing's counters since SetPresentPacing(true), one line (logged at the match's end).
+void PacingReport(char* out, size_t size);
 
 // Snapshots of guest RAM in the runtime's delta store (SnapshotStore + WriteWatch), driven by the
 // core's ring: the ranges (sorted by physical address, not overlapping), then saves and restores
@@ -91,6 +103,15 @@ void CoreGameThreadStack(char* out, size_t size);
 void DumpGuestCpu();
 bool CoreHarnessActive();
 void CoreHarnessPads(Pad* pads);
+
+// The paced wait's lead (the core's PacedSleepLead): how long the coming rollback's re-run will take, 0 for none.
+int64_t CorePacedSleepLeadNs();
+
+// The sound hooks (the core's Gprb::Session::OnSoundAlloc / OnSoundAttached / OnSoundStop, Dolphin's HLE_Misc).
+enum class SoundAlloc : int { Proceed, NoChannel, Reattach };
+SoundAlloc CoreSoundAlloc(uint32_t sound_id, uint32_t handle, uint32_t* sound);
+void CoreSoundAttached(uint32_t handle, uint32_t sound, uint32_t sound_id);
+bool CoreSoundStop(uint32_t sound);
 
 // Brawl Online's in-game UI (brawl_online_ui.cpp, core/ui), in the runtime's ImGui frame: each
 // presented frame, `top` the height the runtime's bar covers; whether the UI has the keyboard.

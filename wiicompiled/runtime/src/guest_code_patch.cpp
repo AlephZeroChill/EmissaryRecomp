@@ -475,6 +475,13 @@ void InterpretReplacedModule(uint32_t start, uint32_t end, const char* name) {
             "the mod's code in the interpreter\n", name, start, end, count);
 }
 
+void InterpretForHooks(uint32_t address, const char* why) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const uint32_t count = InterpretRangeLocked(address, address + 1);
+    RT_LOGF(RT_TAG_MOD, "[mods] 0x%08X runs in the interpreter (%s)%s\n", address, why,
+            count == 1 ? "" : ": no translated function starts there");
+}
+
 void Protect(uint32_t start, uint32_t end, const char* name) {
     std::call_once(g_variantsOnce, [] {
         InitVariants();

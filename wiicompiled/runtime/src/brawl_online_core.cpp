@@ -11,6 +11,7 @@
 #include "det_clock.h"
 #include "display_settings.h"
 #include "frame_input.h"
+#include "guest_code_patch.h"
 #include "memory.h"
 #include "settings_overlay.h"
 
@@ -160,6 +161,56 @@ void DumpGuestCpu() {
 uint64_t TimeBase() { return DetClock::Now(); }
 void SetResimulating(bool active) { DetClock::SetRollbackResimulating(active); }
 void ResetPacing() { DetClock::ResetPacing(); }
+void SetSpeed(double factor) { DetClock::SetSpeed(factor); }
+void AdvancePacing(int64_t ns) { DetClock::AdvanceSchedule(std::chrono::nanoseconds(ns)); }
+void BeginBurst() { DetClock::BeginRollbackBurst(); }
+void SetLoadWait(bool waiting) { DetClock::SetLoadWait(waiting); }
+bool ScheduledHostTime(int64_t* steady_ns) {
+    std::chrono::steady_clock::time_point due;
+    if (!DetClock::ScheduledRealTime(&due)) return false;
+    *steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count();
+    return true;
+}
+int64_t TakeMaxBehindNs() { return DetClock::TakeMaxBehind().count(); }
+
+namespace {
+struct PacingMark {
+    bool on = false;
+    std::chrono::steady_clock::time_point real{};
+    uint64_t ticks = 0, sleptNs = 0;
+    DetClock::PacingStats stats;
+};
+PacingMark s_pacingMark;
+std::chrono::nanoseconds PacedLead() { return std::chrono::nanoseconds(CorePacedSleepLeadNs()); }
+}  // namespace
+
+void SetPresentPacing(bool on, bool lead) {
+    DetClock::SetPresentPacing(on, on && lead ? &PacedLead : nullptr);
+    if (on && !s_pacingMark.on) {
+        DetClock::ResetSpeedRange();
+        s_pacingMark = {true, std::chrono::steady_clock::now(), DetClock::Now(), DetClock::PacingNanoseconds(), DetClock::Stats()};
+    } else if (!on)
+        s_pacingMark.on = false;
+}
+
+void PacingReport(char* out, size_t size) {
+    // Since the match's pacing went on: the emulated time against the real time it took (a timeline running slow or
+    // fast shows here), the time spent waiting for the schedule, and the pacing's own events.
+    const auto& m = s_pacingMark;
+    const auto s = DetClock::Stats();
+    const double real = std::chrono::duration<double>(std::chrono::steady_clock::now() - m.real).count();
+    // Rollback re-runs move the timeline on without real time of their own: they are left out of the comparison.
+    const double rerun = double(s.resimTicks - m.stats.resimTicks) / 60'750'000.0;
+    const double emulated = double(DetClock::Now() - m.ticks) / 60'750'000.0 - rerun;
+    std::snprintf(out, size,
+                  "recomp pacing: emulated %.3f s in %.3f s real (%.3f%%; re-runs %.3f s more), waited %.3f s for the "
+                  "schedule, speed [%.4f, %.4f], schedule advances %llu, re-anchored %llu times (over 100 ms behind), "
+                  "rollback bursts %llu, waits a coming rollback ended early %llu",
+                  emulated, real, real > 0 ? 100.0 * emulated / real : 0.0, rerun,
+                  double(DetClock::PacingNanoseconds() - m.sleptNs) / 1e9, s.speedMin, s.speedMax,
+                  (unsigned long long)(s.advances - m.stats.advances), (unsigned long long)(s.reanchors - m.stats.reanchors),
+                  (unsigned long long)(s.bursts - m.stats.bursts), (unsigned long long)(s.leadWakes - m.stats.leadWakes));
+}
 
 Pad LocalPad(int chan) {
     FrameInput::GcPad pads[4]{};
@@ -249,6 +300,9 @@ void Start() {
         std::abort();
     });
     DetClock::Enable();
+    // The sound hooks act at pcs inside these two (SoundHook): they run in the interpreter, as a mod's patched code does.
+    GuestCodePatch::InterpretForHooks(0x801C9950u, "Brawl Online's sound hooks: SoundArchivePlayer::detail_SetupSound");
+    GuestCodePatch::InterpretForHooks(0x801BC684u, "Brawl Online's sound hooks: BasicSound::Stop");
     const char* comm = std::getenv("BRAWL_ONLINE_REPLAY_COMM");
     B::CoreStart(std::getenv("BRAWL_ONLINE_CORE"), comm ? comm : "");
 }
@@ -302,6 +356,41 @@ void LoopEnd(CpuContext* ctx) {
 }
 
 bool DrivesLoop() { return B::CoreDrivesLoop(); }
+
+uint32_t SoundHook(CpuContext* ctx, uint32_t pc) {
+    static bool seenAlloc = false, seenAttach = false, seenStop = false;
+    CtxScope scope(ctx);
+    switch (pc) {
+    case 0x801C9AACu:  // bl detail_AllocSeqSound
+    case 0x801C9B54u:  // bl detail_AllocStrmSound
+    case 0x801C9BFCu: {  // bl detail_AllocWaveSound
+        if (!seenAlloc) { seenAlloc = true; std::fprintf(stderr, "[brawl-online] hook reached: sound allocation %08x\n", pc); }
+        // r8 is the sound id at all three call sites, r28 the game's SoundHandle (detail_SetupSound's second argument).
+        uint32_t sound = 0;
+        switch (B::CoreSoundAlloc(ctx->gpr[8], ctx->gpr[28], &sound)) {
+        case B::SoundAlloc::Reattach:
+            // The sound an earlier run of this frame started still plays: no allocation and no setup; the success path
+            // attaches the handle (r28) to it (r24) and returns START_SUCCESS.
+            ctx->gpr[24] = sound;
+            return 0x801C9C70u;
+        case B::SoundAlloc::NoChannel:
+            ctx->gpr[3] = 0;  // the pool's own "no channel" (null)
+            return pc + 4;
+        case B::SoundAlloc::Proceed:
+            break;
+        }
+        return pc;
+    }
+    case 0x801C9C70u:  // the success path: handle r28 gets sound r24 (id r29)
+        if (!seenAttach) { seenAttach = true; std::fprintf(stderr, "[brawl-online] hook reached: sound attach 801c9c70\n"); }
+        B::CoreSoundAttached(ctx->gpr[28], ctx->gpr[24], ctx->gpr[29]);
+        return pc;
+    case 0x801BC684u:  // BasicSound::Stop(r3 sound, r4 fade frames)
+        if (!seenStop) { seenStop = true; std::fprintf(stderr, "[brawl-online] hook reached: sound stop 801bc684\n"); }
+        return B::CoreSoundStop(ctx->gpr[3]) ? (ctx->lr & ~3u) : pc;
+    }
+    return pc;
+}
 
 void StageCreate(CpuContext* ctx) {
     CtxScope scope(ctx);

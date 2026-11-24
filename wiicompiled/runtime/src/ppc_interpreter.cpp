@@ -528,6 +528,20 @@ void Run(CpuContext* ctx, uint32_t entry) {
                 Memory::Write32(ctx->gpr[23]+0xFC,Memory::Read16(ctx->gpr[23]+0xF8));
             }
         }
+        // Brawl Online's sound hooks (Dolphin's HLE_Misc sound alloc, attach and stop hooks, at the same pcs): the
+        // game's detail_SetupSound and BasicSound::Stop run here while the core is on (BrawlOnlineCore::Start).
+        if(coreEnabled && (pc==0x801C9AACu || pc==0x801C9B54u || pc==0x801C9BFCu || pc==0x801C9C70u || pc==0x801BC684u)) {
+            const uint32_t to=BrawlOnlineCore::SoundHook(ctx,pc);
+            if(to!=pc) {
+                if(pc==entry && (to&~3u)==(returnAddress&~3u)) {  // BasicSound::Stop declined: back to its caller
+                    SetScalar(f,1,Scalar(f,1));
+                    g_instructions.fetch_add(executed,std::memory_order_relaxed);
+                    return;
+                }
+                f.pc=to;
+                continue;
+            }
+        }
         const uint32_t w = MemoryInline::FlatRead32(pc);
         ctx->pc = pc;
         ++executed;

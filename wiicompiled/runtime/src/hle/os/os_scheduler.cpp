@@ -114,8 +114,8 @@ static void DeterministicIdleStep(CpuContext* cpu)
     }
 
     const uint64_t now = DetClock::Now();
-    uint64_t next = std::min({VI_HLE_DetNextRetraceTicks(), Audio_HLE_DetNextEventTicks(), NextSleepTimerTicks(),
-                              NextAlarmTicks()});
+    const uint64_t retrace = VI_HLE_DetNextRetraceTicks();
+    uint64_t next = std::min({retrace, Audio_HLE_DetNextEventTicks(), NextSleepTimerTicks(), NextAlarmTicks()});
     // Before VIInit nothing may be scheduled yet: creep forward a millisecond at a time. An event
     // that is due but could not be delivered this pass still moves time on by a tick.
     constexpr uint64_t kMaxStep = TimeBaseContract::kTicksPerSecond / 1000;
@@ -124,7 +124,8 @@ static void DeterministicIdleStep(CpuContext* cpu)
     } else if (next <= now) {
         next = now + 1;
     }
-    DetClock::PaceTo(next);
+    // The next retrace is the frame's own pacing point (a network match's lateness and rollback lead, det_clock.h).
+    DetClock::PaceTo(next, next == retrace);
     DetClock::AdvanceTo(next);
 }
 

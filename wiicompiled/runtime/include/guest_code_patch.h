@@ -66,6 +66,10 @@ void InterpretFromEnvironment();
 // A mod's replacement of a resident module links where the disc's translated functions are registered: every
 // translated function in [start, end) runs the bytes there in the interpreter from now on.
 void InterpretReplacedModule(uint32_t start, uint32_t end, const char* name);
+// The translated function at `address` runs in the interpreter from now on, for good: a hook of the runtime's at a pc
+// inside it (ppc_interpreter.cpp; Brawl Online's sound hooks, which act in the middle of the game's functions as
+// Dolphin's HLE hooks do). `why` is logged.
+void InterpretForHooks(uint32_t address, const char* why);
 // A module the game linked in place instead of at its translated home (a mod's, or any loaded on demand while codes
 // are active) is still reached at the home by translated callers (scene tables in sora_scene): every translated
 // function in [homeStart, homeEnd) runs the code at the same offset from `target` in the interpreter, until

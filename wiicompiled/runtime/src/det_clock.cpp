@@ -40,6 +40,16 @@ uint64_t g_anchorTicks = 0;
 bool g_resimulating = false;
 uint64_t g_resimStartTicks = 0;
 uint64_t g_pacingNanoseconds = 0;
+// Time sync and frame pacing (det_clock.h, Brawl Online's Engine): the timeline's speed against real time, a rollback
+// burst's due time, the load wait, the worst lateness since the session last asked, the paced wait's lead.
+double g_speed = 1.0;
+bool g_burstPending = false;
+Clock::time_point g_burstDue{};
+bool g_loadWait = false;
+std::atomic<int64_t> g_maxBehindNs{0};
+bool g_presentPacing = false;
+LeadFn g_lead = nullptr;
+PacingStats g_stats;
 
 void SleepUntil(Clock::time_point deadline) {
 #if defined(_WIN32)
@@ -79,6 +89,41 @@ void SleepUntil(Clock::time_point deadline) {
 #endif
 }
 
+// The real time the virtual instant `ticks` is due at: the anchor, then the ticks since it at the timeline's speed.
+Clock::time_point Due(uint64_t ticks) {
+    const auto elapsed = TimeBaseContract::TicksToDuration(ticks - g_anchorTicks);
+    if (g_speed == 1.0) return g_anchorReal + elapsed;
+    return g_anchorReal + std::chrono::duration_cast<Clock::duration>(
+                              std::chrono::duration<double, std::nano>(double(elapsed.count()) / g_speed));
+}
+
+void Anchor(Clock::time_point real, uint64_t ticks) {
+    g_anchored = true;
+    g_anchorReal = real;
+    g_anchorTicks = ticks;
+}
+
+// Until `target` less the lead (SetPresentPacing), in slices, asking the lead again as the other player's inputs come
+// in (CoreTiming::PacedSleepUntil): 1 ms OS sleeps, the last few ms as one precise sleep.
+void PacedSleepUntil(Clock::time_point target) {
+    constexpr auto kSlice = std::chrono::milliseconds(1);
+    constexpr auto kFinal = std::chrono::milliseconds(3);
+    for (;;) {
+        const auto lead = g_lead();
+        const auto wake = target - lead;
+        const auto now = Clock::now();
+        if (now >= wake) {
+            if (lead.count() > 0 && now < target) ++g_stats.leadWakes;
+            return;
+        }
+        if (wake - now <= kFinal) {
+            SleepUntil(wake);
+            continue;
+        }
+        std::this_thread::sleep_for(kSlice);
+    }
+}
+
 } // namespace
 
 void Enable() noexcept {
@@ -102,31 +147,48 @@ void AdvanceTo(uint64_t ticks) noexcept {
     }
 }
 
-void PaceTo(uint64_t ticks) {
+void PaceTo(uint64_t ticks, bool frameBoundary) {
     if (g_resimulating) return;
     const auto now = Clock::now();
-    if (!g_anchored || ticks < g_anchorTicks) {
-        g_anchored = true;
-        g_anchorReal = now;
-        g_anchorTicks = ticks;
+    if (!g_anchored || ticks < g_anchorTicks || g_loadWait) {
+        // (While the session waits for loads, the timeline is not paced: it keeps re-anchoring, so the frames after the
+        // wait are paced from then and do not race to make up for it.)
+        Anchor(now, ticks);
         return;
     }
-    const auto target = g_anchorReal + TimeBaseContract::TicksToDuration(ticks - g_anchorTicks);
+    const auto target = Due(ticks);
     if (now >= target) {
+        if (frameBoundary) {
+            const int64_t behind = std::chrono::duration_cast<std::chrono::nanoseconds>(now - target).count();
+            int64_t worst = g_maxBehindNs.load(std::memory_order_relaxed);
+            while (behind > worst && !g_maxBehindNs.compare_exchange_weak(worst, behind, std::memory_order_relaxed)) {
+            }
+        }
         if (now - target > kMaxLag) {
-            g_anchorReal = now;
-            g_anchorTicks = ticks;
+            Anchor(now, ticks);
+            ++g_stats.reanchors;
         }
         return;
     }
     const auto sleepStart = Clock::now();
-    SleepUntil(target);
+    // (The lead only at the frame's own pacing point, as Dolphin's paced sleep is the first throttle after a shown frame.)
+    if (frameBoundary && g_presentPacing && g_lead != nullptr) PacedSleepUntil(target);
+    else SleepUntil(target);
     g_pacingNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - sleepStart).count();
 }
 
 uint64_t PacingNanoseconds() noexcept { return g_pacingNanoseconds; }
 
 void SetRollbackResimulating(bool active) noexcept {
+    if (!active && g_resimulating) g_stats.resimTicks += Now() - g_resimStartTicks;
+    if (!active && g_burstPending) {
+        // The presented frame after a rollback burst continues the schedule from where it was due when the burst began:
+        // the re-run's ticks are skipped, the real time it took comes out of the frame's slack (CoreTiming).
+        g_burstPending = false;
+        g_resimulating = false;
+        Anchor(g_burstDue, Now());
+        return;
+    }
     if (active == g_resimulating) return;
     if (active) g_resimStartTicks = Now();
     else if (g_anchored) g_anchorTicks += Now() - g_resimStartTicks;
@@ -134,8 +196,67 @@ void SetRollbackResimulating(bool active) noexcept {
 }
 
 void ResetPacing() noexcept {
-    g_anchored = false;
+    // (Brawl Online's ResetThrottleToNow: a rollback burst still pending is dropped too.)
+    g_burstPending = false;
+    Anchor(Clock::now(), Now());
 }
+
+void SetSpeed(double factor) noexcept {
+    if (!(factor > 0.0) || factor == g_speed) return;
+    // The schedule goes on from the current instant's due time at the new speed (CoreTiming::UpdateSpeedLimit).
+    if (g_anchored && !g_resimulating && !g_loadWait) {
+        const uint64_t now = Now();
+        if (now >= g_anchorTicks) Anchor(Due(now), now);
+    }
+    g_speed = factor;
+    g_stats.speed = factor;
+    g_stats.speedMin = std::min(g_stats.speedMin, factor);
+    g_stats.speedMax = std::max(g_stats.speedMax, factor);
+}
+
+void ResetSpeedRange() noexcept { g_stats.speedMin = g_stats.speedMax = g_speed; }
+
+double Speed() noexcept { return g_speed; }
+
+void AdvanceSchedule(std::chrono::nanoseconds amount) noexcept {
+    if (!g_anchored) return;
+    g_anchorReal -= amount;
+    // A rollback burst in progress resumes the schedule at its due time: that moves as well.
+    if (g_burstPending) g_burstDue -= amount;
+    ++g_stats.advances;
+}
+
+void BeginRollbackBurst() noexcept {
+    if (g_burstPending || !g_anchored) return;
+    // At the loop top, before the load: the virtual instant here is the end of the frame just presented, which the
+    // pacing already waited for.
+    g_burstDue = g_resimulating || g_loadWait ? Clock::now() : Due(Now());
+    g_burstPending = true;
+    ++g_stats.bursts;
+}
+
+void SetLoadWait(bool waiting) noexcept {
+    if (waiting == g_loadWait) return;
+    g_loadWait = waiting;
+    if (!waiting && !g_resimulating) Anchor(Clock::now(), Now());
+}
+
+bool ScheduledRealTime(Clock::time_point* out) noexcept {
+    if (!g_anchored || g_resimulating || g_loadWait) return false;
+    *out = Due(Now());
+    return true;
+}
+
+std::chrono::nanoseconds TakeMaxBehind() noexcept {
+    return std::chrono::nanoseconds(g_maxBehindNs.exchange(0, std::memory_order_relaxed));
+}
+
+void SetPresentPacing(bool on, LeadFn lead) noexcept {
+    g_presentPacing = on;
+    g_lead = lead;
+}
+
+PacingStats Stats() noexcept { return g_stats; }
 
 Clock::time_point NowTimePoint() noexcept {
     return Clock::time_point{TimeBaseContract::TicksToDuration(Now())};

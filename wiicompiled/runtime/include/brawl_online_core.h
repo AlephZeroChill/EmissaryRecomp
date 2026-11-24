@@ -26,6 +26,12 @@ bool FrameEnd(CpuContext* ctx);
 void LoopEnd(CpuContext* ctx);
 bool DrivesLoop();
 
+// Brawl Online's sound hooks (Dolphin's HLE_Misc BrawlbackSkipResim*SoundAllocHook, GprbSoundAttachHook and
+// GprbSoundStopHook): the interpreter at one of their pcs in detail_SetupSound (the three `bl detail_Alloc*Sound`,
+// 0x801C9AAC/0x801C9B54/0x801C9BFC, and its success path 0x801C9C70) or at BasicSound::Stop (0x801BC684). Returns
+// the pc to go on at: `pc` itself to run the instruction there as usual.
+uint32_t SoundHook(CpuContext* ctx, uint32_t pc);
+
 void StageCreate(CpuContext* ctx);
 void StageFile(CpuContext* ctx);
 void PadRead(CpuContext* ctx);

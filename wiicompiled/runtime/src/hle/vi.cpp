@@ -383,6 +383,14 @@ uint64_t IntervalTicks(std::chrono::microseconds interval) {
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()));
 }
 
+// The deterministic clock's retrace period (DetClock: network play). NTSC is the console's field, 1001/60000 s
+// (59.94 Hz: 60.75 MHz * 1001 / 60000 = 1,013,512.5 ticks, rounded as Brawl Online's engine counts a field), as on a
+// Wii and in Dolphin; the wall-clock path's 16,666 us is 60.00 Hz, which made this game's frames come 0.1% early
+// against a Dolphin, so the time sync of a crossplay match spent its correction holding a third of a frame's gap.
+uint64_t DetIntervalTicks() {
+    return g_vi.retraceInterval == IntervalForFormat(1) ? IntervalTicks(g_vi.retraceInterval) : 1'013'513u;
+}
+
 void EnsureInitializedLocked() {
     if (g_vi.initialized) {
         return;
@@ -610,7 +618,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
                 if (!g_vi.initialized) {
                     return advancedAny;
                 }
-                const uint64_t due = g_vi.detLastRetraceTicks + IntervalTicks(g_vi.retraceInterval);
+                const uint64_t due = g_vi.detLastRetraceTicks + DetIntervalTicks();
                 if (DetClock::Now() < due) {
                     return advancedAny;
                 }
@@ -701,7 +709,7 @@ uint64_t VI_HLE_DetNextRetraceTicks() {
     if (!g_vi.initialized) {
         return DetClock::kNever;
     }
-    return g_vi.detLastRetraceTicks + IntervalTicks(g_vi.retraceInterval);
+    return g_vi.detLastRetraceTicks + DetIntervalTicks();
 }
 
 void VI_HLE_WaitForNextRetracePoll() {
@@ -1437,6 +1445,8 @@ extern "C" void VIGetCurrentLine_HLE(CpuContext* ctx)
         {
             std::lock_guard<GuestThreadGuard> lock(g_viGuard);
             lastTicks = g_vi.detLastRetraceTicks;
+            // The deterministic field, not the display lock's (which differs from one PC to the next).
+            interval = TimeBaseContract::TicksToDuration(DetIntervalTicks());
         }
         const uint64_t now = DetClock::Now();
         elapsed = std::chrono::duration_cast<std::chrono::microseconds>(

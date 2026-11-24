@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -90,18 +92,58 @@ public:
         resimulating = r;
         B::SetResimulating(r);
     }
-    void SetRollbackLoadWait(bool) override {}
+    // The loop top's wait for the game's loads: unpaced meanwhile (the deterministic clock's load wait).
+    void SetRollbackLoadWait(bool waiting) override { B::SetLoadWait(waiting); }
+    // The audio clock's waits for re-runs: the recomp's audio follows the deterministic clock (not done).
     void SetRollbackAudioWaits(bool) override {}
     void AddRollbackAudioPause(s64) override {}
-    void SetRollbackSpeedAdjustment(double) override {}
-    void AdvanceThrottle(DT) override {}
-    void SetPresentPacing(bool) override {}
-    void SetPacedSleepLead(PacedSleepLead) override {}
+    // Time sync (docs/design/brawl-online-core.md §10.2): the session's speed for this machine (a little slower when
+    // it is ahead of the other, faster when behind) and its catch-up frames, on the deterministic clock's schedule,
+    // as Dolphin's CoreTiming throttle takes them.
+    void SetRollbackSpeedAdjustment(double factor) override { B::SetSpeed(factor * TestClockSkew()); }
+    // BRAWL_TEST_CLOCK_SKEW=<factor> (tests): this machine's match runs that much faster than real time before time
+    // sync's own factor (1.004: 0.4% fast), as a PC whose clock or frame pacing is off would; Dolphin's equivalent is
+    // its emulation speed (Core.EmulationSpeed).
+    static double TestClockSkew() {
+        static const double skew = [] {
+            const char* e = std::getenv("BRAWL_TEST_CLOCK_SKEW");
+            const double v = e ? std::strtod(e, nullptr) : 1.0;
+            if (e) INFO_LOG_FMT(BRAWLBACK, "test: BRAWL_TEST_CLOCK_SKEW: the match runs at {:.4f} times real time", v);
+            return v > 0.5 && v < 2.0 ? v : 1.0;
+        }();
+        return skew;
+    }
+    void AdvanceThrottle(DT amount) override {
+        B::AdvancePacing(std::chrono::duration_cast<std::chrono::nanoseconds>(amount).count());
+    }
+    // The match's frame pacing; a pacing wait ends early by the lead (a coming rollback runs in it).
+    void SetPresentPacing(bool on) override {
+        if (!on && present_pacing) {
+            char line[512];
+            B::PacingReport(line, sizeof line);
+            INFO_LOG_FMT(BRAWLBACK, "{}", line);
+        }
+        present_pacing = on;
+        B::SetPresentPacing(on, lead != nullptr);
+    }
+    void SetPacedSleepLead(PacedSleepLead l) override {
+        lead = l;
+        B::SetPresentPacing(present_pacing, l != nullptr);
+    }
     void ResetThrottleToNow() override { B::ResetPacing(); }
-    void BeginRollbackBurst() override {}
-    DT TakeMaxBehindSchedule() override { return {}; }
-    std::optional<TimePoint> ScheduledHostTime() override { return std::nullopt; }
+    void BeginRollbackBurst() override { B::BeginBurst(); }
+    DT TakeMaxBehindSchedule() override {
+        return std::chrono::duration_cast<DT>(std::chrono::nanoseconds(B::TakeMaxBehindNs()));
+    }
+    std::optional<TimePoint> ScheduledHostTime() override {
+        int64_t ns = 0;
+        if (!B::ScheduledHostTime(&ns)) return std::nullopt;
+        return TimePoint(std::chrono::duration_cast<DT>(std::chrono::nanoseconds(ns)));
+    }
     void SleepUntil(TimePoint t) override { std::this_thread::sleep_until(t); }
+    // The lead (the core's PacedSleepLead), asked by the pacing's waits.
+    PacedSleepLead lead = nullptr;
+    bool present_pacing = false;
 
     // Snapshots: the region set in the runtime's delta store, in Dolphin's ring (RollbackManager:
     // 8 slots, a load `back` saves before the newest frees the ones after it).
@@ -299,6 +341,29 @@ bool CoreFrameEnd() {
     Gprb::FrameTraceOnFrameEnd(Core::System::GetInstance(), B::Gpr(24), false);
     return true;
 }
+
+int64_t CorePacedSleepLeadNs() {
+    const auto lead = s_engine.lead;
+    return lead ? std::chrono::duration_cast<std::chrono::nanoseconds>(lead()).count() : 0;
+}
+
+SoundAlloc CoreSoundAlloc(uint32_t sound_id, uint32_t handle, uint32_t* sound) {
+    const auto d = Gprb::Session::OnSoundAlloc(Guard(), sound_id, handle);
+    switch (d.action) {
+    case Gprb::Session::SoundAllocAction::Reattach:
+        *sound = d.sound;
+        return SoundAlloc::Reattach;
+    case Gprb::Session::SoundAllocAction::NoChannel:
+        return SoundAlloc::NoChannel;
+    case Gprb::Session::SoundAllocAction::Proceed:
+        break;
+    }
+    return SoundAlloc::Proceed;
+}
+void CoreSoundAttached(uint32_t handle, uint32_t sound, uint32_t sound_id) {
+    Gprb::Session::OnSoundAttached(Guard(), handle, sound, sound_id);
+}
+bool CoreSoundStop(uint32_t sound) { return Gprb::Session::OnSoundStop(Guard(), sound); }
 
 void CoreLoopEnd() { Gprb::Session::OnLoopEnd(Guard()); }
 bool CoreDrivesLoop() { return Gprb::Session::DrivesLoop(); }
