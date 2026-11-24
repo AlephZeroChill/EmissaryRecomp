@@ -18,10 +18,13 @@ $auroraCMake = Join-Path $repoRoot 'aurora-main\CMakeLists.txt'
 $auroraExtern = Join-Path $repoRoot 'aurora-main\extern\CMakeLists.txt'
 $auroraLibUsb = Join-Path $repoRoot 'aurora-main\cmake\AuroraLibUSB.cmake'
 $auroraSdl = Join-Path $repoRoot 'aurora-main\cmake\AuroraSDL3Provider.cmake'
+$auroraImGuiPatch = Join-Path $repoRoot 'aurora-main\cmake\imgui-sdlgpu3-transfer-buffer.cmake'
 
 # Name = directory under the destination; FetchContent maps it back through
 # FETCHCONTENT_SOURCE_DIR_<UPPERCASE NAME> (NativeBuildFlags.ps1), so the names are the declared
-# FetchContent names, not the upstream project names.
+# FetchContent names, not the upstream project names. FetchContent runs no PATCH_COMMAND for a
+# source dir given that way, so a package whose declaration patches it names the same script in
+# Patch (run in the extracted tree, as FetchContent would).
 $packages = @(
     [pscustomobject]@{
         Name = 'SDL'; File = 'SDL3-3.4.4.tar.gz'
@@ -47,9 +50,11 @@ $packages = @(
         Pins = @(@{ File = $auroraExtern; Text = 'https://files.twilitrealm.dev/freetype-2.14.3.tar.gz' })
     },
     [pscustomobject]@{
-        Name = 'imgui'; File = 'imgui-1.91.9b-docking.tar.gz'
-        Uris = @('https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b-docking.tar.gz')
-        Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b-docking.tar.gz' })
+        Name = 'imgui'; File = 'imgui-1.92.2b.tar.gz'
+        Uris = @('https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz')
+        Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz' },
+                 @{ File = $auroraExtern; Text = 'imgui-sdlgpu3-transfer-buffer.cmake' })
+        Patch = $auroraImGuiPatch
     },
     [pscustomobject]@{
         Name = 'libusb'; File = 'libusb-1.0.30.tar.bz2'
@@ -143,8 +148,24 @@ function Expand-Package([string]$Archive, [string]$Target) {
 foreach ($package in $packages) {
     Assert-Pinned $package
     $target = Join-Path $Destination $package.Name
-    if (Test-Path -LiteralPath $target -PathType Container) { continue }
+    # Which archive (and patch) a prepared tree came from: a tree of another pin is prepared again.
+    $stamp = Join-Path $Destination ".$($package.Name).prepared"
+    $patch = if ($package.PSObject.Properties['Patch']) { $package.Patch } else { $null }
+    $want = $package.File + $(if ($patch) { ' + ' + (Split-Path -Leaf $patch) } else { '' })
+    if ((Test-Path -LiteralPath $target -PathType Container) -and
+        (Test-Path -LiteralPath $stamp -PathType Leaf) -and ([IO.File]::ReadAllText($stamp).Trim() -eq $want)) { continue }
     Expand-Package (Get-Archive $package) $target
+    if ($patch) {
+        # The pinned toolchain's CMake (build-brawl.ps1 puts it on PATH only after this script).
+        $cmake = Join-Path (Split-Path -Parent $repoRoot) 'toolchain\CMake\bin\cmake.exe'
+        if (-not (Test-Path -LiteralPath $cmake -PathType Leaf)) { $cmake = (Get-Command cmake -ErrorAction Stop).Source }
+        Push-Location -LiteralPath $target
+        try {
+            & $cmake -P $patch
+            if ($LASTEXITCODE -ne 0) { throw "$($package.Name): $patch failed with exit code $LASTEXITCODE." }
+        } finally { Pop-Location }
+    }
+    [IO.File]::WriteAllText($stamp, $want)
     Write-Host "Prepared $($package.Name)"
 }
 
