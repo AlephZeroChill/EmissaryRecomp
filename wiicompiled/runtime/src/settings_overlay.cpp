@@ -39,6 +39,7 @@ extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint
 #include <imgui.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_misc.h>
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
@@ -1454,6 +1455,277 @@ std::string StartButtonName();
 std::string g_busyLabel;  // SetBusyProgress
 float g_busyFraction = 0.0f;
 
+#if MKW_BRAWL_ONLINE_CORE
+// Emissary's title card art (tools/make_emissary_title.py, in Sys/Resources beside the program). A picture is drawn
+// from a copy made at the size it is shown, averaged down from the full-size art, so its edges stay clean at any
+// window size (the GPU's linear filter alone skips pixels when it shrinks a picture).
+class TitleArt {
+public:
+    explicit TitleArt(const char* file) : m_file(file) {}
+
+    // The picture at `widthPx` pixels across (its height follows), or none if the file can't be read.
+    ImTextureID At(int widthPx) {
+        if (!Load() || widthPx <= 0) return ImTextureID{};
+        widthPx = std::min(widthPx, m_w);
+        // A new copy when the size changes by more than an eighth (a few window resizes while the card shows; the
+        // ones before stay with the GPU, so at most a few).
+        if (!m_sized || (std::abs(widthPx - m_sizedW) * 8 > m_sizedW && m_copies < 6)) {
+            const int h = std::max(1, static_cast<int>(std::lround(static_cast<double>(m_h) * widthPx / m_w)));
+            const std::vector<uint8_t> rgba = Resample(m_rgba, m_w, m_h, widthPx, h);
+            m_sized = aurora_imgui_add_texture(widthPx, h, rgba.data());
+            m_sizedW = widthPx;
+            ++m_copies;
+        }
+        return m_sized;
+    }
+    int ShownWidth() const { return m_sizedW; }
+    float Aspect() const { return m_h > 0 ? static_cast<float>(m_w) / static_cast<float>(m_h) : 0.0f; }
+
+    // Its shape in white, blurred, on a margin of `kGlowPad` of its width each side: a glow behind it.
+    ImTextureID Glow() {
+        if (!Load()) return ImTextureID{};
+        if (!m_glow) {
+            const int w = std::max(8, m_w / 12), h = std::max(8, static_cast<int>(std::lround(double(m_h) * w / m_w)));
+            const int pad = static_cast<int>(std::lround(w * kGlowPad));
+            const std::vector<uint8_t> small = Resample(m_rgba, m_w, m_h, w, h);
+            const int gw = w + 2 * pad, gh = h + 2 * pad;
+            std::vector<float> a(static_cast<size_t>(gw) * gh, 0.0f), tmp(a.size());
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) a[(y + pad) * gw + x + pad] = small[(size_t(y) * w + x) * 4 + 3] / 255.0f;
+            const int r = std::max(1, pad / 3);
+            for (int pass = 0; pass < 3; ++pass) {  // three box blurs: close to a Gaussian
+                for (int y = 0; y < gh; ++y)
+                    for (int x = 0; x < gw; ++x) {
+                        float s = 0;
+                        for (int d = -r; d <= r; ++d) s += a[y * gw + std::clamp(x + d, 0, gw - 1)];
+                        tmp[y * gw + x] = s / (2 * r + 1);
+                    }
+                for (int y = 0; y < gh; ++y)
+                    for (int x = 0; x < gw; ++x) {
+                        float s = 0;
+                        for (int d = -r; d <= r; ++d) s += tmp[std::clamp(y + d, 0, gh - 1) * gw + x];
+                        a[y * gw + x] = s / (2 * r + 1);
+                    }
+            }
+            std::vector<uint8_t> rgba(a.size() * 4, 255);
+            for (size_t i = 0; i < a.size(); ++i) rgba[i * 4 + 3] = static_cast<uint8_t>(std::clamp(a[i], 0.0f, 1.0f) * 255.0f);
+            m_glow = aurora_imgui_add_texture(gw, gh, rgba.data());
+        }
+        return m_glow;
+    }
+    static constexpr float kGlowPad = 0.08f;
+
+private:
+    bool Load() {
+        if (m_tried) return !m_rgba.empty();
+        m_tried = true;
+        const char* base = SDL_GetBasePath();
+        const std::string path = std::string(base != nullptr ? base : "") + "Sys/Resources/" + m_file;
+        uint32_t w = 0, h = 0;
+        if (uint8_t* rgba = aurora_load_png_rgba(path.c_str(), &w, &h)) {
+            m_rgba.assign(rgba, rgba + size_t(w) * h * 4);
+            std::free(rgba);
+            m_w = static_cast<int>(w);
+            m_h = static_cast<int>(h);
+        }
+        return !m_rgba.empty();
+    }
+
+    // Area average of straight-alpha RGBA from sw x sh down to dw x dh, weighted by alpha so transparent pixels'
+    // colours don't darken the edges.
+    static std::vector<uint8_t> Resample(const std::vector<uint8_t>& src, int sw, int sh, int dw, int dh) {
+        auto spans = [](int s, int d) {  // for each output pixel, the source pixels it covers and how much
+            std::vector<std::vector<std::pair<int, float>>> out(d);
+            const double scale = double(s) / d;
+            for (int i = 0; i < d; ++i) {
+                const double a = i * scale, b = (i + 1) * scale;
+                for (int j = int(a); j < std::min(s, int(std::ceil(b))); ++j) {
+                    const double cover = std::min(b, j + 1.0) - std::max(a, double(j));
+                    if (cover > 0) out[i].push_back({j, float(cover / scale)});
+                }
+            }
+            return out;
+        };
+        const auto xs = spans(sw, dw), ys = spans(sh, dh);
+        std::vector<float> rows(size_t(dw) * sh * 4);  // premultiplied
+        for (int y = 0; y < sh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float acc[4] = {};
+                for (const auto& [j, wgt] : xs[x]) {
+                    const uint8_t* p = &src[(size_t(y) * sw + j) * 4];
+                    const float al = p[3] / 255.0f;
+                    for (int c = 0; c < 3; ++c) acc[c] += wgt * p[c] * al;
+                    acc[3] += wgt * al;
+                }
+                std::copy(acc, acc + 4, &rows[(size_t(y) * dw + x) * 4]);
+            }
+        std::vector<uint8_t> out(size_t(dw) * dh * 4);
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float acc[4] = {};
+                for (const auto& [j, wgt] : ys[y])
+                    for (int c = 0; c < 4; ++c) acc[c] += wgt * rows[(size_t(j) * dw + x) * 4 + c];
+                uint8_t* q = &out[(size_t(y) * dw + x) * 4];
+                for (int c = 0; c < 3; ++c) q[c] = acc[3] > 0 ? uint8_t(std::clamp(acc[c] / acc[3], 0.0f, 255.0f)) : 0;
+                q[3] = uint8_t(std::clamp(acc[3] * 255.0f + 0.5f, 0.0f, 255.0f));
+            }
+        return out;
+    }
+
+    const char* m_file;
+    bool m_tried = false;
+    std::vector<uint8_t> m_rgba;
+    int m_w = 0, m_h = 0;
+    ImTextureID m_sized{}, m_glow{};
+    int m_sizedW = 0, m_copies = 0;
+};
+
+// A soft round light (white, fading out from its middle), tinted when drawn.
+ImTextureID SoftLight() {
+    static ImTextureID id = [] {
+        constexpr int n = 128;
+        std::vector<uint8_t> rgba(n * n * 4, 255);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const float dx = (x + 0.5f) / n * 2 - 1, dy = (y + 0.5f) / n * 2 - 1;
+                const float d = std::min(1.0f, std::sqrt(dx * dx + dy * dy));
+                const float a = (1 - d) * (1 - d);
+                rgba[(y * n + x) * 4 + 3] = static_cast<uint8_t>(a * 255.0f);
+            }
+        return aurora_imgui_add_texture(n, n, rgba.data());
+    }();
+    return id;
+}
+
+// The night sky: an ellipse of violet light a little above the middle, fading to near black (dithered, so a big
+// window shows no bands).
+ImTextureID NightSky() {
+    static ImTextureID id = [] {
+        constexpr int w = 512, h = 288;
+        std::vector<uint8_t> rgba(size_t(w) * h * 4, 255);
+        const float stops[3][4] = {{0.0f, 42, 18, 56}, {0.55f, 18, 8, 24}, {1.0f, 5, 3, 8}};
+        uint32_t seed = 12345;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float u = ((x + 0.5f) / w - 0.5f) / 0.7f, v = ((y + 0.5f) / h - 0.38f) / 0.6f;
+                const float d = std::min(1.0f, std::sqrt(u * u + v * v));
+                const int s = d < stops[1][0] ? 0 : 1;
+                const float f = (d - stops[s][0]) / (stops[s + 1][0] - stops[s][0]);
+                for (int c = 0; c < 3; ++c) {
+                    seed = seed * 1664525u + 1013904223u;
+                    const float noise = ((seed >> 8) & 0xFFFF) / 65535.0f - 0.5f;
+                    const float value = stops[s][c + 1] + (stops[s + 1][c + 1] - stops[s][c + 1]) * f + noise;
+                    rgba[(size_t(y) * w + x) * 4 + c] = static_cast<uint8_t>(std::clamp(value + 0.5f, 0.0f, 255.0f));
+                }
+            }
+        return aurora_imgui_add_texture(w, h, rgba.data());
+    }();
+    return id;
+}
+
+// Emissary's title card (Brawl Online's build): the mask over a night sky with its eyes glowing, "emissary" on its
+// swoosh, "FOR BRAWL ONLINE", and along the bottom the credits, what the game waits for (`status`, with `progress`
+// 0-1 as a line along the bottom edge, or below 0 for none) and how to open the options. `small` is the game's font
+// for the text (none before it is read: the art alone).
+void DrawEmissaryTitle(const ImGuiViewport* viewport, const char* status, float progress, const GameLayout::Font* small) {
+    static TitleArt mask("emissary_mask.png"), wordmark("emissary_wordmark.png");
+    constexpr const char* kCredit =
+        "EmissaryRecomp by kalomaze, a fork of BrawlRecompiled by JosiahG, which is built on WiiCompiled by patchzyy";
+    constexpr const char* kHint = "F10 or Home = options";
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    const GameLayout::View view = GameLayout::GameView();
+    const float k = view.scale, t = static_cast<float>(ImGui::GetTime());
+    const ImVec2 o = viewport->Pos, sz = viewport->Size;
+    auto S = [&](float x, float y) { return ImVec2(view.centerX + x * k, view.centerY - y * k); };
+
+    list->AddImage(NightSky(), o, ImVec2(o.x + sz.x, o.y + sz.y));
+    // Stars over the whole window, each twinkling slowly.
+    for (int i = 0; i < 70; ++i) {
+        const float x = o.x + static_cast<float>((i * 173) % 1280) / 1280.0f * sz.x;
+        const float y = o.y + static_cast<float>((i * 89) % 560) / 720.0f * sz.y;
+        const float base = 0.15f + static_cast<float>((i * 37) % 60) / 100.0f;
+        const float a = base * (0.65f + 0.35f * std::sin(t * 1.3f + i * 2.1f));
+        list->AddCircleFilled(ImVec2(x, y), std::max(1.0f, 0.65f * k), IM_COL32(255, 255, 255, int(a * 255)), 8);
+    }
+
+    // A picture of `art` `width` layout units across, centred at (x, y), snapped to whole pixels.
+    auto DrawArt = [&](TitleArt& art, float x, float y, float width) {
+        const ImTextureID id = art.At(static_cast<int>(std::lround(width * k)));
+        if (!id) return;
+        const float w = static_cast<float>(art.ShownWidth()), h = std::round(w / art.Aspect());
+        const ImVec2 c = S(x, y), p0(std::round(c.x - w / 2), std::round(c.y - h / 2));
+        list->AddImage(id, p0, ImVec2(p0.x + w, p0.y + h));
+    };
+    // Its glow, `grow` times its size, tinted `col`.
+    auto DrawGlow = [&](TitleArt& art, float x, float y, float width, float grow, uint32_t col) {
+        const ImTextureID id = art.Glow();
+        if (!id || art.Aspect() <= 0) return;
+        const float w = width * (1 + 2 * TitleArt::kGlowPad) * grow, h = width / art.Aspect() * grow + width * 2 * TitleArt::kGlowPad * grow;
+        list->AddImage(id, S(x - w / 2, y + h / 2), S(x + w / 2, y - h / 2), ImVec2(0, 0), ImVec2(1, 1), col);
+    };
+
+    // The mask (its eyes 53.8 units either side of the middle, 72.8 up), a crimson glow round it and the eyes' light.
+    constexpr float kMaskY = 100.5f, kMaskW = 340.3f;
+    DrawGlow(mask, 0.0f, kMaskY, kMaskW, 1.03f, IM_COL32(160, 0, 63, 120));
+    const float pulse = 0.85f + 0.15f * std::sin(t * 2.0f);
+    for (const float ex : {-53.8f, 53.8f}) {
+        const float r = 38.0f;
+        list->AddImage(SoftLight(), S(ex - r, 72.8f + r), S(ex + r, 72.8f - r), ImVec2(0, 0), ImVec2(1, 1),
+                       IM_COL32(255, 201, 122, int(150 * pulse)));
+    }
+    DrawArt(mask, 0.0f, kMaskY, kMaskW);
+    // "emissary" on its swoosh, with a soft shadow under it.
+    constexpr float kWordY = -68.6f, kWordW = 449.3f;
+    DrawGlow(wordmark, 0.0f, kWordY - 5.0f, kWordW, 1.0f, IM_COL32(0, 0, 0, 150));
+    DrawArt(wordmark, 0.0f, kWordY, kWordW);
+
+    if (small != nullptr) {
+        // FOR BRAWL ONLINE, its letters spread apart.
+        {
+            const std::u16string text = GameLayout::Utf16("FOR BRAWL ONLINE");
+            const float size = 16.5f, gap = 3.8f;
+            float width = -gap;
+            for (const char16_t ch : text) width += GameLayout::MeasureText(*small, std::u16string(1, ch), size) + gap;
+            float x = -width / 2;
+            for (const char16_t ch : text) {
+                const std::u16string one(1, ch);
+                GameLayout::DrawText(list, view, *small, one, x, -153.9f, size, 0xFFC97AFFu, 0xFFC97AFFu, 1.0f, 0, 1);
+                x += GameLayout::MeasureText(*small, one, size) + gap;
+            }
+        }
+        // Along the bottom of the window: the credits on the left, then what the game waits for and the options key
+        // on the right (above the credits when both don't fit on one line).
+        const float size = 9.5f, margin = 17.0f;
+        const float left = (o.x - view.centerX) / k + margin, right = (o.x + sz.x - view.centerX) / k - margin;
+        const float bottom = (view.centerY - (o.y + sz.y)) / k + margin;
+        const std::u16string credit = GameLayout::Utf16(kCredit), hint = GameLayout::Utf16(kHint);
+        const std::u16string waits = GameLayout::Utf16(status != nullptr ? status : "");
+        const float creditW = GameLayout::MeasureText(*small, credit, size);
+        const float waitsW = waits.empty() ? 0.0f : GameLayout::MeasureText(*small, waits, size) + 14.0f;
+        const float hintW = GameLayout::MeasureText(*small, hint, size);
+        const bool oneLine = left + creditW + 24.0f + waitsW + hintW <= right;
+        const float lineH = GameLayout::LineHeight(*small, size);
+        const float rightY = oneLine ? bottom : bottom + lineH * 1.4f;
+        const float creditSize = creditW > right - left ? size * (right - left) / creditW : size;
+        GameLayout::DrawText(list, view, *small, credit, left, bottom, creditSize, 0x8E7F9CFFu, 0x8E7F9CFFu, 1.0f, 0, 2);
+        GameLayout::DrawText(list, view, *small, hint, right, rightY, size, 0xB8A8C8FFu, 0xB8A8C8FFu, 1.0f, 2, 2);
+        if (!waits.empty()) {
+            GameLayout::DrawText(list, view, *small, waits, right - hintW - 14.0f, rightY, size, 0xB8A8C8FFu,
+                                 0xB8A8C8FFu, 1.0f, 2, 2);
+        }
+    }
+    // Progress: a thin line along the window's bottom edge.
+    if (progress >= 0.0f) {
+        const float h = std::max(2.0f, std::round(1.9f * k));
+        const ImVec2 b0(o.x, o.y + sz.y - h), b1(o.x + sz.x, o.y + sz.y);
+        list->AddRectFilled(b0, b1, IM_COL32(28, 16, 36, 255));
+        const float fill = o.x + sz.x * std::clamp(progress, 0.0f, 1.0f);
+        list->AddRectFilledMultiColor(b0, ImVec2(fill, b1.y), IM_COL32(160, 0, 63, 255), IM_COL32(255, 45, 120, 255),
+                                      IM_COL32(255, 45, 120, 255), IM_COL32(160, 0, 63, 255));
+    }
+}
+#endif
+
 void DrawStartupScreen() {
     if (!StartupScreenVisible()) {
         return;
@@ -1501,6 +1773,24 @@ void DrawStartupScreen() {
             std::snprintf(shaderLine, sizeof(shaderLine), "Compiling shaders... %u to go",
                           aurora_get_queued_pipeline_count());
         }
+#if MKW_BRAWL_ONLINE_CORE
+        // Brawl Online's build shows Emissary's own title card (DrawEmissaryTitle), also before the game's fonts are
+        // read (its art needs none).
+        (void)kTitle, (void)kCredit, (void)kReport, (void)startY, (void)titleHeight;
+        float progress = -1.0f;
+        if (!g_busyLabel.empty()) {
+            progress = g_busyFraction;
+        } else if (shaderLine[0] != '\0') {
+            static uint32_t mostQueued = 0;
+            const uint32_t queued = aurora_get_queued_pipeline_count();
+            mostQueued = std::max(mostQueued, queued);
+            progress = mostQueued > 0 ? 1.0f - static_cast<float>(queued) / static_cast<float>(mostQueued) : 0.0f;
+        }
+        const GameLayout::Font* small = GameLayout::FontReady(menuFont.get()) ? menuFont.get()
+                                        : gameFonts                             ? pmFont.get()
+                                                                                : nullptr;
+        DrawEmissaryTitle(viewport, shaderLine, progress, small);
+#else
         if (gameFonts) {
             // A Brawl title card: a night sky with rising embers and light rays, a dark card with the credits, and the
             // Smash Ball turning in the top-left corner (<game folder>/startup/smash_ball.png, from tools/make_icon.py).
@@ -1686,6 +1976,7 @@ void DrawStartupScreen() {
             ImGui::SetCursorPos(ImVec2(lineX, startY + titleSize.y * 1.8f));
             ImGui::TextUnformatted(shaderLine);
         }
+#endif
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -1715,7 +2006,9 @@ void UpdateBootShaderState() {
 #if MKW_BRAWL_ONLINE_CORE
         // Brawl Online's build goes on by itself, as Dolphin does: the launcher started it to play, and a press here
         // would be one more step before the online menus. The card (and its credits) shows while the game boots.
-        NotifyStrapInputAccepted();
+        // BRAWL_TITLE_HOLD=1 keeps it up (screenshots of the card).
+        static const bool hold = std::getenv("BRAWL_TITLE_HOLD") != nullptr;
+        if (!hold) NotifyStrapInputAccepted();
 #endif
     }
 }

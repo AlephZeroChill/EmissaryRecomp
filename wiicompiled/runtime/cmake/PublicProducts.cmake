@@ -111,11 +111,14 @@ if(BRAWL_ONLINE_ROOT)
         target_compile_definitions(mkw_brawl_online_core PRIVATE MKW_RELEASE_VERSION="${MKW_RELEASE_VERSION}")
     endif()
     set(MKW_BRAWL_ONLINE_SYS "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Rollback")
-    # The UI's fonts (Dolphin's Sys/Resources: the OSD's and the chat's).
+    # The UI's fonts (Dolphin's Sys/Resources: the OSD's and the chat's) and the title card's art.
     set(MKW_BRAWL_ONLINE_FONTS
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/OSD_Font.ttf"
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSans-Regular.ttf"
-        "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf")
+        "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf"
+        # Emissary's title card (tools/make_emissary_title.py).
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_mask.png"
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_wordmark.png")
 endif()
 mkw_configure_object_target(mkw_runtime_common)
 target_compile_features(mkw_runtime_common PRIVATE cxx_std_20)
