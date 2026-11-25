@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds an EmissaryRecomp release with Brawl Online's online core: both Windows engines, the Linux program (in a WSL
-distro from Windows, or directly on Linux), the two downloads and manifest.json; with --publish, the GitHub release.
-The layout and the manifest are described in docs/releases.md.
+distro from Windows, or directly on Linux), the macOS program (on a Mac), the downloads and manifest.json; with
+--publish, the GitHub release. The layout and the manifest are described in docs/releases.md.
 
     python tools/release.py --game <extracted disc DATA> [--prerelease rc.1] [--publish]
 
@@ -31,6 +31,7 @@ ENGINE = 'emissary'  # the engine's name as Brawl Online's servers learn it (bra
 PLATFORMS = {
     'windows': {'asset': '{p}-{tag}-Windows.zip', 'program': 'WiiCompiled.exe'},
     'linux': {'asset': '{p}-{tag}-Linux.tar.gz', 'program': 'WiiCompiled'},
+    'macos': {'asset': '{p}-{tag}-macOS.tar.gz', 'program': 'WiiCompiled'},  # Apple silicon
 }
 TAG = re.compile(r'^v(\d+\.\d+\.\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$')
 
@@ -99,6 +100,14 @@ def build_linux(args, tag, commit, out: Path):
         run('bash', TOOLS / 'release-linux.sh', ROOT, args.linux_game or args.game.resolve(), out, *script_args)
 
 
+def build_macos(args, tag, commit, out: Path):
+    """The macOS program, built from the commit on this Mac (tools/release-macos.sh); its files go to out. A release
+    with Windows too is packaged on the Windows machine: copy out (dist/<tag>/macos-native) there and --skip-build."""
+    out.mkdir(parents=True, exist_ok=True)
+    log('macOS program')
+    run('bash', TOOLS / 'release-macos.sh', ROOT, args.game.resolve(), out, str(args.jobs), tag, commit)
+
+
 def copy_tree(src: Path, dst: Path):
     if not src.is_dir():
         raise RuntimeError(f'missing {src}')
@@ -157,14 +166,15 @@ def stage_windows(stage: Path, info: dict) -> Path:
     return top
 
 
-def stage_linux(stage: Path, native: Path, info: dict) -> Path:
+def stage_linux(stage: Path, native: Path, info: dict, system: str = 'Linux') -> Path:
+    """The Linux download, or the macOS one (the same layout: the program and its files, LF text)."""
     top = stage / TOP
     if stage.exists():
         shutil.rmtree(stage)
     top.mkdir(parents=True)
     for need in ('WiiCompiled', 'dsp_coef.bin', 'cacert.pem', 'wii_bootstrap', 'Sys/Rollback'):
         if not (native / need).exists():
-            raise RuntimeError(f'missing {native / need}: the Linux build did not finish')
+            raise RuntimeError(f'missing {native / need}: the {system} build did not finish')
     for f in sorted(native.iterdir()):
         if f.is_file():  # WiiCompiled, any library it bundles, dsp_coef.bin, cacert.pem
             shutil.copyfile(f, top / f.name)
@@ -190,7 +200,8 @@ def write_tar(top: Path, archive: Path):
     # Modes set here, not taken from the disk (files built in WSL and copied to Windows lose theirs): the program and
     # its shared libraries 0755, the rest 0644, owned by no one in particular.
     def entry(info: tarfile.TarInfo) -> tarfile.TarInfo:
-        executable = info.isdir() or info.name.endswith('/WiiCompiled') or '.so' in PurePosixPath(info.name).name
+        name = PurePosixPath(info.name).name
+        executable = info.isdir() or name == 'WiiCompiled' or '.so' in name or name.endswith('.dylib')
         info.mode = 0o755 if executable else 0o644
         info.uid = info.gid = 0
         info.uname = info.gname = ''
@@ -266,7 +277,8 @@ def main():
     parser.add_argument('--linux-game', help='the same, as the Linux build sees it (default: --game through /mnt)')
     parser.add_argument('--tag', help='the release tag (default: v<VERSION>[-<prerelease>])')
     parser.add_argument('--prerelease', help='a prerelease of VERSION: rc.1 makes v<VERSION>-rc.1')
-    parser.add_argument('--platforms', default='windows,linux', help='comma-separated: windows, linux')
+    parser.add_argument('--platforms', default='windows,linux',
+                        help='comma-separated: windows, linux, macos (macos builds on a Mac)')
     parser.add_argument('--jobs', type=int, default=6, help='compile jobs per build (one build at a time)')
     parser.add_argument('--wsl-distro', default='EmissaryRecomp-Build', help='the WSL distro of the Linux build')
     parser.add_argument('--skip-build', action='store_true', help='package the builds already there')
@@ -286,6 +298,8 @@ def main():
         parser.error(f'--platforms: {", ".join(PLATFORMS)}')
     if 'windows' in platforms and os.name != 'nt' and not args.skip_build:
         parser.error('the Windows engines build on Windows (--skip-build packages builds made there)')
+    if 'macos' in platforms and sys.platform != 'darwin' and not args.skip_build:
+        parser.error('the macOS program builds on a Mac (--skip-build packages its macos-native folder)')
     tag, prerelease = release_tag(args)
     dirty = git_out('status', '--porcelain', '--untracked-files=no')
     if dirty and not args.allow_dirty:
@@ -313,6 +327,8 @@ def main():
     if not args.skip_build:
         if 'linux' in platforms:  # first: it checks out the commit itself, so it fails early on an unpushed tree
             build_linux(args, tag, commit, out / 'linux-native')
+        if 'macos' in platforms:
+            build_macos(args, tag, commit, out / 'macos-native')
         if 'windows' in platforms:
             build_windows(args, tag)
 
@@ -333,6 +349,9 @@ def main():
         if platform == 'windows':
             top = stage_windows(out / 'stage-windows', info)
             write_zip(top, archive)
+        elif platform == 'macos':
+            top = stage_linux(out / 'stage-macos', out / 'macos-native', info, 'macOS')
+            write_tar(top, archive)
         else:
             top = stage_linux(out / 'stage-linux', out / 'linux-native', info)
             write_tar(top, archive)

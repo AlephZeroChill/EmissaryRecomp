@@ -253,6 +253,11 @@ def build_game(args, game, build):
     # prebuilt package aurora picks for MinGW is the official SDL3, which has no libusb: it never sees the official
     # GameCube adapter (WUP-028, a WinUSB device, not HID), so its controllers did nothing in the game.
     sdl = ['-DAURORA_SDL3_PROVIDER=vendor', '-DAURORA_SDL3_LIBUSB=ON'] if os.name == 'nt' else []
+    if sys.platform == 'darwin':
+        # macOS: a program that runs on other Macs. SDL, abseil, FreeType and libpng are built from source rather
+        # than found in Homebrew or XQuartz (/opt/X11, also as /usr/X11R6), whose libraries exist only on the build
+        # Mac and target its own macOS version.
+        sdl = ['-DAURORA_SDL3_PROVIDER=vendor', '-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/X11;/usr/X11R6']
     run(args.cmake, '-S', wc / 'runtime', '-B', build / 'native', '-G', 'Ninja', *sdl,
         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={Path(shutil.which("clang")).as_posix()}',
         f'-DCMAKE_CXX_COMPILER={Path(shutil.which("clang++")).as_posix()}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}',
