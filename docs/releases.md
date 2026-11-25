@@ -68,6 +68,7 @@ EmissaryRecomp/
   dsp_coef.bin           the Wii DSP coefficient ROM
   wii_bootstrap/         the Wii's first-run NAND files
   Sys/Rollback/          Brawl Online's rollback region sets (gp-v*.json), read beside the program
+  Sys/Resources/         the in-game UI's fonts, and Emissary's title card (emissary_mask.png, emissary_wordmark.png)
   startup/smash_ball.png the title card's art
   release.json           the manifest without the assets (what this folder is)
   README.txt, LICENSE.txt, CREDITS.txt, licenses/
