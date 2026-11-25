@@ -34,6 +34,10 @@ template <typename T> void Write(uint32_t addr, T value) {
 }
 }
 
+namespace BrawlDirtyMemory {
+inline void MarkHost(const void*, size_t) {}
+}
+
 namespace GuestFlat {
 inline bool RequiresCheckedAccess() noexcept { return true; }
 }
@@ -52,6 +56,11 @@ public:
 };
 
 namespace MemoryInline {
+template <typename T> T FlatLoad(uint32_t a) { return PsqTestMemory::Read<T>(a); }
+template <typename T> void FlatStore(uint32_t a, T v) { PsqTestMemory::Write(a, v); }
+inline uint8_t* LeanHost(uint32_t a) { return PsqTestMemory::Pointer(a); }
+inline bool LeanStoreNeedsPolicy(uint32_t) { return true; }
+
 inline bool FlatWriteNeedsPolicy(uint32_t) { return true; }
 inline bool TryGetPointerFast(uint32_t a, size_t, uint8_t*& host) {
     host = PsqTestMemory::directStack ? PsqTestMemory::Pointer(a) : nullptr;
@@ -80,4 +89,7 @@ PSQ_TEST_MEMORY_WIDTH(16, uint16_t)
 PSQ_TEST_MEMORY_WIDTH(32, uint32_t)
 PSQ_TEST_MEMORY_WIDTH(64, uint64_t)
 #undef PSQ_TEST_MEMORY_WIDTH
+inline void SegWrite32(uint8_t* h, uint32_t o, uint32_t a, uint32_t v) {
+    WriteResolved32(h, o, a, v);
+}
 }

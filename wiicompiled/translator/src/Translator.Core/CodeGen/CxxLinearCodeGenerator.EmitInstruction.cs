@@ -236,6 +236,12 @@ public sealed partial class CxxLinearCodeGenerator
                     var template = $"<{store.W}u, {store.I}u{known}>";
                     var value = ToPairedFloatExpression(store.Source, types, localPaired);
                     var address = ToExpression(store.OriginalAddress, types);
+                    if (_segmentPsqStores && !store.KnownGqr.HasValue && store.W == 0 &&
+                        !IsPairedFloatValue(store.Source, localPaired))
+                    {
+                        sb.AppendLine($"{pad}PPC_PsqStScalarSegmentInline<{store.I}u>(ctx, {store.Range}, {store.RangeOffset}u, {address}, {ToExpression(store.Source, types)});");
+                        break;
+                    }
                     var knownCall = $"{helper}{template}(ctx, {store.Range}, {store.RangeOffset}u, {address}, {value})";
                     if (store.GuardKnownGqr && store.KnownGqr.HasValue)
                     {

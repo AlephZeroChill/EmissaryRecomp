@@ -456,21 +456,31 @@ set_target_properties(mkw_platform PROPERTIES UNITY_BUILD OFF)
 # project's host-platform contracts, not Aurora's third-party test suite.
 enable_testing()
 if(MKW_BUILD_PSQ_TESTS)
-    add_executable(mkw_psq_helpers_tests
-        "${CMAKE_CURRENT_LIST_DIR}/tests/psq_helpers_tests.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp")
-    target_include_directories(mkw_psq_helpers_tests PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/tests/psq_memory"
-        "${CMAKE_CURRENT_LIST_DIR}/include/isa"
-        "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
-    target_compile_options(mkw_psq_helpers_tests PRIVATE
-        "$<$<CONFIG:Release>:-O2>" ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-        target_compile_options(mkw_psq_helpers_tests PRIVATE ${MKW_BASELINE_ARCH_FLAG})
-    endif()
-    set_target_properties(mkw_psq_helpers_tests PROPERTIES UNITY_BUILD OFF)
-    add_test(NAME mkw_psq_helpers_tests COMMAND mkw_psq_helpers_tests)
+    foreach(psq_test IN ITEMS helpers scalar_store scalar_store_lean)
+        set(psq_source "${psq_test}")
+        set(psq_lean 0)
+        if(psq_test STREQUAL "scalar_store_lean")
+            set(psq_source scalar_store)
+            set(psq_lean 1)
+        endif()
+        set(psq_target "mkw_psq_${psq_test}_tests")
+        add_executable(${psq_target}
+            "${CMAKE_CURRENT_LIST_DIR}/tests/psq_${psq_source}_tests.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp")
+        target_include_directories(${psq_target} PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/tests/psq_memory"
+            "${CMAKE_CURRENT_LIST_DIR}/include/isa"
+            "${CMAKE_CURRENT_LIST_DIR}/include")
+        target_compile_features(${psq_target} PRIVATE cxx_std_17)
+        target_compile_definitions(${psq_target} PRIVATE MKW_LEAN_MEMORY=${psq_lean})
+        target_compile_options(${psq_target} PRIVATE
+            "$<$<CONFIG:Release>:-O2>" ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+            target_compile_options(${psq_target} PRIVATE ${MKW_BASELINE_ARCH_FLAG})
+        endif()
+        set_target_properties(${psq_target} PROPERTIES UNITY_BUILD OFF)
+        add_test(NAME ${psq_target} COMMAND ${psq_target})
+    endforeach()
     add_test(NAME mkw_psq_reserved_tests COMMAND "${CMAKE_COMMAND}"
         "-DPSQ_TEST_EXECUTABLE=$<TARGET_FILE:mkw_psq_helpers_tests>"
         "-DPSQ_TEST_EMULATOR=$<TARGET_PROPERTY:mkw_psq_helpers_tests,CROSSCOMPILING_EMULATOR>"
