@@ -145,6 +145,10 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
     include("${_aurora_sdl3_patches}")
     if (DEFINED FETCHCONTENT_SOURCE_DIR_SDL AND EXISTS "${FETCHCONTENT_SOURCE_DIR_SDL}")
       aurora_sdl3_apply_patches("${FETCHCONTENT_SOURCE_DIR_SDL}")
+    elseif (EXISTS "${FETCHCONTENT_BASE_DIR}/sdl-src/CMakeLists.txt")
+      # A tree an earlier configure downloaded: its PATCH_COMMAND ran then and won't again, so a patch added since (the
+      # macOS libusb one) reaches an existing build folder only from here. Each patch is skipped where it is applied.
+      aurora_sdl3_apply_patches("${FETCHCONTENT_BASE_DIR}/sdl-src")
     endif ()
     FetchContent_Declare(SDL
       URL "https://github.com/libsdl-org/SDL/releases/download/release-${AURORA_SDL3_VERSION}/SDL3-${AURORA_SDL3_VERSION}.tar.gz"
