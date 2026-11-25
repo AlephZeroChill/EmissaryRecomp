@@ -82,7 +82,20 @@ std::optional<std::filesystem::path> ExecutableDirectory() noexcept {
     }
     return std::nullopt;
 #else
-    if (const auto executable = ExecutablePath()) return executable->parent_path();
+    if (const auto executable = ExecutablePath()) {
+#if defined(__APPLE__)
+        // A macOS app's program is <X>.app/Contents/MacOS/<name> (Brawl Online's releases ship Emissary.app, so the
+        // Dock, the menu bar and Cmd-Tab name and show the game): its files (DSP ROM, Sys/, the Wii bootstrap NAND,
+        // portable.txt) are beside the bundle, as they are beside the program on Windows and Linux.
+        const std::filesystem::path macos = executable->parent_path();
+        const std::filesystem::path contents = macos.parent_path();
+        if (macos.filename() == "MacOS" && contents.filename() == "Contents" &&
+            contents.parent_path().extension() == ".app") {
+            return contents.parent_path().parent_path();
+        }
+#endif
+        return executable->parent_path();
+    }
     return std::nullopt;
 #endif
 }

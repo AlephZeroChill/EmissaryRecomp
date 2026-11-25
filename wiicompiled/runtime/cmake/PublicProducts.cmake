@@ -118,7 +118,9 @@ if(BRAWL_ONLINE_ROOT)
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf"
         # Emissary's title card (tools/make_emissary_title.py).
         "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_mask.png"
-        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_wordmark.png")
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_wordmark.png"
+        # Emissary's icon, for the window on Linux (tools/make_emissary_icon.py).
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/icon/emissary.png")
 endif()
 mkw_configure_object_target(mkw_runtime_common)
 target_compile_features(mkw_runtime_common PRIVATE cxx_std_20)
@@ -289,7 +291,8 @@ function(mkw_configure_product target)
         aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
     if(MKW_PLATFORM_MACOS)
         target_link_libraries(${target} PRIVATE
-            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}")
+            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}"
+            "-framework CoreVideo" "-framework CoreGraphics")  # src/display_timing_macos.cpp
         target_link_options(${target} PRIVATE
             "LINKER:-U,_OBJC_CLASS_$_MTLLogStateDescriptor")
         # Weak references to what a build may leave out (ELF makes them null by itself; ld64 wants
@@ -430,11 +433,26 @@ endif()
 target_precompile_headers(WiiCompiled PRIVATE
     "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
 if(MKW_PLATFORM_WINDOWS)
-    # The app icon (tools/make_icon.py: the Smash Ball): Explorer, the taskbar and, through SDL's
-    # default of the executable's first icon, the game window.
+    # The app icon (tools/make_icon.py: the Smash Ball; Brawl Online's build: tools/make_emissary_icon.py, the
+    # Emissary mask): Explorer, the taskbar and, through SDL's default of the executable's first icon, the game window.
     enable_language(RC)
-    file(TO_CMAKE_PATH "${MKW_RUNTIME_SOURCE_DIR}/assets/icon/brawl.ico" MKW_APP_ICON)
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc" "1 ICON \"${MKW_APP_ICON}\"\n")
+    set(MKW_APP_VERSION_RC "")
+    if(BRAWL_ONLINE_ROOT)
+        file(TO_CMAKE_PATH "${MKW_RUNTIME_SOURCE_DIR}/assets/icon/emissary.ico" MKW_APP_ICON)
+        # The name Windows shows for the program (Task Manager, the taskbar's menus): Emissary, not WiiCompiled.exe.
+        string(CONCAT MKW_APP_VERSION_RC
+            "1 VERSIONINFO\nFILEVERSION 0,0,0,0\nPRODUCTVERSION 0,0,0,0\nFILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n"
+            "  BLOCK \"StringFileInfo\"\n  BEGIN\n    BLOCK \"040904B0\"\n    BEGIN\n"
+            # Each string ends in \0 itself: llvm-rc (llvm-mingw's) writes none, and Windows then reads them as empty.
+            "      VALUE \"FileDescription\", \"Emissary\\0\"\n"
+            "      VALUE \"ProductName\", \"EmissaryRecomp\\0\"\n"
+            "      VALUE \"ProductVersion\", \"${MKW_RELEASE_VERSION}\\0\"\n"
+            "      VALUE \"LegalCopyright\", \"GPLv3: EmissaryRecomp by kalomaze, BrawlRecompiled by JosiahG, WiiCompiled by patchzyy\\0\"\n"
+            "    END\n  END\n  BLOCK \"VarFileInfo\"\n  BEGIN\n    VALUE \"Translation\", 0x409, 1200\n  END\nEND\n")
+    else()
+        file(TO_CMAKE_PATH "${MKW_RUNTIME_SOURCE_DIR}/assets/icon/brawl.ico" MKW_APP_ICON)
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc" "1 ICON \"${MKW_APP_ICON}\"\n${MKW_APP_VERSION_RC}")
     target_sources(WiiCompiled PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc")
     if(TARGET WiiCompiledLoader)
         target_sources(WiiCompiledLoader PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc")

@@ -31,7 +31,7 @@ ENGINE = 'emissary'  # the engine's name as Brawl Online's servers learn it (bra
 PLATFORMS = {
     'windows': {'asset': '{p}-{tag}-Windows.zip', 'program': 'WiiCompiled.exe'},
     'linux': {'asset': '{p}-{tag}-Linux.tar.gz', 'program': 'WiiCompiled'},
-    'macos': {'asset': '{p}-{tag}-macOS.tar.gz', 'program': 'WiiCompiled'},  # Apple silicon
+    'macos': {'asset': '{p}-{tag}-macOS.tar.gz', 'program': 'Emissary.app/Contents/MacOS/Emissary'},  # Apple silicon
 }
 TAG = re.compile(r'^v(\d+\.\d+\.\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$')
 
@@ -167,17 +167,21 @@ def stage_windows(stage: Path, info: dict) -> Path:
 
 
 def stage_linux(stage: Path, native: Path, info: dict, system: str = 'Linux') -> Path:
-    """The Linux download, or the macOS one (the same layout: the program and its files, LF text)."""
+    """The Linux download, or the macOS one (the same layout, LF text; on macOS the program is Emissary.app, signed by
+    release-macos.sh, with the files beside it)."""
     top = stage / TOP
     if stage.exists():
         shutil.rmtree(stage)
     top.mkdir(parents=True)
-    for need in ('WiiCompiled', 'dsp_coef.bin', 'cacert.pem', 'wii_bootstrap', 'Sys/Rollback'):
+    program = 'Emissary.app/Contents/MacOS/Emissary' if system == 'macOS' else 'WiiCompiled'
+    for need in (program, 'dsp_coef.bin', 'cacert.pem', 'wii_bootstrap', 'Sys/Rollback'):
         if not (native / need).exists():
             raise RuntimeError(f'missing {native / need}: the {system} build did not finish')
     for f in sorted(native.iterdir()):
         if f.is_file():  # WiiCompiled, any library it bundles, dsp_coef.bin, cacert.pem
             shutil.copyfile(f, top / f.name)
+    if system == 'macOS':
+        copy_tree(native / 'Emissary.app', top / 'Emissary.app')
     copy_tree(native / 'wii_bootstrap', top / 'wii_bootstrap')
     copy_tree(native / 'Sys', top / 'Sys')
     stage_common(top, info, '\n')
@@ -201,7 +205,8 @@ def write_tar(top: Path, archive: Path):
     # its shared libraries 0755, the rest 0644, owned by no one in particular.
     def entry(info: tarfile.TarInfo) -> tarfile.TarInfo:
         name = PurePosixPath(info.name).name
-        executable = info.isdir() or name == 'WiiCompiled' or '.so' in name or name.endswith('.dylib')
+        executable = (info.isdir() or name == 'WiiCompiled' or '.so' in name or name.endswith('.dylib') or
+                      info.name.endswith('.app/Contents/MacOS/Emissary'))
         info.mode = 0o755 if executable else 0o644
         info.uid = info.gid = 0
         info.uname = info.gname = ''

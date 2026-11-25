@@ -68,6 +68,12 @@ extern "C" int HorizonDisplaySize(unsigned* width, unsigned* height);  // platfo
 #include "netplay_ui.h"
 #include "netplay_start.h"
 #include "netplay_session.h"
+#include "platform/host_platform.h"
+#include <optional>
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_surface.h>
+#include <SDL3/SDL_video.h>
+extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint32_t* height);
 #include "frame_input.h"
 #include "det_clock.h"
 #include "game_folder.h"
@@ -104,6 +110,28 @@ namespace {
 
 // Defined below, beside the fatal-log machinery.
 std::string FormatHostStackTrace(unsigned framesToSkip = 0);
+
+#if MKW_BRAWL_ONLINE_CORE && !defined(_WIN32) && !defined(__APPLE__)
+// The window's icon from a PNG in Sys/Resources beside the program.
+void SetWindowIconFromFile(SDL_Window* window, const std::optional<std::filesystem::path>& directory, const char* file) {
+    if (window == nullptr || !directory) return;
+    const std::string path = RuntimeConfigFile::PathToUtf8(*directory / "Sys" / "Resources" / file);
+    uint32_t width = 0, height = 0;
+    uint8_t* rgba = aurora_load_png_rgba(path.c_str(), &width, &height);
+    if (rgba == nullptr) {
+        RT_LOGF(RT_TAG_RUNTIME, "window icon: could not read %s\n", path.c_str());
+        return;
+    }
+    if (SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(width), static_cast<int>(height),
+                                                     SDL_PIXELFORMAT_RGBA32, rgba, static_cast<int>(width) * 4)) {
+        if (!SDL_SetWindowIcon(window, surface)) {
+            RT_LOGF(RT_TAG_RUNTIME, "window icon: %s\n", SDL_GetError());
+        }
+        SDL_DestroySurface(surface);
+    }
+    std::free(rgba);
+}
+#endif
 
 void ServiceGuestTimingDuringAuroraFrameWait() {
     // Aurora can block inside FIFO drains before control returns to GX HLE, for as long as a
@@ -907,7 +935,11 @@ void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) 
         message.append("\n\nThe full log of this run is console.log in:\n");
         message.append(RuntimeConfigFile::PathToUtf8(GetRunLogDirectory()));
 #if defined(_WIN32)
+#if MKW_BRAWL_ONLINE_CORE
+        ::MessageBoxA(nullptr, message.c_str(), "Emissary - Fatal Error",
+#else
         ::MessageBoxA(nullptr, message.c_str(), "WiiCompiled - Fatal Error",
+#endif
                       MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL);
 #else
         // Retain the console diagnostic when no native dialog is available.
@@ -1279,6 +1311,17 @@ static void TerminateHandler() {
 
 // Runtime entry point: loads the configuration, brings up aurora and runs the game.
 int RuntimeMain(int argc, char** argv) {
+#if defined(__APPLE__)
+    // Run from Emissary.app (Brawl Online's macOS release), the program's files are beside the bundle
+    // (RuntimePlatform::ExecutableDirectory): files named relative to the working directory (the title card's
+    // startup/ art) are found there too, whatever folder it was started from (the launcher's: Contents/MacOS).
+    if (const auto executable = RuntimePlatform::ExecutablePath()) {
+        if (const auto directory = RuntimeConfigFile::ExecutableDirectory(); directory && *directory != executable->parent_path()) {
+            std::error_code ec;
+            std::filesystem::current_path(*directory, ec);
+        }
+    }
+#endif
     // Must run before the transcript duplicates stdout/stderr: it decides what
     // those descriptors are mirrored to now that the products are GUI-subsystem.
     AttachParentConsoleForDiagnostics();
@@ -1394,6 +1437,11 @@ int RuntimeMain(int argc, char** argv) {
         // This is required for GX commands (like texture loading) to work.
         AuroraConfig auroraConfig = {};
         auroraConfig.appName = "Super Smash Bros. Brawl";
+#if MKW_BRAWL_ONLINE_CORE
+        // Brawl Online's build is Emissary to the desktop: Linux's app id and class (a taskbar entry of its own),
+        // macOS's name when not run from Emissary.app. The window's title stays the game's.
+        SDL_SetAppMetadata("Emissary", nullptr, "net.brawlonline.emissary");
+#endif
         const auto applicationDataDirectory = RuntimeConfigFile::ApplicationDataDirectory();
         const auto rendererCacheDirectory = applicationDataDirectory / "Cache";
         std::error_code rendererPathError;
@@ -1550,10 +1598,22 @@ int RuntimeMain(int argc, char** argv) {
         }
         GraphicsInfo::Set(auroraInfo.gpuName != nullptr ? auroraInfo.gpuName : "", auroraInfo.gpuCompatActive);
         // BRAWL_ASSUME_INTEGRATED_GPU=1 tests the integrated-GPU limits on a PC with a graphics card.
+#if defined(__APPLE__)
+        // Apple silicon's GPU shares the CPU's memory (aurora calls it integrated), but the integrated-GPU limits are for
+        // a PC's (a first start on Low, which allows no frame rate above 60, and 1080p at most): an M-series GPU plays
+        // High, and 120 to 240 fps, like a graphics card.
+        GraphicsInfo::SetIntegrated(std::getenv("BRAWL_ASSUME_INTEGRATED_GPU") != nullptr);
+#else
         GraphicsInfo::SetIntegrated(auroraInfo.gpuIntegrated || std::getenv("BRAWL_ASSUME_INTEGRATED_GPU") != nullptr);
+#endif
         GraphicsInfo::SetMemoryBytes(auroraInfo.gpuMemoryBytes);
         // V-Sync's automatic setting needs to know whether the screen follows the frames (G-Sync, FreeSync).
         DisplayRefresh::Start(auroraInfo.window);
+#if MKW_BRAWL_ONLINE_CORE && !defined(_WIN32) && !defined(__APPLE__)
+        // Emissary's icon on the window (the taskbar's and the window switcher's). Windows takes the program's icon
+        // and macOS Emissary.app's, both of which are this one (tools/make_emissary_icon.py).
+        SetWindowIconFromFile(auroraInfo.window, runtimeDirectory, "emissary.png");
+#endif
         RT_LOG(RT_TAG_RUNTIME) << "graphics adapter: " << GraphicsInfo::Name() << ", compatibility fixes "
                   << (auroraInfo.gpuCompatActive ? "on" : "off") << std::endl;
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);

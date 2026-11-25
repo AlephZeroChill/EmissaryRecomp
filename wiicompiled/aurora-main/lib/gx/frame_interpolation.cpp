@@ -24,6 +24,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace aurora {
+// aurora.cpp: the refresh period of the screen the window is on, 0 when unknown.
+extern std::atomic<uint64_t> g_displayPeriodNanos;
+} // namespace aurora
+
 namespace aurora::gx {
 namespace detail {
 std::atomic_uint32_t g_frameInterpolationFps{0};
@@ -343,7 +348,17 @@ uint32_t maximum_interpolation_samples() noexcept {
   if (targetFps == 0) {
     return 0;
   }
-  return std::min(targetFps / 60 - 1, MaxInterpolatedFrames);
+  uint32_t samples = std::min(targetFps / 60 - 1, MaxInterpolatedFrames);
+  // No more inserted frames than the screen can show. The presenter puts each one at least a refresh after the
+  // previous present, so on a screen slower than the target (240 on a 120 Hz MacBook, 180 or 240 on a 144 Hz monitor)
+  // the extra ones queued behind it and held the game itself back: 23 game frames a second at 240 on 120 Hz. Now the
+  // target counts as the screen's: 120 Hz shows 120 (one inserted frame), 144 and 165 Hz 120, 180 Hz 180, 240 Hz 240.
+  const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
+  if (period != 0) {
+    const auto refreshesPerFrame = static_cast<uint32_t>(1e9 / static_cast<double>(period) / 60.0 + 0.05);
+    samples = std::min(samples, refreshesPerFrame > 0 ? refreshesPerFrame - 1 : 0u);
+  }
+  return samples;
 }
 
 constexpr float kMinimumScale = 1.0e-5f;

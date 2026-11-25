@@ -19,6 +19,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <signal.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
 #endif
 
 #if MKW_DOLPHIN_CONTROLS
@@ -46,6 +53,10 @@ HANDLE s_window_process = nullptr;
 // controller and the next window said "Insufficient permissions" (Sarah's board, card 797). Dolphin saves each change
 // as it is made, and a posted WM_CLOSE doesn't close that window, so ending it loses nothing and needs no asking.
 HANDLE s_window_job = nullptr;
+#else
+// macOS and Linux: the window runs under a small shell that ends it when the game's process is gone (the job's part),
+// checking twice a second; this is the shell's pid while it runs.
+pid_t s_window_watcher = 0;
 #endif
 
 std::wstring Wide(const std::string& text) {
@@ -70,6 +81,11 @@ bool WindowShowingLocked() {
     s_next_check = {};
     return false;
 #else
+    if (s_window_watcher <= 0) return false;
+    int status = 0;
+    if (waitpid(s_window_watcher, &status, WNOHANG) == 0) return true;
+    s_window_watcher = 0;
+    s_next_check = {};
     return false;
 #endif
 }
@@ -227,7 +243,29 @@ bool DolphinControllersOpen() {
     std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: started (pid %lu)\n", process.dwProcessId);
     return true;
 #else
-    return false;
+    // As on Windows, and tied to the game: the shell starts Dolphin ($2 -u $3 --controllers) and ends it once the
+    // game ($1) is gone, however the game ended; it ends by itself when Dolphin's window is closed.
+    static const char kWatcher[] =
+        "\"$2\" -u \"$3\" --controllers & d=$!\n"
+        "trap 'kill $d 2>/dev/null; exit 0' TERM\n"
+        "while kill -0 \"$1\" 2>/dev/null && kill -0 $d 2>/dev/null; do sleep 0.5; done\n"
+        "kill $d 2>/dev/null\n"
+        "wait $d 2>/dev/null\n";
+    const std::string game = std::to_string(static_cast<long>(getpid()));
+    const std::string user = s_user;
+    char* const argv[] = {const_cast<char*>("sh"), const_cast<char*>("-c"), const_cast<char*>(kWatcher),
+                          const_cast<char*>("sh"), const_cast<char*>(game.c_str()), const_cast<char*>(exe),
+                          const_cast<char*>(user.c_str()), nullptr};
+    pid_t pid = 0;
+    const int error = posix_spawn(&pid, "/bin/sh", nullptr, nullptr, argv, environ);
+    if (error != 0) {
+        std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: could not start %s (error %d)\n", exe, error);
+        return false;
+    }
+    s_window_watcher = pid;
+    std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: started (watcher pid %ld)\n",
+                 static_cast<long>(pid));
+    return true;
 #endif
 }
 

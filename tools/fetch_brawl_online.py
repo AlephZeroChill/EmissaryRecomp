@@ -50,6 +50,11 @@ PATHS = [
     'dolphin/Source/Core/Core/Rollback/InputTrace.h',
     'dolphin/Source/Core/Core/Online/MatchQoS.cpp',
     'dolphin/Source/Core/Core/Online/MatchQoS.h',
+    # A room's SPECIAL page: P+'s Special Versus box from the game's SD card image (core/standalone, card 806).
+    'dolphin/Source/Core/Core/Online/SpecialAssets.cpp',
+    'dolphin/Source/Core/Core/Online/SpecialAssets.h',
+    'dolphin/Source/Core/Core/Rollback/CardFat.cpp',
+    'dolphin/Source/Core/Core/Rollback/CardFat.h',
     'dolphin/Data/Sys/Rollback/',
     # The in-game UI's fonts (runtime/cmake/PublicProducts.cmake copies them to Sys/Resources).
     'dolphin/Data/Sys/Resources/OSD_Font.ttf',

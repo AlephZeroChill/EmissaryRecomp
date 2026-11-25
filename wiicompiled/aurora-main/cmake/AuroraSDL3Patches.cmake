@@ -342,6 +342,18 @@ char *SDL_SYS_GetCurrentDirectory(void)
         SDL_UnlockMutex(renderer->defragGate);
     }
 ]==])
+
+  # macOS: open libusb devices without detaching the kernel's driver first. The GameCube adapter (WUP-028) is a HID
+  # interface that macOS's HID driver holds; libusb can detach it only with root or a device-access entitlement
+  # (LIBUSB_ERROR_ACCESS), and hidapi gave the device up on that failure, so no controller on the adapter ever showed.
+  # Claiming the interface with the driver still attached works on macOS (the adapter's reports read normally).
+  _aurora_sdl3_replace("${sdl_source_dir}/src/hidapi/libusb/hid.c" "libusb: no kernel driver detach on macOS"
+[==[#ifndef __FreeBSD__
+#define DETACH_KERNEL_DRIVER
+#endif]==]
+[==[#if !defined(__FreeBSD__) && !defined(__APPLE__) /* WiiCompiled: see AuroraSDL3Patches.cmake */
+#define DETACH_KERNEL_DRIVER
+#endif]==])
 endfunction()
 
 # Script mode (FetchContent PATCH_COMMAND).

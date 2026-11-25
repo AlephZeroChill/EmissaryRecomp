@@ -24,6 +24,12 @@
 
 #include <cstdio>
 #include <exception>
+#if defined(__APPLE__)
+// The Objective-C runtime's two calls used here, declared rather than included: <objc/objc.h>'s BOOL is not the Wii
+// SDK's (dolphin/types.h), and this file sees both.
+extern "C" struct objc_selector* sel_registerName(const char* name);
+extern "C" void objc_msgSend();
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -571,6 +577,15 @@ bool DolphinControlsLoaded() {
             if (count > 0)
                 window = SDL_GetPointerProperty(SDL_GetWindowProperties(windows[0]), SDL_PROP_WINDOW_WIN32_HWND_POINTER,
                                                 nullptr);
+#elif defined(__APPLE__)
+            // Dolphin's macOS keyboard and mouse (Quartz) take the window's content view.
+            if (count > 0) {
+                if (void* ns_window = SDL_GetPointerProperty(SDL_GetWindowProperties(windows[0]),
+                                                             SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr)) {
+                    window = reinterpret_cast<void* (*)(void*, objc_selector*)>(objc_msgSend)(
+                        ns_window, sel_registerName("contentView"));
+                }
+            }
 #endif
             SDL_free(windows);
         }

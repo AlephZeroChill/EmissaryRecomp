@@ -54,7 +54,8 @@ Each release has these assets:
 | `SHA256SUMS` | the sha256 of the other assets, for `sha256sum -c` |
 
 Each archive has one top folder, `EmissaryRecomp/`, with the program at its top (the launcher looks for
-`WiiCompiled[.exe]` in the archive's top folder, removes any `portable.txt` and `UserData` it finds beside it, and keeps
+`WiiCompiled[.exe]`, on macOS `Emissary.app/Contents/MacOS/Emissary`, in the archive's top folder, removes any
+`portable.txt` and `UserData` it finds beside it, and keeps
 the player's settings, saves and logs above the version folders):
 
 ```
@@ -65,8 +66,9 @@ EmissaryRecomp/
   SDL3.dll, libc++.dll, libunwind.dll, libpng16.dll, libz.dll                      (Windows; Windows' own UCRT)
   WiiCompiled            Linux: the program (RUNPATH $ORIGIN)                        (Linux)
   lib*.so*               any library the build made itself (none today: it needs only libz, glibc, libstdc++) (Linux)
-  WiiCompiled            macOS: the program (rpath @executable_path, signed ad hoc)  (macOS)
-  lib*.dylib             any library the build made itself (libpng, when it is shared) (macOS)
+  Emissary.app/          macOS: the program as an app (Contents/MacOS/Emissary, Info.plist, Emissary.icns), so the
+                         Dock, the menu bar and Cmd-Tab show "Emissary" and its icon; libraries the build made itself
+                         in Contents/Frameworks; signed ad hoc. Its files are the ones beside it.   (macOS)
   cacert.pem             TLS roots for the game's own HTTPS (Schannel on Windows)    (Linux, macOS)
   dsp_coef.bin           the Wii DSP coefficient ROM
   wii_bootstrap/         the Wii's first-run NAND files
@@ -127,9 +129,10 @@ python tools\release.py --game D:\path\to\extracted\DATA --prerelease rc.1 --pub
 2. Both Windows engines: `tools/build-brawl.ps1 -NoPlay -BrawlOnline lock -ReleaseVersion <tag>` (`build/release`,
    engine_usa.dll and the loader), then with `-OldCpu` (`build/release-v2`, engine_usa_v2.dll).
 3. The macOS program (`--platforms ...,macos`, on an Apple silicon Mac only): `tools/release-macos.sh` builds the
-   commit the same way in `~/emissary-release-macos` and copies it to `dist/<tag>/macos-native/`, with the libraries
-   the build made itself beside it (rpath `@executable_path`), refusing any library outside `/usr/lib` and `/System`
-   (Homebrew's and XQuartz's, which `tools/build.py` keeps out of a macOS build), signed ad hoc. A release with Windows
+   commit the same way in `~/emissary-release-macos` and puts it in `dist/<tag>/macos-native/` as `Emissary.app`
+   (Info.plist, the icon from `tools/make_emissary_icon.py`, the libraries the build made itself in its Frameworks),
+   refusing any library outside `/usr/lib` and `/System` (Homebrew's and XQuartz's, which `tools/build.py` keeps out of
+   a macOS build), signed ad hoc, with the game's files beside it. A release with Windows
    too is packaged on the Windows machine: copy `macos-native/` into its `dist/<tag>/` and run with `--skip-build`.
    (`EMISSARY_RELEASE_CORE=<checkout>` links that core instead of the lock's: Brawl Online's staging.)
 4. The archives, `manifest.json` and `SHA256SUMS` in `dist/<tag>/`.

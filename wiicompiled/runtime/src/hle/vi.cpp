@@ -45,6 +45,11 @@
 #endif
 #include <windows.h>
 #include <dwmapi.h>
+#elif !defined(__SWITCH__)
+#include <sys/resource.h>
+#endif
+#if defined(__APPLE__)
+#include "display_timing_macos.h"
 #endif
 
 #include <aurora/aurora.h>
@@ -179,7 +184,7 @@ constexpr uint32_t kViRetraceQueueAddr      = 0x805a0828;  // retraceQueue (NSMB
 
 
 // ============================================================================
-// V-Sync display lock (Windows)
+// V-Sync display lock (Windows: DWM's timing; macOS: a CoreVideo display link)
 // ============================================================================
 // With V-Sync on, presents wait for vblank. A game clock of exactly 60.000 Hz against a display that
 // really runs at 59.94 (or 179.96 / 3) drops or repeats a frame every few seconds, and a full flip
@@ -198,6 +203,9 @@ struct DisplayLock {
     bool logged = false;
 };
 DisplayLock g_displayLock;  // under g_viGuard
+#if defined(__APPLE__)
+const Clock::time_point g_displayLockSince = Clock::now();  // the display link's first report takes a moment
+#endif
 
 void RefreshDisplayLockLocked(Clock::time_point now) {
     DisplayLock& d = g_displayLock;
@@ -242,6 +250,30 @@ void RefreshDisplayLockLocked(Clock::time_point now) {
     d.period = period;
     d.vblank = steadyNow - std::chrono::nanoseconds(static_cast<int64_t>(
                                static_cast<double>(qpcNow.QuadPart - static_cast<LONGLONG>(info.qpcVBlank)) * nsPerTick));
+    if (!d.logged) {
+        d.logged = true;
+        RT_LOGF(RT_TAG_VI, "V-Sync: display %.3f Hz, %s\n", hz,
+                d.valid ? (std::string("game clock locked at ") + std::to_string(k) + " refresh(es) per frame").c_str()
+                        : "no whole fraction near 60 Hz; the game keeps its own clock");
+    }
+#elif defined(__APPLE__)
+    // The main display's refresh from a CoreVideo display link (display_timing_macos.cpp), as DWM's above.
+    int64_t periodNanos = 0, vblankNanos = 0;
+    if (!DisplayTimingMac::Read(&periodNanos, &vblankNanos)) {
+        if (!d.logged && now - g_displayLockSince > 2s) {
+            d.logged = true;
+            RT_LOGF(RT_TAG_VI, "V-Sync: no display timing; the game keeps its own clock\n");
+        }
+        d.valid = false;
+        return;
+    }
+    const auto period = std::chrono::nanoseconds(periodNanos);
+    const double hz = 1e9 / static_cast<double>(periodNanos);
+    const int k = static_cast<int>(std::lround(hz / 60.0));
+    d.valid = k >= 1 && k <= 8 && std::fabs(hz / k - 60.0) < 60.0 * 0.02;
+    d.k = k;
+    d.period = period;
+    d.vblank = Clock::time_point(std::chrono::nanoseconds(vblankNanos));
     if (!d.logged) {
         d.logged = true;
         RT_LOGF(RT_TAG_VI, "V-Sync: display %.3f Hz, %s\n", hz,
@@ -1180,6 +1212,12 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
                 if (::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user)) {
                     cpu100ns = ((uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
                                ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+                }
+#elif !defined(__SWITCH__)
+                rusage usage{};
+                if (::getrusage(RUSAGE_SELF, &usage) == 0) {
+                    cpu100ns = (uint64_t(usage.ru_utime.tv_sec) + uint64_t(usage.ru_stime.tv_sec)) * 10000000ull +
+                               (uint64_t(usage.ru_utime.tv_usec) + uint64_t(usage.ru_stime.tv_usec)) * 10ull;
                 }
 #endif
                 const uint64_t frames = d.frameLatencyCount - last.frameLatencyCount;
