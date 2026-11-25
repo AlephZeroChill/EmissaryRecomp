@@ -427,6 +427,10 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/lean_base.cpp" PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON)
+# macOS's display timing (V-Sync's display lock) includes CoreVideo, whose headers don't mix with the Wii SDK's.
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/display_timing_macos.cpp" PROPERTIES
+    SKIP_UNITY_BUILD_INCLUSION ON
+    SKIP_PRECOMPILE_HEADERS ON)
 if(NOT MKW_FLAT_MEMORY)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
 endif()

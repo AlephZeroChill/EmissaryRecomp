@@ -1519,8 +1519,10 @@ private:
     bool Load() {
         if (m_tried) return !m_rgba.empty();
         m_tried = true;
-        const char* base = SDL_GetBasePath();
-        const std::string path = std::string(base != nullptr ? base : "") + "Sys/Resources/" + m_file;
+        // Beside the program (beside Emissary.app on macOS, where SDL's base path is the bundle's Resources).
+        const auto base = RuntimeConfigFile::ExecutableDirectory();
+        const std::string path =
+            RuntimeConfigFile::PathToUtf8((base ? *base : std::filesystem::path{}) / "Sys" / "Resources" / m_file);
         uint32_t w = 0, h = 0;
         if (uint8_t* rgba = aurora_load_png_rgba(path.c_str(), &w, &h)) {
             m_rgba.assign(rgba, rgba + size_t(w) * h * 4);
