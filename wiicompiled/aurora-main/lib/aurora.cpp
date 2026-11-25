@@ -1328,6 +1328,7 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
     }
     // A V-Sync change reconfigures the swapchain at this same ordered frame boundary.
     if (gpu::take_vsync_change()) {
+      gpu::apply_present_mode();  // the swapchain's own mode: resize_swapchain only tracks the window's size
       const auto size = window::get_window_size();
       gpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
     }

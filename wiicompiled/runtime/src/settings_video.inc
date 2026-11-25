@@ -167,9 +167,9 @@ void AntiAliasingRows(std::vector<MenuRow>& rows) {
 }
 
 void VSyncRow(std::vector<MenuRow>& rows) {
-    // AUTO -> ON -> OFF. Auto shows what it chose.
+    // AUTO -> ON -> OFF. Auto shows what it chose: off only on a screen that follows the frames (UpdateAutoVSync).
     const int mode = g_vsyncAuto ? 0 : (g_vsync.load() ? 1 : 2);
-    const std::string value = g_vsyncAuto ? std::string("AUTO: ") + OnOff(g_vsync.load()) : OnOff(g_vsync.load());
+    const std::string value = g_vsyncAuto ? (g_vsync.load() ? "AUTO: ON" : "AUTO: G-SYNC") : OnOff(g_vsync.load());
     rows.push_back({"V-Sync", value,
                     "No screen tearing; the game follows your screen's refresh. Auto: off on a G-Sync or FreeSync screen.",
                     [mode](int step) {
