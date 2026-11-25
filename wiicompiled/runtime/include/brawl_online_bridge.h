@@ -72,6 +72,9 @@ void ScreenMessage(const char* text, uint32_t ms, uint32_t argb);
 void StopGame();
 // The width over height the game's picture is shown at (DisplaySettings::PictureAspect; 0 = not known yet).
 float DrawAspect();
+// The SD card image the game plays from (SdCard::PlainImagePath; "" for none), into `out` (NUL-terminated): the
+// core reads P+'s Special Versus box from it (Online/SpecialAssets.h). False when there is none or it is too long.
+bool SdCardImage(char* out, size_t size);
 // The game's thread stands still at the loop top (a replay paused or buffering: the core's
 // Engine::WhileStandingStill, about 30 times a second): the window's events, the controllers read
 // for LeaveButtonsHeld, and the last frame presented again with the UI drawn over it.
