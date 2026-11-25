@@ -204,6 +204,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     elseif(MKW_HOST_ISA STREQUAL "v2")
         target_compile_definitions(mkw_cpu_baseline PRIVATE MKW_HOST_ISA_V2)
     endif()
+    if(BRAWL_ONLINE_ROOT)
+        # Its message box says Emissary in Brawl Online's build.
+        target_compile_definitions(mkw_cpu_baseline PRIVATE MKW_BRAWL_ONLINE_CORE=1)
+    endif()
 endif()
 
 if(NOT MKW_BASE_COMMON_SHARDS)

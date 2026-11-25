@@ -198,7 +198,11 @@ void WriteStdErrEarly(const char* text) {
     WriteStdErrEarly("\n");
 
 #if defined(_WIN32)
+#if MKW_BRAWL_ONLINE_CORE
+    ::MessageBoxA(nullptr, message.data, "Emissary - Unsupported Processor",
+#else
     ::MessageBoxA(nullptr, message.data, "WiiCompiled - Unsupported Processor",
+#endif
                   MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL);
     // Leave through the OS rather than exit(): the C++ dynamic initializers
     // have not run yet, so there is no constructed program state to unwind and

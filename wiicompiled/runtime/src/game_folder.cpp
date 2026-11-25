@@ -24,7 +24,11 @@ bool IsExtractedDisc(const fs::path& path) {
 }
 
 #if defined(_WIN32)
+#if MKW_BRAWL_ONLINE_CORE
+constexpr const wchar_t* kTitle = L"Emissary";
+#else
 constexpr const wchar_t* kTitle = L"Super Smash Bros. Brawl";
+#endif
 
 constexpr const wchar_t* kSteps =
     L"This port runs your own copy of Super Smash Bros. Brawl (USA, RSBE01, revision 1). "

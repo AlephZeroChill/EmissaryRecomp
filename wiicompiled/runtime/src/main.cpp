@@ -1436,11 +1436,14 @@ int RuntimeMain(int argc, char** argv) {
         // We use auto backend (or specific if needed) and set a default window size.
         // This is required for GX commands (like texture loading) to work.
         AuroraConfig auroraConfig = {};
-        auroraConfig.appName = "Super Smash Bros. Brawl";
 #if MKW_BRAWL_ONLINE_CORE
-        // Brawl Online's build is Emissary to the desktop: Linux's app id and class (a taskbar entry of its own),
-        // macOS's name when not run from Emissary.app. The window's title stays the game's.
+        // Brawl Online's build is Emissary to the desktop: the window's title (the title bar, the taskbar's and the
+        // window switcher's label), Linux's app id and class (a taskbar entry of its own), macOS's name when not run
+        // from Emissary.app. The user and cache folders are set below, so the name moves no files.
+        auroraConfig.appName = "Emissary";
         SDL_SetAppMetadata("Emissary", nullptr, "net.brawlonline.emissary");
+#else
+        auroraConfig.appName = "Super Smash Bros. Brawl";
 #endif
         const auto applicationDataDirectory = RuntimeConfigFile::ApplicationDataDirectory();
         const auto rendererCacheDirectory = applicationDataDirectory / "Cache";
