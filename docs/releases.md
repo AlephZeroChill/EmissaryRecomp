@@ -49,6 +49,7 @@ Each release has these assets:
 |---|---|
 | `EmissaryRecomp-<tag>-Windows.zip` | Windows x86-64 |
 | `EmissaryRecomp-<tag>-Linux.tar.gz` | Linux x86-64, glibc 2.38+ (Ubuntu 24.04, Debian 13, SteamOS 3.6, Fedora 39, Arch...) |
+| `EmissaryRecomp-<tag>-macOS.tar.gz` | macOS 12+ on Apple silicon (arm64); only when built on a Mac (`--platforms macos`) |
 | `manifest.json` | what the release is, and the archives' sizes and sha256 |
 | `SHA256SUMS` | the sha256 of the other assets, for `sha256sum -c` |
 
@@ -64,7 +65,9 @@ EmissaryRecomp/
   SDL3.dll, libc++.dll, libunwind.dll, libpng16.dll, libz.dll                      (Windows; Windows' own UCRT)
   WiiCompiled            Linux: the program (RUNPATH $ORIGIN)                        (Linux)
   lib*.so*               any library the build made itself (none today: it needs only libz, glibc, libstdc++) (Linux)
-  cacert.pem             TLS roots for the game's own HTTPS (Schannel on Windows)    (Linux)
+  WiiCompiled            macOS: the program (rpath @executable_path, signed ad hoc)  (macOS)
+  lib*.dylib             any library the build made itself (libpng, when it is shared) (macOS)
+  cacert.pem             TLS roots for the game's own HTTPS (Schannel on Windows)    (Linux, macOS)
   dsp_coef.bin           the Wii DSP coefficient ROM
   wii_bootstrap/         the Wii's first-run NAND files
   Sys/Rollback/          Brawl Online's rollback region sets (gp-v*.json), read beside the program
@@ -123,8 +126,14 @@ python tools\release.py --game D:\path\to\extracted\DATA --prerelease rc.1 --pub
    builds its own checkout in place: `EMISSARY_RELEASE_IN_PLACE=1`.)
 2. Both Windows engines: `tools/build-brawl.ps1 -NoPlay -BrawlOnline lock -ReleaseVersion <tag>` (`build/release`,
    engine_usa.dll and the loader), then with `-OldCpu` (`build/release-v2`, engine_usa_v2.dll).
-3. The archives, `manifest.json` and `SHA256SUMS` in `dist/<tag>/`.
-4. With `--publish`: `gh release create <tag>` at the commit (which must be pushed), a prerelease for a suffixed tag. A
+3. The macOS program (`--platforms ...,macos`, on an Apple silicon Mac only): `tools/release-macos.sh` builds the
+   commit the same way in `~/emissary-release-macos` and copies it to `dist/<tag>/macos-native/`, with the libraries
+   the build made itself beside it (rpath `@executable_path`), refusing any library outside `/usr/lib` and `/System`
+   (Homebrew's and XQuartz's, which `tools/build.py` keeps out of a macOS build), signed ad hoc. A release with Windows
+   too is packaged on the Windows machine: copy `macos-native/` into its `dist/<tag>/` and run with `--skip-build`.
+   (`EMISSARY_RELEASE_CORE=<checkout>` links that core instead of the lock's: Brawl Online's staging.)
+4. The archives, `manifest.json` and `SHA256SUMS` in `dist/<tag>/`.
+5. With `--publish`: `gh release create <tag>` at the commit (which must be pushed), a prerelease for a suffixed tag. A
    release without a suffix is published without becoming `/releases/latest`, which is what every launcher installs:
    `--latest` makes it the latest, or later `gh release edit <tag> --latest`.
 
@@ -241,7 +250,7 @@ when the CI repository does not exist.
 | C | GitHub's runners in a public repository Sarah owns (a fork), the game's code encrypted in a private one | the two repositories, the deploy key and the secrets (`setup_ci.py`, as their owner) | free, three platforms at once, about half an hour to an hour from scratch; only Sarah (and what she pushes) can run it; the game's files are on GitHub, encrypted, in a private repository, decrypted on GitHub's runners for each build; the launcher points at the fork's releases |
 | D | GitHub's runners in a private repository | as C | logs and artifacts private, but 2-core runners and 2,000 free minutes a month (Windows minutes count twice): a few releases a month at most; players cannot download a private repository's releases, so they would be published elsewhere |
 | E | A runner on a home server or VPS | the machine; a Linux runner | one OS (Linux); those machines are already busy. The Windows engines are built with llvm-mingw, which also runs on Linux, so a Linux machine could cross-compile them, but the build (`build-brawl.ps1`, `Prepare-PortableTools.ps1`) is Windows-only today |
-| F | macOS (later) | `macos-15` runners (arm64, 3 cores, 7 GB, free in a public repository) | the game builds for macOS upstream; Brawl Online's core and the launcher do not play on macOS yet |
+| F | macOS (later) | `macos-15` runners (arm64, 3 cores, 7 GB, free in a public repository) | the game, Brawl Online's core and the launcher play on Apple silicon since 2026-11-25 (`tools/release-macos.sh`); CI has no macOS job yet |
 
 The repository variable or the secrets missing, every job is skipped, so the same workflow serves B and C.
 

@@ -292,6 +292,14 @@ function(mkw_configure_product target)
             "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}")
         target_link_options(${target} PRIVATE
             "LINKER:-U,_OBJC_CLASS_$_MTLLogStateDescriptor")
+        # Weak references to what a build may leave out (ELF makes them null by itself; ld64 wants
+        # each named): the linker script's symbol, the PGO runtime, and EABI translations that only
+        # a MKW_EABI_REGS (vanilla) translation has.
+        foreach(weak_symbol IN ITEMS __executable_start __llvm_profile_write_file
+                func_8002E44C_eabi func_8002EB88_eabi func_801A81D4_eabi func_801D7AE4_eabi
+                func_80282CD4_eabi func_80283524_eabi func_80285A6C_eabi func_803F6150_eabi)
+            target_link_options(${target} PRIVATE "LINKER:-U,_${weak_symbol}")
+        endforeach()
     endif()
     if(EXISTS "${MKW_AURORA_DIR}/cmake/AuroraCopyRuntimeDLLs.cmake")
         include("${MKW_AURORA_DIR}/cmake/AuroraCopyRuntimeDLLs.cmake")
