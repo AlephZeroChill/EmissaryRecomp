@@ -32,6 +32,9 @@ public:
         BrawlDirtyMemory::flatBase=flatBase;
     }
     ~WriteWatch(){
+        BrawlDirtyMemory::MarksCleared();
+        for (const auto& page : scanPages)
+            BrawlDirtyMemory::trackedPages[page.index & 0x3FFFu].store(0, std::memory_order_release);
         BrawlDirtyMemory::active.store(false,std::memory_order_relaxed);
         for(auto& p:BrawlDirtyMemory::pages)p=nullptr;
         BrawlDirtyMemory::hosts.clear();
@@ -79,6 +82,8 @@ public:
             static_assert(sizeof(std::atomic<uint8_t>)==1,"dirty marks must be byte sized");
             scanPages.push_back({index,nullptr,
                 reinterpret_cast<std::atomic<uint8_t>*>(BrawlDirtyMemory::leanBlocks+(size_t(index)<<10))});
+            // before Enable's clear and base image: marks the interpreter cleared here until now are not needed
+            BrawlDirtyMemory::trackedPages[index&0x3FFFu].store(1,std::memory_order_release);
 #else
             scanPages.push_back({index,&page->touched,page->blocks});
 #endif
@@ -88,6 +93,7 @@ public:
     // Capture consumes all marks. Enable after the initial base image; later
     // save/restore boundaries need no second walk over clean tracking pages.
     void Enable(){
+        BrawlDirtyMemory::MarksConsuming();  // its clear drops whatever marks are set
 #if MKW_LEAN_MEMORY  // lean stores mark at all times: drop what the base image already holds
         for(const auto& page:scanPages)std::memset(static_cast<void*>(page.blocks),0,1024);
 #endif
@@ -95,6 +101,7 @@ public:
         resetNs=0;
     }
     void Reset(){
+        BrawlDirtyMemory::MarksConsuming();
         const auto start=std::chrono::steady_clock::now();
         // Writers are quiescent here. Capture already cleared consumed pages;
         // an exchange would still issue a locked write for every clean page.
@@ -109,6 +116,7 @@ public:
     }
     // Valid until the next Capture; snapshot workers finish before that boundary.
     const std::vector<uint32_t>& Capture(size_t bytes,SnapshotJobs& jobs){
+        BrawlDirtyMemory::MarksConsuming();  // it clears the marks it consumes
         const auto start=std::chrono::steady_clock::now();
         auto& dirty=capturedKeys;dirty.clear();dirty.reserve(8192);metadataBytes=0;
         // Same cache-line scan/skip and clear-as-consumed ordering as Dolphin's

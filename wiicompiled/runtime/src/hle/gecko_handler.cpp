@@ -795,6 +795,7 @@ void VerifyPass(CpuContext* ctx) {
         }
     };
     const auto restore = [&](const std::vector<uint8_t>* mem, [[maybe_unused]] const std::vector<uint8_t>* dirty) {
+        BrawlDirtyMemory::MarksCleared();
         for (int i = 0; i < 2; ++i) {
             std::memcpy(Memory::GetPointer(kRegions[i].base, kRegions[i].size), mem[i].data(), kRegions[i].size);
 #if MKW_LEAN_MEMORY

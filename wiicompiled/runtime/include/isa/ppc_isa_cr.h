@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 // MKW_LEAN_FLAGS=1: compares leave the CR field's SO bit clear instead of copying XER[SO]. Translated code never
 // sets SO (its only XER writes are CA updates and a few mtxer restores, checked program-wide), so the copy is dead
@@ -18,7 +19,10 @@
 // `const`, so a compare whose CR is never read still compiles away.
 template <typename T>
 inline uint32_t PpcCrCompareBody(uint32_t cr, uint32_t xer, uint32_t field, T a, T b) noexcept {
-    uint32_t value = (a < b ? 0x8u : 0u) | (a > b ? 0x4u : 0u) | (a == b ? 0x2u : 0u) | MKW_CR_SO_BIT(xer);
+    static_assert(std::is_integral_v<T>, "floating comparisons use PpcCrCompareFloatBody");
+    // Integer ordering has exactly one outcome. Selecting its encoding avoids
+    // constructing and combining three separate Boolean flags at every cmp.
+    const uint32_t value = (a < b ? 0x8u : a > b ? 0x4u : 0x2u) | MKW_CR_SO_BIT(xer);
     const uint32_t shift = (7 - field) * 4;
     return (cr & ~(0xFu << shift)) | (value << shift);
 }

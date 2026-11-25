@@ -24,6 +24,30 @@ struct Page {
 };
 inline std::atomic<bool> active{false};
 inline Page* pages[65536]{};
+// Bumped before anything clears marks or rewrites guest memory without marking it (a rollback or save-state load,
+// a verifier putting memory back). Between bumps a mark only goes from clear to set, so code that matched guest
+// memory in the current epoch and whose marks are still clear has not been written since: the interpreter's block
+// cache checks that instead of comparing the code on every entry.
+inline std::atomic<uint32_t> markEpoch{1};
+inline void MarksCleared() { markEpoch.fetch_add(1, std::memory_order_acq_rel); }
+// Rollback's WriteWatch consumes the marks of the pages it tracks (scans then clears them, writers quiescent) and
+// restores those pages from snapshots; consumeSeq counts the consumes, and a snapshot keeps the count it was taken at.
+// The interpreter's code caches set these hooks so that neither needs a new epoch: before a consume they retire the
+// code under set marks (noting the count), and after a restore to a snapshot they retire the code written since it
+// (and code built since). Without hooks, both start a new epoch.
+inline std::atomic<uint32_t> consumeSeq{0};
+inline void (*consumingMarks)(uint32_t seq) = nullptr;
+inline void (*restoredMarks)(uint32_t seq) = nullptr;
+inline void MarksConsuming() {
+    const uint32_t seq = consumeSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (consumingMarks) consumingMarks(seq); else MarksCleared();
+}
+inline void MarksRestored(uint32_t snapshotSeq) {
+    if (restoredMarks) restoredMarks(snapshotSeq); else MarksCleared();
+}
+// Lean memory: the 64 KiB pages (of the 1 GiB canonical window) whose marks rollback's WriteWatch consumes. Nothing
+// reads the marks of any other page, so the interpreter clears those of the code it checks there itself.
+inline std::atomic<uint8_t> trackedPages[1u << 14]{};
 // Mark/MarkHost run at every guest store in translated code. Their bodies stay out of line (and cold) so a store
 // pays only the inline test of `active` while no match is tracked; an inlined call to the whole body made the
 // compiler spill caller-saved registers around every store even with tracking off.

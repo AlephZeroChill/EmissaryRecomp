@@ -172,12 +172,13 @@ public:
         const auto indexStart=Clock::now();
         c.flagged.clear();c.restoreKeys.clear();c.restoreSources.clear();
         auto flag=[&](uint32_t key){if(!c.needsSource[key]){c.needsSource[key]=1;c.flagged.push_back(key);}};
-        // Forward indexing: the target and later slots, plus unsaved live writes.
+        // Only writes after the target can differ from its saved image. Including the target
+        // rescans its dirty list and needlessly restores blocks untouched since that snapshot.
         for(uint32_t key:dirty) {
             if(key>=c.needsSource.size())throw std::runtime_error("rollback: dirty block outside memory");
             flag(key);
         }
-        for(size_t n=0;n<=framesBack;++n) {
+        for(size_t n=1;n<=framesBack;++n) {
             const auto& slot=c.slots[(target+n)%Capacity];
             for(size_t i=0;i<slot.count;++i)flag(slot.indices[i]);
         }

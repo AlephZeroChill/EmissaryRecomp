@@ -1,6 +1,7 @@
 // save_states.cpp - see save_states.h.
 
 #include "save_states.h"
+#include "brawl_dirty_memory.h"
 
 #include "abi_bridge.h"
 #include "axfx_async.h"
@@ -191,6 +192,7 @@ void PutBack(const Snapshot& s) {
             return;
         }
     }
+    BrawlDirtyMemory::MarksCleared();  // guest memory rewritten without marks
     for (size_t i = 0; i < s.memory.size(); ++i) {
         const auto [base, size] = kMemoryRegions[i];
         Unpack(s.memory[i], Memory::GetPointer(base, size), size);

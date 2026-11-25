@@ -234,3 +234,24 @@ GPLv3, see [`wiicompiled/LICENSE`](wiicompiled/LICENSE). Bundled third-party com
 Super Smash Bros. Brawl and all related characters are trademarks and copyrights of Nintendo, HAL Laboratory and
 their respective owners. This is an unofficial fan project, not affiliated with or endorsed by Nintendo. This
 repository contains no game code or data; the game's disc data is read from your own copy of the game.
+
+### Profile-guided builds
+
+`tools/build.py --pgo-generate` instruments a host build. Keep the same build directory,
+compiler and generated shards when switching to `--pgo-profile=/absolute/path/game.profdata`;
+this preserves the source identities used to match profile counts. Both options accept the
+usual `--game`, `--cmake`, `--brawl-online` and `--code-variants` arguments.
+
+1. Build with `--pgo-generate` and an empty directory for the training output.
+2. Run representative rendered matches with `LLVM_PROFILE_FILE=/absolute/path/profiles/game-%p.profraw`.
+   The rollback replay's `COMPLETE` boundary and a clean online-core shutdown flush the profile.
+   Killing the process earlier may lose it. Use separate recordings for training and evaluation
+   (the historical cohort trained on 002/067/127 and evaluated on 001/064/128).
+3. Merge using the matching compiler's `llvm-profdata merge -o game.profdata profiles/*.profraw`.
+4. Rebuild the same directory with `--pgo-profile=/absolute/path/game.profdata`, then verify
+   recording checksums and measure the held-out recordings against an unprofiled build.
+
+Profiles are build artifacts, not universal game data: regenerate them after source or compiler
+changes and train each target separately. These switches do not supply a pretrained profile.
+To turn PGO off in an existing build directory, pass
+`--native-arg=-DMKW_PGO_GENERATE=OFF --native-arg=-DMKW_PGO_PROFILE=`.

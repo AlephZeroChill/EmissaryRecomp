@@ -1876,6 +1876,31 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStSegmentInline(CpuContext* cpu, uint8_t* resol
     PPC_PsqStResolvedInline<W, I>(cpu, resolvedHost, offset, addr, value);
 }
 
+// A scalar source supplies both lanes: convert and sanitize once before duplicating.
+inline uint64_t PpcScalarPsqFloatBitsInline(double value)
+{
+    uint32_t bits = PpcBitCastToU32Inline(static_cast<float>(value));
+#if !MKW_FAST_FLOAT
+    bits = PpcStorePsqFloatBitsInline(bits);
+#endif
+    return (static_cast<uint64_t>(bits) << 32) | bits;
+}
+
+template <uint32_t I>
+MKW_PPC_FORCE_INLINE void PPC_PsqStScalarSegmentInline(CpuContext* cpu, uint8_t* resolvedHost,
+                                                       uint32_t offset, uint32_t addr, double value)
+{
+    static_assert(I < 8u, "psq store GQR index must be 0..7");
+#if MKW_LEAN_MEMORY
+    if (resolvedHost != nullptr && (cpu->gqr[I] & 0xFFFFu) == 0u) [[likely]] {
+        const uint64_t bytes = __builtin_bswap64(PpcScalarPsqFloatBitsInline(value));
+        std::memcpy(resolvedHost + offset, &bytes, sizeof(bytes));
+        return;
+    }
+#endif
+    PPC_PsqStSegmentInline<0u, I>(cpu, resolvedHost, offset, addr, PPC_PsFromScalarInline(value));
+}
+
 template <uint32_t W, uint32_t I, uint32_t GQR>
 MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStKnownResolvedFallback(
     uint32_t addr, double value)

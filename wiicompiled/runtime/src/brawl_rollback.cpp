@@ -1,6 +1,7 @@
 // Gameplay rollback prototype. Pad anchoring and region discovery ported from
 // Brawl Online GameplayRollback.cpp / gp-v29 (GPL-2.0-or-later).
 #include "brawl_rollback.h"
+#include "profile_flush.h"
 #include "abi_bridge.h"
 #include "axfx_async.h"
 #include "det_clock.h"
@@ -48,6 +49,7 @@ struct Snapshot {
     int frame = -999;
     CpuContext cpu{};
     std::vector<uint8_t> bytes;
+    uint32_t markSeq = 0;  // BrawlDirtyMemory::consumeSeq once taken: guest memory as of that consume
 };
 struct Session {
     bool configured = false, active = false, finished = false, sawMatchReset = false;
@@ -364,6 +366,10 @@ void Save(int frame,CpuContext* ctx) {
             auto* p=Memory::GetPointer(r.addr,r.size);s.bytes.insert(s.bytes.end(),p,p+r.size);
         }
     }
+    // Capture clears the tracked marks before an incremental save. Only the
+    // initial base image (or a full-copy save without Capture) needs Enable's
+    // reset; the subsequent snapshot copies do not mark guest memory.
+    const bool resetWriteWatch=session.fullSnapshots || session.incremental.Empty();
     size_t payload=total+sizeof(CpuContext),resident=0;
     if(!session.fullSnapshots) {
         auto read=[cursor=size_t{0}](size_t offset,uint8_t* out,size_t count) mutable {TransferPacked<false>(cursor,offset,out,count);};
@@ -371,6 +377,7 @@ void Save(int frame,CpuContext* ctx) {
         const auto& dirty=session.writeWatch && !session.incremental.Empty()?
             session.writeWatch->Capture(total,session.incremental.Jobs()):empty;
         session.incremental.Save(frame,total,read,session.writeWatch?&dirty:nullptr,session.dirtyAnchor);
+        s.markSeq=BrawlDirtyMemory::consumeSeq.load(std::memory_order_acquire);
         payload=session.incremental.lastPayload+sizeof(CpuContext);
         resident=session.incremental.ResidentBytes()+sizeof(session.snapshots);
         if(session.incremental.Count()>1){session.snapshotPayload+=payload;++session.snapshotDeltaSaves;}
@@ -385,7 +392,7 @@ void Save(int frame,CpuContext* ctx) {
             }
         }
     } else for(const auto& snapshot:session.snapshots)resident+=snapshot.bytes.capacity()+sizeof(snapshot);
-    if(session.writeWatch)session.writeWatch->Enable();session.dirtyAnchor=frame;
+    if(session.writeWatch && resetWriteWatch)session.writeWatch->Enable();session.dirtyAnchor=frame;
     ++session.saves;
     const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
     session.snapshotSaveNs+=ns;
@@ -408,6 +415,10 @@ void Load(int frame,CpuContext* ctx) {
     if(s.frame!=frame) throw std::runtime_error("rollback: snapshot outside ring");
     size_t total=0;for(auto r:session.ranges)total+=r.size;
     size_t examined=total,written=total;
+    // The restore rewrites guest memory without marks: what was written since the snapshot (all marked and consumed
+    // since, or by the Capture below), or everything.
+    if(session.fullSnapshots || !session.writeWatch) BrawlDirtyMemory::MarksCleared();
+    else BrawlDirtyMemory::MarksRestored(s.markSeq);
     if(!session.fullSnapshots) {
         std::vector<uint32_t> all;
         if(!session.writeWatch)for(size_t i=0;i<(total+63)/64;++i)all.push_back(uint32_t(i));
@@ -430,7 +441,9 @@ void Load(int frame,CpuContext* ctx) {
         }
     }
     *ctx=s.cpu;++session.loads;
-    if(session.writeWatch)session.writeWatch->Enable();session.dirtyAnchor=frame;
+    // Capture consumed the incremental path's marks; TransferPacked restores
+    // bytes directly without setting new marks. Full-copy loads skip Capture.
+    if(session.writeWatch && session.fullSnapshots)session.writeWatch->Enable();session.dirtyAnchor=frame;
     const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
     session.snapshotLoadNs+=ns;
     std::fprintf(session.snapshotMetrics,"load,%d,%zu,%zu,%zu,%zu,%lld,%d,%zu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",frame,total,written,session.incremental.DeltaBytes(),
@@ -1054,6 +1067,7 @@ void RunLoop(CpuContext* ctx,GuestFunction gameProc) {
     if(ended || (session.cursor>=session.limit && (!session.udpPort || gekko_confirmed_frame(session.gekko)>=int(session.limit)-1))) {
         WriteResaveDiff();  // before COMPLETE: the harness stops the game when it reads that line
         WriteAttrib();
+        FlushTrainingProfile();
         std::fprintf(stderr,"[rollback] COMPLETE frames=%u saves=%llu loads=%llu advances=%llu desyncs=%llu region_differences=%llu\n",
             session.cursor,(unsigned long long)session.saves,(unsigned long long)session.loads,
             (unsigned long long)session.advances,(unsigned long long)session.mismatches,(unsigned long long)session.regionDifferences);
