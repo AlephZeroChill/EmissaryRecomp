@@ -249,7 +249,11 @@ def build_game(args, game, build):
         # CMake would reset the cache itself on a compiler change and drop the -D options below with it.
         (build / 'native/CMakeCache.txt').unlink(missing_ok=True)
     compilers_stamp.write_text(compilers)
-    run(args.cmake, '-S', wc / 'runtime', '-B', build / 'native', '-G', 'Ninja',
+    # Windows: SDL built from source, with libusb inside (aurora's AURORA_SDL3_LIBUSB, and its SDL patches). The
+    # prebuilt package aurora picks for MinGW is the official SDL3, which has no libusb: it never sees the official
+    # GameCube adapter (WUP-028, a WinUSB device, not HID), so its controllers did nothing in the game.
+    sdl = ['-DAURORA_SDL3_PROVIDER=vendor', '-DAURORA_SDL3_LIBUSB=ON'] if os.name == 'nt' else []
+    run(args.cmake, '-S', wc / 'runtime', '-B', build / 'native', '-G', 'Ninja', *sdl,
         '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={Path(shutil.which("clang")).as_posix()}',
         f'-DCMAKE_CXX_COMPILER={Path(shutil.which("clang++")).as_posix()}', f'-DMKW_TRANSLATED_COMPILE_JOBS={args.jobs}',
         *brawl_online_args(args), f'-DMKW_RELEASE_VERSION={args.release_version}', *args.native_arg)
