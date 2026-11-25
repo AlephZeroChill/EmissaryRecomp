@@ -247,8 +247,10 @@ The repository variable or the secrets missing, every job is skipped, so the sam
 
 ## Updating the core
 
-1. Merge or commit the core change on brawlonline.net's `emissary-recomp` branch and push it to its
-   `emissary-brawlonline` branch (never `main`).
+1. Commit the core change on brawlonline.net's `main` (EmissaryRecomp work goes there since 2026-11-25; the
+   `emissary-recomp` branch is retired). A lock needs a commit on GitHub: until Sarah pushes `main` herself, push
+   that commit to the `emissary-brawlonline` branch (`git push origin <commit>:emissary-brawlonline`), never to
+   `main`.
 2. In `brawl_online.lock`: the new `commit`, and `appVersion` = the Brawl Online release that commit contains.
 3. Bump `VERSION`, commit, and release. A player's launcher updates to the new `/releases/latest` before its next
    game (never during one, nor between the games of a Ranked set).
