@@ -15,6 +15,7 @@
 #include "frame_input.h"
 #include "guest_code_patch.h"
 #include "hle_stubs.h"
+#include "hle/storage/sd_card.h"
 #include "memory.h"
 #include "memory_access.h"
 #include "settings_overlay.h"
@@ -345,6 +346,13 @@ bool LeaveButtonsHeld() {
     return at != 0 && SteadyNs() - at < 250'000'000 && s_leaveHeld.load(std::memory_order_relaxed);
 }
 float DrawAspect() { return DisplaySettings::PictureAspect(); }
+
+bool SdCardImage(char* out, size_t size) {
+    const std::string path = SdCard::PlainImagePath();
+    if (path.empty() || path.size() >= size) return false;
+    std::memcpy(out, path.c_str(), path.size() + 1);
+    return true;
+}
 
 void StallReport(char* out, size_t size) {
     // Any thread: the deterministic clock is an atomic, the scheduler's words are guest memory. The

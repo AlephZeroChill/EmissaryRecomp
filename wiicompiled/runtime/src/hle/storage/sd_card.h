@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace SdCard {
 
@@ -19,5 +20,10 @@ using ProgressHandler = void (*)(uint64_t doneBytes, uint64_t totalBytes);
 void SetProgressHandler(ProgressHandler handler);
 // Closes the image and copies files the game created or changed back to the SD folder.
 void Shutdown();
+// The image file (UTF-8) when the card is a plain image with every file's bytes in it (UserData/sd.raw, as Brawl
+// Online's launcher gives it), for a reader of the card's files from outside the game (the Brawl Online core's
+// Special Versus box); empty when there is no card or it is built from UserData/SD (its files' bytes stay in the
+// folder). Does not open the card.
+std::string PlainImagePath();
 
 } // namespace SdCard

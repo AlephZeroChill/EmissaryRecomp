@@ -701,6 +701,15 @@ bool Write(uint64_t offset, const void* source, size_t length) {
     return true;
 }
 
+std::string PlainImagePath() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_tried) return g_image && g_folder.empty() ? Utf8(g_imagePath) : std::string();
+    const fs::path userData = RuntimeConfigFile::ApplicationDataDirectory();
+    std::error_code ec;
+    if (fs::is_directory(userData / "SD", ec) || !fs::exists(userData / "sd.raw", ec)) return {};
+    return Utf8(userData / "sd.raw");
+}
+
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_image) return;

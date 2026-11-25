@@ -27,6 +27,7 @@
 #include "BrawlOnline/Online/OnlineSession.h"
 #include "BrawlOnline/Rollback/GameplayRollback.h"
 #include "BrawlOnline/Rollback/GameplaySession.h"
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/Logging/LogManager.h"
 #include "Core/Core.h"
@@ -330,6 +331,15 @@ void CoreStart(const char* user_dir, const char* replay_comm) {
     BrawlOnline::InitCompat(user_dir);
     Common::Log::LogManager::Init();
     INFO_LOG_FMT(BRAWLBACK, "Brawl Online core in EmissaryRecomp {}, user folder {}", MKW_RELEASE_VERSION, user_dir);
+    // The game's SD card, not Dolphin's User/Wii/sd.raw: the room's rules menu has P+'s Special Versus box read
+    // from it (GameBridge CMD_SPECIAL_ASSETS, Online/SpecialAssets.h).
+    std::array<char, 4096> sd{};
+    if (B::SdCardImage(sd.data(), sd.size())) {
+        File::SetUserPath(F_WIISDCARDIMAGE_IDX, sd.data());
+        INFO_LOG_FMT(BRAWLBACK, "SD card for the core: {}", sd.data());
+    } else {
+        WARN_LOG_FMT(BRAWLBACK, "SD card for the core: none (no plain UserData/sd.raw): rooms show no Special Versus box");
+    }
     Gprb::RegisterOnlineBackend();
     Online::Session::SelectConfigured();
     Online::GameBridge::Reset();
