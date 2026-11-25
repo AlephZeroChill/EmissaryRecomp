@@ -312,12 +312,14 @@ void SaveMarks(const MarkSpans& spans, std::vector<uint8_t>& out) {
     }
 }
 void ClearMarks(const MarkSpans& spans) {
+    BrawlDirtyMemory::MarksCleared();
     for (int i = 0; i < spans.count; ++i)
         std::memset(BrawlDirtyMemory::leanBlocks + spans.items[i].firstBlock, 0, spans.items[i].blocks);
 }
 // marks = a | b | c (overlapping local spans hold the same bytes, so writing them twice is harmless)
 void RestoreMarks(const MarkSpans& spans, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
                   const std::vector<uint8_t>& c) {
+    BrawlDirtyMemory::MarksCleared();
     size_t at = 0;
     for (int k = 0; k < spans.count; ++k) {
         const MarkSpan& s = spans.items[k];
@@ -443,6 +445,7 @@ void Capture(const Ranges& ranges, std::vector<uint8_t>& out) {
     }
 }
 void Restore(const Ranges& ranges, const std::vector<uint8_t>& in) {
+    BrawlDirtyMemory::MarksCleared();
     size_t at = 0;
     for (int i = 0; i < ranges.count; ++i) {
         std::memcpy(Window() + Canonical(ranges.items[i].address), in.data() + at, ranges.items[i].size);

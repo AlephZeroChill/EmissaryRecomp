@@ -2,6 +2,7 @@
 // the main loop's hooks, the deterministic clock and the pads for the core, and the loop driver.
 
 #include "brawl_online_core.h"
+#include "profile_flush.h"
 #include "brawl_online_bridge.h"
 
 #include "abi_bridge.h"
@@ -15,6 +16,7 @@
 #include "guest_code_patch.h"
 #include "hle_stubs.h"
 #include "memory.h"
+#include "memory_access.h"
 #include "settings_overlay.h"
 #include "aurora_events.h"
 #include "hle_stubs.h"
@@ -28,6 +30,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -72,6 +75,7 @@ struct Snapshots {
     std::unique_ptr<BrawlRollback::SnapshotStore> store;
     std::unique_ptr<BrawlRollback::WriteWatch> watch;
     int anchor = 0;
+    std::unordered_map<int, uint32_t> markSequences;
 
     template <bool Write> void Transfer(size_t& cursor, size_t offset, uint8_t* bytes, size_t count) {
         auto at = backing.begin() + cursor;
@@ -102,9 +106,17 @@ void SnapshotRegions(const uint32_t* addrs, const uint32_t* sizes, size_t count)
     s_snap.backing.clear();
     s_snap.total = 0;
     s_snap.anchor = 0;
+    s_snap.markSequences.clear();
+    BrawlDirtyMemory::MarksCleared();
     if (!count) return;
     s_snap.store = std::make_unique<BrawlRollback::SnapshotStore>();
+#if MKW_FLAT_MEMORY
     s_snap.watch = std::make_unique<BrawlRollback::WriteWatch>(reinterpret_cast<uintptr_t>(MKW_FLAT_GUEST_BASE));
+#elif MKW_LEAN_MEMORY
+    s_snap.watch = std::make_unique<BrawlRollback::WriteWatch>(reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase));
+#else
+    s_snap.watch = std::make_unique<BrawlRollback::WriteWatch>();
+#endif
     BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase, Memory::kMem1Size)), Memory::kMem1Size, Memory::kMem1CachedBase});
     BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem2CachedBase, Memory::kMem2Size)), Memory::kMem2Size, Memory::kMem2CachedBase});
     for (size_t i = 0; i < count; ++i) {
@@ -120,20 +132,27 @@ void SnapshotSave(int key) {
     if (!s.store) return;
     auto read = [cursor = size_t{0}](size_t offset, uint8_t* out, size_t n) mutable { s_snap.Transfer<false>(cursor, offset, out, n); };
     const std::vector<uint32_t> none;
-    const auto& dirty = !s.store->Empty() ? s.watch->Capture(s.total, s.store->Jobs()) : none;
+    const bool initial = s.store->Empty();
+    const auto& dirty = !initial ? s.watch->Capture(s.total, s.store->Jobs()) : none;
     s.store->Save(key, s.total, read, s.store->Empty() ? nullptr : &dirty, s.anchor);
-    s.watch->Enable();
+    s.markSequences[key] = BrawlDirtyMemory::consumeSeq.load(std::memory_order_acquire);
+    for (auto it = s.markSequences.begin(); it != s.markSequences.end();) {
+        if (!s.store->Contains(it->first)) it = s.markSequences.erase(it);
+        else ++it;
+    }
+    if (initial) s.watch->Enable();  // Capture already consumed subsequent saves' marks.
     s.anchor = key;
 }
 
 void SnapshotRestore(int key) {
     auto& s = s_snap;
     if (!s.store) return;
+    BrawlDirtyMemory::MarksRestored(s.markSequences.at(key));
     const auto& dirty = s.watch->Capture(s.total, s.store->Jobs());
     auto read = [cursor = size_t{0}](size_t offset, uint8_t* out, size_t n) mutable { s_snap.Transfer<false>(cursor, offset, out, n); };
     auto write = [cursor = size_t{0}](size_t offset, const uint8_t* in, size_t n) mutable { s_snap.Transfer<true>(cursor, offset, const_cast<uint8_t*>(in), n); };
     s.store->Restore(key, s.anchor, dirty, read, write);
-    s.watch->Enable();
+    // Capture consumed the marks; the direct restore copies do not set new ones.
     s.anchor = key;
 }
 
@@ -373,6 +392,7 @@ void StopGame() {
     }).detach();
     std::thread([] {
         BrawlOnlineCore::Shutdown();
+        FlushTrainingProfile();
         std::fflush(nullptr);
         std::_Exit(0);
     }).detach();

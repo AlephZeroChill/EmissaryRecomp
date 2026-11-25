@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <thread>
+#include <utility>
 
 /* this algo is derived from: https://github.com/cdwfs/cds_job */
 /* sourced from: https://github.com/injinj/WSQ */
@@ -476,7 +477,7 @@ inline void* JobTaskThread::alloc_job(void)
 inline Job* JobTaskThread::create_job(JobFunction f, void* d)
 {
   void* m = this->alloc_job();
-  return new (m) Job(*this, f, d);
+  return new (m) Job(*this, std::move(f), d);
 }
 
 /* create a child job as part of parent job, this allows threads to
@@ -484,7 +485,7 @@ inline Job* JobTaskThread::create_job(JobFunction f, void* d)
 inline Job* JobTaskThread::create_job_as_child(Job& j, JobFunction f, void* d)
 {
   void* m = this->alloc_job();
-  return new (m) Job(*this, f, d, &j);
+  return new (m) Job(*this, std::move(f), d, &j);
 }
 
 /* find a job to run, look at task's queue
@@ -658,7 +659,7 @@ inline void JobTaskThread::do_work_and_kick_jobs(Job** jar, uint16_t n)
 
 /* constructor for job */
 inline Job::Job(JobTaskThread& t, JobFunction f, void* d, Job* p)
-    : thr(t), function(f), parent(p), data(d), alloc_block(*t.cur_block), execute_worker_id(0),
+    : thr(t), function(std::move(f)), parent(p), data(d), alloc_block(*t.cur_block), execute_worker_id(0),
       is_done(false), is_waiting(false)
 {
   this->unfinished_jobs.store(1, std::memory_order_relaxed);
@@ -705,7 +706,7 @@ inline void Job::finish(void)
 
 static inline job::Job* KickRootJob(job::JobTaskThread* dt, job::JobFunction fn)
 {
-  job::Job* root = dt->create_job(fn);
+  job::Job* root = dt->create_job(std::move(fn));
   root->is_waiting = true;
   root->kick();
   return root;

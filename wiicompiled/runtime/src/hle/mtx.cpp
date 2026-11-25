@@ -979,6 +979,7 @@ void Capture(const GuestRanges& ranges, std::vector<uint8_t>& out)
 
 void Restore(const GuestRanges& ranges, const std::vector<uint8_t>& in)
 {
+    BrawlDirtyMemory::MarksCleared();
     size_t at = 0;
     for (int i = 0; i < ranges.count; ++i) {
         const uint32_t c = Canonical(ranges.items[i].address);

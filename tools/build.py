@@ -82,7 +82,14 @@ def main():
     parser.add_argument('--code-variants', type=Path,
                         help="a mod's code-variant spec (projects/brawl/tools/gen_variant_spec.py): its patched "
                              'functions are translated as it patches them, beside the unmodified translation')
+    pgo = parser.add_mutually_exclusive_group()
+    pgo.add_argument('--pgo-generate', action='store_true', help='build with frontend PGO instrumentation')
+    pgo.add_argument('--pgo-profile', type=Path, help='build using a merged llvm-profdata training profile')
     args = parser.parse_args()
+    if args.pgo_generate:
+        args.native_arg += ['-DMKW_PGO_GENERATE=ON', '-DMKW_PGO_PROFILE=']
+    elif args.pgo_profile:
+        args.native_arg += ['-DMKW_PGO_GENERATE=OFF', f'-DMKW_PGO_PROFILE={args.pgo_profile.resolve(strict=True)}']
     if args.jobs < 1:
         parser.error('--jobs must be positive')
     if args.release_version and not re.fullmatch(r'v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?', args.release_version):

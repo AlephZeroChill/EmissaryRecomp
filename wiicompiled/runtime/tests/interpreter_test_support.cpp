@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <ostream>
 #include <string_view>
+#include <stdexcept>
 
 // No translated functions here, so no float ABI facts (the generated table, guest_float_abi.h).
 extern "C" const uint32_t g_mkwGuestFloatAbiCount = 0u;
@@ -55,10 +56,10 @@ void SystemBridge::DumpCpuState(std::ostream&, const CpuContext*) {}
 namespace BrawlOnline { void Stage() { std::abort(); } }
 namespace BrawlRollback {
 void Run(CpuContext*, GuestFunction) { std::abort(); }
-void RunLoop(CpuContext*, GuestFunction) { std::abort(); }
+void RunLoop(CpuContext* ctx, GuestFunction pass) { pass(ctx); throw std::runtime_error("test loop completed"); }
 void UpdateSystem(CpuContext*, GuestFunction) { std::abort(); }
 void SeedCrossplayStage() { std::abort(); }
-bool DrivesLoop() { std::abort(); }
+bool DrivesLoop() { return false; }
 void AnchorPads() { std::abort(); }
 LoopCallAction LoopCall(CpuContext*, uint32_t) { std::abort(); }
 void LoopCallDone(uint32_t) { std::abort(); }
@@ -70,4 +71,20 @@ extern "C" void GX_HLE_FIFO_WriteFloat(float) { std::abort(); }
 
 namespace RuntimeCrash {
 [[noreturn]] void FatalMissingGuestTarget(uint32_t, CpuContext*) noexcept { std::abort(); }
+}
+
+namespace InterpreterTest {
+unsigned frameEnds = 0, loopEnds = 0, soundHooks = 0;
+}
+namespace BrawlOnlineCore {
+bool Enabled() { return std::getenv("BRAWL_TEST_ONLINE_CORE") != nullptr; }
+bool FrameEnd(CpuContext*) { ++InterpreterTest::frameEnds; return true; }
+void LoopEnd(CpuContext*) { ++InterpreterTest::loopEnds; }
+uint32_t SoundHook(CpuContext*, uint32_t pc) { ++InterpreterTest::soundHooks; return pc + 4; }
+}
+namespace GuestCodePatch {
+static void TestContinuation(CpuContext* ctx) { ctx->gpr[3] = 0x55; }
+void (*ContinuationAt(uint32_t address))(CpuContext*) {
+    return address == 0x8000d004u ? TestContinuation : nullptr;
+}
 }
