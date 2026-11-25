@@ -127,4 +127,25 @@ bool CoreUiBlocksInput();
 // At the core's start (CoreStart, core side): the UI's hooks, before the first message.
 void CoreUiStart();
 
+// Dolphin's controls (core side, brawl_online_dolphin_controls.cpp): the controllers as set up in
+// Dolphin's Controllers settings (the user folder's Config/GCPadNew.ini and Dolphin.ini's SIDevice0-3),
+// read with Dolphin's own input code (brawlonline.net core/standalone, BrawlOnline/DolphinPads.h).
+// Load once the window exists (`window`: its HWND, for DInput's keyboard); active when GCPadNew.ini is there.
+bool DolphinControlsLoad(const char* user_dir, void* window);
+bool DolphinControlsActive();
+// Dolphin's SIDevice for GameCube port `port` (6 standard controller, 12 GameCube adapter, 0 none).
+int DolphinControlsSiDevice(int port);
+// The four ports as Dolphin would read them now (only SIDevice 6 ports are filled), and each port's
+// SIDevice. Reloads what Dolphin's window saved (checked once a second). The game's thread.
+void DolphinControlsRead(bool window_has_focus, Pad* pads, int* si_devices);
+// The port's Rumble/Motor (Dolphin's GCPad::SetOutput), 0 or 1.
+void DolphinControlsRumble(int port, double strength);
+// The port's device line ("SDL/0/Nintendo Switch Pro Controller"), empty when Dolphin's controls are off.
+void DolphinControlsDevice(int port, char* out, size_t size);
+// Dolphin's Controllers window over the game (BRAWL_ONLINE_DOLPHIN: the netplay Dolphin's exe, as the
+// launcher's own "configure controllers" starts it): known, open now, open it (false if it could not).
+bool DolphinControllersAvailable();
+bool DolphinControllersShowing();
+bool DolphinControllersOpen();
+
 }  // namespace BrawlOnlineBridge

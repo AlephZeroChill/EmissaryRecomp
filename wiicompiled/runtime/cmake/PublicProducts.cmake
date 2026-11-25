@@ -89,13 +89,21 @@ if(BRAWL_ONLINE_ROOT)
     # Its in-game UI too (core/ui: on-screen messages, chat, the replay overlay), drawn with aurora's
     # ImGui (Dolphin's version) in the runtime's ImGui frame (brawl_online/brawl_online_ui.cpp).
     set(BRAWL_ONLINE_UI ON CACHE BOOL "" FORCE)
+    # Dolphin's controls (brawl_online/brawl_online_dolphin_controls.cpp): Dolphin's input code over
+    # Dolphin's Windows devices and the runtime's SDL gamepads (a core from before it has none).
+    set(BRAWL_ONLINE_SDL3_TARGET "${AURORA_SDL3_TARGET}" CACHE STRING "" FORCE)
     add_subdirectory("${BRAWL_ONLINE_ROOT}/core/standalone" "${CMAKE_CURRENT_BINARY_DIR}/brawl-online-core" EXCLUDE_FROM_ALL)
     add_library(mkw_brawl_online_core STATIC "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_core_side.cpp"
         "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_harness.cpp"
-        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_ui.cpp")
+        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_ui.cpp"
+        "${MKW_RUNTIME_SOURCE_DIR}/brawl_online/brawl_online_dolphin_controls.cpp")
     target_include_directories(mkw_brawl_online_core PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include")
     target_link_libraries(mkw_brawl_online_core PUBLIC brawl_online_core_standalone brawl_online_ui
         PRIVATE ${AURORA_SDL3_TARGET} aurora::pad ZLIB::ZLIB)
+    if(TARGET brawl_online_dolphin_input)
+        target_link_libraries(mkw_brawl_online_core PRIVATE brawl_online_dolphin_input)
+        target_compile_definitions(mkw_brawl_online_core PRIVATE MKW_DOLPHIN_CONTROLS=1)
+    endif()
     target_compile_definitions(mkw_runtime_common PRIVATE MKW_BRAWL_ONLINE_CORE=1)
     # The release this build is (tools/build.py --release-version, VERSION + tag), which the core logs; empty: "dev".
     set(MKW_RELEASE_VERSION "" CACHE STRING "The EmissaryRecomp release of this build (v0.7.0); empty for a dev build")

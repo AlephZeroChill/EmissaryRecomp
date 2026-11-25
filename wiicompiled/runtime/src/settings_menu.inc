@@ -181,11 +181,26 @@ void AudioRows(std::vector<MenuRow>& rows) {
                     }});
 }
 
+void WiiRemotesRow(std::vector<MenuRow>& rows) {
+    rows.push_back({"Wii Remotes", OnOff(g_wiiRemotesEnabled),
+                    "Wii Remotes and Wii U Pro Controllers paired over Bluetooth (press 1+2 to connect). Takes effect after a restart.",
+                    [](int) {
+                        g_wiiRemotesEnabled = !g_wiiRemotesEnabled;
+                        RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
+                        g_menu.restartNeeded = true;
+                    }});
+}
+
 void ControlsRows(std::vector<MenuRow>& rows) {
     const uint32_t port = static_cast<uint32_t>(g_controllerPort);
     const char* name = PADGetName(port);
-    rows.push_back({"Player", "PLAYER " + std::to_string(port + 1),
-                    std::string("Controller on this port: ") + (name != nullptr ? name : "none") + ". Every pad is set up automatically.",
+    std::string playerHint = std::string("Controller on this port: ") + (name != nullptr ? name : "none") + ". Every pad is set up automatically.";
+#if MKW_BRAWL_ONLINE_CORE
+    // Brawl Online, a port Dolphin's Controllers settings play: their device ("DInput/0/Keyboard Mouse").
+    const bool dolphinPort = BrawlOnlineCore::DolphinControlsActive() && BrawlOnlineCore::DolphinControlsSiDevice(static_cast<int>(port)) == 6;
+    if (dolphinPort) playerHint = "Controller on this port: " + BrawlOnlineCore::DolphinControlsDevice(static_cast<int>(port)) + ".";
+#endif
+    rows.push_back({"Player", "PLAYER " + std::to_string(port + 1), playerHint,
                     [](int step) { g_controllerPort = Cycle(g_controllerPort, step, PAD_MAX_CONTROLLERS); }});
     rows.push_back({"Vibration", OnOff(g_rumbleEnabled), "Rumble on every controller.", [](int) {
                         g_rumbleEnabled = !g_rumbleEnabled;
@@ -197,6 +212,22 @@ void ControlsRows(std::vector<MenuRow>& rows) {
                             PADControlAllMotors(stopAll.data());
                         }
                     }});
+#if MKW_BRAWL_ONLINE_CORE
+    // Brawl Online: the controls set up in Dolphin, and Dolphin's own window to change them over the game.
+    if (BrawlOnlineCore::DolphinControllersAvailable()) {
+        const bool showing = BrawlOnlineCore::DolphinControllersShowing();
+        rows.push_back({"Controllers", "OPEN", "",
+                        [](int step) {
+                            if (step == 0) BrawlOnlineCore::OpenDolphinControllers();
+                        },
+                        !showing});
+    }
+    if (dolphinPort) {
+        // Dolphin's settings play this port: the runtime's own keys and buttons below would do nothing.
+        WiiRemotesRow(rows);
+        return;
+    }
+#endif
     uint32_t keyCount = 0;
     auto* keys = PADGetKeyButtonBindings(port, &keyCount);
     rows.push_back({"Keyboard and mouse", OnOff(keys != nullptr), "Use the keyboard as this player's controller instead of a pad.",
@@ -273,13 +304,7 @@ void ControlsRows(std::vector<MenuRow>& rows) {
                             if (step == 0) BeginRebind(RebindKind::Controller, padButton, kControllerButtons[i].label);
                         }, padHere});
     }
-    rows.push_back({"Wii Remotes", OnOff(g_wiiRemotesEnabled),
-                    "Wii Remotes and Wii U Pro Controllers paired over Bluetooth (press 1+2 to connect). Takes effect after a restart.",
-                    [](int) {
-                        g_wiiRemotesEnabled = !g_wiiRemotesEnabled;
-                        RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
-                        g_menu.restartNeeded = true;
-                    }});
+    WiiRemotesRow(rows);
 }
 
 void GameplayRows(std::vector<MenuRow>& rows) {
