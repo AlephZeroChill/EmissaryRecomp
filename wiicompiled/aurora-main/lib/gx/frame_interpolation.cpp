@@ -169,6 +169,8 @@ struct FrameTransformEntry {
   // ahead of the frame in its inserted slots, and the glide offset its slots fade out (the glide in finalize_frame_interpolation).
   std::array<float, 3> velocity{};
   std::array<float, 3> glide{};
+  float depth = 0.0f;    // view-space z of its matrices (median), with `velocity`
+  bool stepped = false;  // `velocity` and `depth` were measured this frame, whether or not the draw was carried forward
   bool predicted = false;
   bool glides = false;
 };
@@ -307,6 +309,14 @@ constexpr float kPredictMaxTranslation = 40.0f;
 constexpr float kPredictMinQuaternionDot = 0.82533561f;  // cos(0.6): 1.2 radians in one frame
 constexpr float kPredictMaxScaleRatio = 1.5f;
 constexpr float kPredictMaxLinearChange = 0.35f;
+// A draw that stood still last frame (its step under kPredictRestScreenStep on screen) and moved more than
+// kPredictMaxScreenJump this frame jumped there: a menu's hover outline moving to the next character slot (Brawl's
+// character select outline: ~6.3 units at a depth of ~140, a twelfth of the screen's width, well under the 40 units
+// above). Predict carried that jump on into the next slot and snapped it back with the next frame; the draw keeps its
+// latest pose instead, and a slide that goes on is carried forward again from the next frame. Normalized screen units:
+// 2 = the screen's width or height. Gameplay motion starts from rest far slower than this.
+constexpr float kPredictRestScreenStep = 0.0002f;
+constexpr float kPredictMaxScreenJump = 0.06f;
 // Glide (finalize_frame_interpolation): the overshoot undone over this fraction of a game frame; larger corrections snap.
 constexpr float kGlideFrames = 0.5f;
 constexpr float kGlideMax = 12.0f;
@@ -690,6 +700,26 @@ bool predict_holds(const PreparedAffinePair& pair) noexcept {
     }
   }
   return false;
+}
+
+// A measured step on screen (normalized units, the larger of x and y) at the draw's depth: perspective divides by the
+// distance, orthographic by 1. NaN for a draw at or behind the eye, which then never counts as a jump.
+float screen_step(const FrameTransformEntry& entry) noexcept {
+  const auto& p = entry.transform.projection;
+  const float w = p[3][2] * entry.depth + p[3][3];
+  if (!(w > 1.0e-3f)) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return std::max(std::abs(entry.velocity[0] * p[0][0]), std::abs(entry.velocity[1] * p[1][1])) / w;
+}
+
+// Predict: whether the draw stood still last frame and jumped this frame (kPredictMaxScreenJump). A draw with no
+// measured step last frame (new, or held by predict_holds) is left to the other gates.
+bool predict_jumps(const FrameTransformEntry& entry, const FrameTransformEntry* previous) noexcept {
+  if (previous == nullptr || !previous->stepped) {
+    return false;
+  }
+  return screen_step(*previous) <= kPredictRestScreenStep && screen_step(entry) > kPredictMaxScreenJump;
 }
 
 // The translation step of a prepared pair (current - previous), in view space.
@@ -1539,6 +1569,7 @@ void finalize_frame_interpolation() noexcept {
       const uint32_t sampleCount = s_activeInterpolationSamples.load(std::memory_order_acquire);
       s_previousSlotDenominator = sampleCount + 1;
       std::array<std::vector<float>, 3> steps;
+      std::vector<float> depths;
       uint64_t held = 0, predicted = 0, glided = 0;
       uint32_t moving = 0, reversed = 0;
       float largest = 0.0f;
@@ -1549,6 +1580,7 @@ void finalize_frame_interpolation() noexcept {
         auto& entry = s_currentFrameTransforms[index];
         const auto& prepared = preparedTransforms[index];
         for (auto& v : steps) v.clear();
+        depths.clear();
         bool hold = false;
         const auto addPair = [&](size_t offset) {
           if (offset == kNoPreparedPair) {
@@ -1561,6 +1593,7 @@ void finalize_frame_interpolation() noexcept {
           }
           const auto step = pair_step(preparedPairs[offset]);
           for (size_t c = 0; c < 3; ++c) steps[c].push_back(step[c]);
+          depths.push_back(preparedPairs[offset].current.m2.w());
         };
         if (entry.transform.indexedMatrices) {
           if (!prepared.indexedValid) {
@@ -1577,13 +1610,25 @@ void finalize_frame_interpolation() noexcept {
           ++held;
           continue;
         }
-        predictHold[index] = 0;
-        ++predicted;
         for (size_t c = 0; c < 3; ++c) {
           auto& v = steps[c];
           std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
           entry.velocity[c] = v[v.size() / 2];
         }
+        std::nth_element(depths.begin(), depths.begin() + static_cast<std::ptrdiff_t>(depths.size() / 2), depths.end());
+        entry.depth = depths[depths.size() / 2];
+        entry.stepped = true;
+        {
+          const size_t previousIndex = currentToPrevious[index];
+          if (predict_jumps(entry, previousIndex < s_previousFrameTransforms.size()
+                                       ? &s_previousFrameTransforms[previousIndex]
+                                       : nullptr)) {
+            ++held;
+            continue;
+          }
+        }
+        predictHold[index] = 0;
+        ++predicted;
         entry.predicted = true;
         // Glide: the previous frame's last shown slot put this draw `overshoot` ahead of where the game had it. When
         // this frame turns it back (a dash dance turning, a float starting), drawing it as the game has it now jumps
