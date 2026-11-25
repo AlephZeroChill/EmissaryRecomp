@@ -34,7 +34,10 @@ PATHS = [
     'core/',
     'dolphin/Source/Core/Common/',
     'dolphin/Source/Core/Core/Brawlback/include/',
-    'dolphin/Source/Core/InputCommon/GCPadStatus.h',
+    # Dolphin's input code (core/standalone's brawl_online_dolphin_input: Dolphin's controls).
+    'dolphin/Source/Core/InputCommon/',
+    'dolphin/Source/Core/Core/HW/GCPadEmu.cpp',
+    'dolphin/Source/Core/Core/HW/GCPadEmu.h',
     'dolphin/Source/Core/Core/Rollback/FrameProfile.cpp',
     'dolphin/Source/Core/Core/Rollback/FrameProfile.h',
     'dolphin/Source/Core/Core/Rollback/UdpSocket6.cpp',

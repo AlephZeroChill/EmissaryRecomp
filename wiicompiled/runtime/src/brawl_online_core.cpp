@@ -34,6 +34,11 @@
 #include <mutex>
 #include <string>
 
+#include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_video.h>
+#include <dolphin/pad.h>
+
 void PAD_HLE_SampleLocalPads(FrameInput::GcPad* pads);
 extern std::atomic_bool g_auroraFrameActive;
 extern "C" void aurora_gx_present_last_display_copy();
@@ -524,6 +529,74 @@ void DrawUi(float top) {
     if (Enabled()) B::CoreUiDraw(top);
 }
 bool UiBlocksInput() { return Enabled() && B::CoreUiBlocksInput(); }
+
+namespace {
+// Loaded on the first read, once the window is there (DInput's keyboard needs its HWND).
+bool DolphinControlsLoaded() {
+    static std::once_flag once;
+    static bool loaded = false;
+    std::call_once(once, [] {
+        void* window = nullptr;
+        int count = 0;
+        if (SDL_Window** windows = SDL_GetWindows(&count)) {
+#ifdef _WIN32
+            if (count > 0)
+                window = SDL_GetPointerProperty(SDL_GetWindowProperties(windows[0]), SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                                nullptr);
+#endif
+            SDL_free(windows);
+        }
+        B::DolphinControlsLoad(std::getenv("BRAWL_ONLINE_CORE"), window);
+        loaded = true;
+    });
+    return loaded;
+}
+}  // namespace
+
+void ApplyDolphinControls(PADStatus* statuses) {
+    if (!Enabled() || statuses == nullptr || !DolphinControlsLoaded()) return;
+    B::Pad pads[4]{};
+    int si[4]{};
+    // Dolphin reads the controls only with its game window in front (Dolphin.ini [Input] BackgroundInput off).
+    B::DolphinControlsRead(SDL_GetKeyboardFocus() != nullptr, pads, si);
+    if (!B::DolphinControlsActive()) return;
+    for (int port = 0; port < 4; ++port) {
+        PADStatus& s = statuses[port];
+        if (si[port] == 12) continue;  // the GameCube adapter: the runtime's own pads
+        s = {};
+        if (si[port] != 6 || !pads[port].connected) {
+            s.err = PAD_ERR_NO_CONTROLLER;
+            continue;
+        }
+        const B::Pad& p = pads[port];
+        s.err = PAD_ERR_NONE;
+        s.button = p.button;
+        s.stickX = p.stickX;
+        s.stickY = p.stickY;
+        s.substickX = p.substickX;
+        s.substickY = p.substickY;
+        s.triggerLeft = p.triggerL;
+        s.triggerRight = p.triggerR;
+    }
+}
+
+bool DolphinControlsRumble(int32_t chan, bool on) {
+    if (!Enabled() || chan < 0 || chan >= 4 || !B::DolphinControlsActive() || B::DolphinControlsSiDevice(chan) != 6)
+        return false;
+    B::DolphinControlsRumble(chan, on ? 1.0 : 0.0);
+    return true;
+}
+
+bool DolphinControlsActive() { return Enabled() && B::DolphinControlsActive(); }
+int DolphinControlsSiDevice(int port) { return Enabled() ? B::DolphinControlsSiDevice(port) : 0; }
+std::string DolphinControlsDevice(int port) {
+    char text[256] = {};
+    if (Enabled()) B::DolphinControlsDevice(port, text, sizeof(text));
+    return text;
+}
+bool DolphinControllersAvailable() { return Enabled() && B::DolphinControllersAvailable(); }
+bool DolphinControllersShowing() { return Enabled() && B::DolphinControllersShowing(); }
+bool OpenDolphinControllers() { return Enabled() && B::DolphinControllersOpen(); }
 void PadThreadUpdated(CpuContext* ctx) {
     static bool seen = false;
     if (!seen) { seen = true; std::fprintf(stderr, "[brawl-online] hook reached: pad thread loop 0x8002BA84\n"); }

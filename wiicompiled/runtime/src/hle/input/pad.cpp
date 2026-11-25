@@ -5,6 +5,7 @@
 #include "input_bindings.h"
 #include "wii_remote_input.h"
 #include "frame_input.h"
+#include "brawl_online_core.h"
 #include "runtime_config.h"
 #include "save_states.h"
 #include "settings_overlay.h"
@@ -189,6 +190,8 @@ static uint32_t ReadLocalPads(PADStatus* statuses)
 
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);
+    // Brawl Online: the ports as Dolphin's Controllers settings have them (when the player set them up there).
+    BrawlOnlineCore::ApplyDolphinControls(statuses);
     // Test scripts last, and alone: a key or mouse button pressed at the PC during a scripted run must not reach
     // the game (the keyboard pad maps the mouse buttons to A and B).
     // A script's channel field drives that port (a second player's picks in a scripted match).
@@ -706,6 +709,7 @@ extern "C" void PAD__ControlMotor_HLE(int32_t chan, uint32_t command)
     if (command == PAD_MOTOR_RUMBLE && !g_rumbleEnabled.load(std::memory_order_relaxed)) {
         command = PAD_MOTOR_STOP;
     }
+    if (BrawlOnlineCore::DolphinControlsRumble(chan, command == PAD_MOTOR_RUMBLE)) return;
     PADControlMotor(chan, command);
 }
 // Brawl (RSBE01): GameCube controllers are its main input.

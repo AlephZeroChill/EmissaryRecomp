@@ -4,8 +4,10 @@
 // replaces BrawlRollback's prototype loop and BrawlOnline's IPC.
 
 #include <cstdint>
+#include <string>
 
 struct CpuContext;
+struct PADStatus;
 
 namespace BrawlOnlineCore {
 
@@ -52,5 +54,21 @@ void NoteLocalPads(const void* frame);
 void DrawUi(float top);
 // The UI has the keyboard (the chat box): the game gets no keyboard or controller input meanwhile.
 bool UiBlocksInput();
+
+// Dolphin's controls (brawl_online_bridge.h DolphinControls*): with the core on and the user folder's
+// Config/GCPadNew.ini there, each GameCube port is what Dolphin plugs into it (Dolphin.ini SIDevice0-3):
+// a standard controller reads as Dolphin's Controllers settings have it (any device, expressions,
+// sticks, modifiers), the GameCube adapter as the runtime reads its pads, anything else as no controller.
+// `statuses`: the four ports as aurora's PADRead and the runtime's bindings left them. The game's thread.
+void ApplyDolphinControls(PADStatus* statuses);
+// A port Dolphin's controls drive: its Rumble/Motor takes the game's motor command (true: done).
+bool DolphinControlsRumble(int32_t chan, bool on);
+bool DolphinControlsActive();
+int DolphinControlsSiDevice(int port);
+std::string DolphinControlsDevice(int port);
+// Dolphin's Controllers window over the game: known (the launcher passed BRAWL_ONLINE_DOLPHIN), open now, open it.
+bool DolphinControllersAvailable();
+bool DolphinControllersShowing();
+bool OpenDolphinControllers();
 
 }  // namespace BrawlOnlineCore
