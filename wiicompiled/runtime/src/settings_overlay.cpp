@@ -1908,6 +1908,24 @@ bool IsToggleKey(const SDL_Event& event, SDL_Scancode code) {
     return event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == code;
 }
 
+// Escape plays a button: a port's keyboard bindings use it, or (Brawl Online) Dolphin's controls do.
+bool EscapeIsAGameKey() {
+    for (u32 port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+        u32 count = 0;
+        const PADKeyButtonBinding* keys = PADGetKeyButtonBindings(port, &count);
+        if (keys == nullptr) continue;  // the keyboard doesn't play this port
+        for (u32 i = 0; i < count; ++i)
+            if (keys[i].scancode == SDL_SCANCODE_ESCAPE) return true;
+        const PADKeyAxisBinding* axes = PADGetKeyAxisBindings(port, &count);
+        for (u32 i = 0; axes != nullptr && i < count; ++i)
+            if (axes[i].scancode == SDL_SCANCODE_ESCAPE) return true;
+    }
+#if MKW_BRAWL_ONLINE_CORE
+    if (BrawlOnlineCore::DolphinControlsUseKey("ESCAPE")) return true;
+#endif
+    return false;
+}
+
 bool IsMouseActivity(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION:
@@ -2013,6 +2031,7 @@ void HandleEvents(const AuroraEvent* events) noexcept {
         if (ev->type != AURORA_SDL_EVENT) {
             continue;
         }
+        const bool wizardWasActive = controller_mapping_wizard::IsActive();  // Escape ends it (HandleSdlEvent)
         controller_mapping_wizard::HandleSdlEvent(ev->sdl);
         if (g_rebind.active && (IsToggleKey(ev->sdl, SDL_SCANCODE_BACKSPACE) ||
                                 IsToggleKey(ev->sdl, SDL_SCANCODE_DELETE))) {
@@ -2059,11 +2078,18 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             AudioBackend::Instance().SetMuted(g_audioMuted);
             RuntimeConfigFile::SetAudioMuted(g_audioMuted);
         }
-        // NSMBW: Escape is the game's + (its pause menus, Keybinds); here it only closes the F10 bar
-        // or the quit prompt.
+        // Escape opens the options menu, as a PC game's Escape does (Sarah's board, card 797); open, it is the menu's
+        // Back (MK::ReadNav), which closes it from the tabs. It closes the quit prompt and a controller's mapping wizard
+        // first, and stays the game's when a player has bound it to a button.
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_ESCAPE)) {
             if (g_exitPromptOpen) {
                 g_exitPromptOpen = false;
+            } else if (!g_topBarVisible && !wizardWasActive && !OnlineMenu::IsOpen() && !StartupScreenVisible() &&
+                       !EscapeIsAGameKey()) {
+                SetTopBarVisible(true);
+                g_menu.escapeHeld = true;
+                g_menu.escapeSeenDown = false;
+                g_menu.escapeAt = ImGui::GetTime();
             }
             ApplyInputBlockState();
         }

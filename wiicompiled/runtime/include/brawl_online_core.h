@@ -66,6 +66,8 @@ bool DolphinControlsRumble(int32_t chan, bool on);
 bool DolphinControlsActive();
 int DolphinControlsSiDevice(int port);
 std::string DolphinControlsDevice(int port);
+// Dolphin's controls bind this keyboard key (Dolphin's name for it, "ESCAPE").
+bool DolphinControlsUseKey(const char* key);
 // Dolphin's Controllers window over the game: known (the launcher passed BRAWL_ONLINE_DOLPHIN), open now, open it.
 bool DolphinControllersAvailable();
 bool DolphinControllersShowing();

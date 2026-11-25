@@ -372,6 +372,13 @@ std::shared_ptr<Font> LoadFont(const std::string& name) {
             sheet.width = sheetWidth;
             sheet.height = sheetHeight;
             if (!DecodeTexture(data.data() + at, sheetSize, sheetFormat, sheetWidth, sheetHeight, sheet.rgba)) return false;
+            // The cells are a pixel apart, and a glyph's bottom can run into that gap (font_hira's g, p, q and Q reach
+            // the top of n, w, x and X below them). Drawn smoothed at another size, the edge texel blends with the gap:
+            // a line over the glyph below (Sarah's board, card 797: "Fill Window", "2.25x"). The gaps are blanked.
+            for (uint32_t x = font->cellWidth; x < sheetWidth; x += font->cellWidth + 1u)
+                for (uint32_t y = 0; y < sheetHeight; ++y) std::fill_n(sheet.rgba.data() + (size_t(y) * sheetWidth + x) * 4, 4, uint8_t(0));
+            for (uint32_t y = font->cellHeight; y < sheetHeight; y += font->cellHeight + 1u)
+                std::fill_n(sheet.rgba.data() + size_t(y) * sheetWidth * 4, size_t(sheetWidth) * 4, uint8_t(0));
             sheets.push_back(std::move(sheet));
         }
         const uint32_t perSheet = static_cast<uint32_t>(perRow) * perColumn;

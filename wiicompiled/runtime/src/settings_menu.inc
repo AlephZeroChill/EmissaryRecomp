@@ -22,7 +22,15 @@ struct MenuState {
     int tab = kTabGraphics;
     bool inRows = false;
     int row = 0;
-    int first = 0;     // first row shown (the list scrolls)
+    // The list scrolls on its own: the mouse wheel moves the list, not the choice (Sarah's board, card 797), and a row
+    // chosen with the keyboard or a controller is brought into view (follow). scroll is the top row shown, in rows.
+    float scroll = 0, scrollTarget = 0;
+    int scrollTab = -1;
+    bool follow = false;
+    bool mouse = false;       // the mouse was used last: the row under it is the chosen one
+    bool escapeHeld = false;  // the Escape that opened the menu is not also Back, until ImGui has seen it go up
+    bool escapeSeenDown = false;
+    double escapeAt = 0;
     bool quitArmed = false;
     std::string flash;  // a line over the footer for a few seconds
     double flashUntil = 0;
@@ -344,6 +352,7 @@ void CheatRows(std::vector<MenuRow>& rows) {
         rows.push_back({cheat.name, OnOff(cheat.enabled), hint, [i](int step) {
                             if (step != 0) {
                                 g_menu.row += step * kVisibleRows;
+                                g_menu.follow = true;
                                 return;
                             }
                             auto& list = Gecko::Cheats();
@@ -531,6 +540,7 @@ void DrawOptionsMenu() {
     if (!g_topBarVisible) {
         g_menu.inRows = false;
         g_menu.quitArmed = false;
+        g_menu.escapeHeld = false;
         return;
     }
     {
@@ -559,7 +569,20 @@ void DrawOptionsMenu() {
         c.list->AddRectFilledMultiColor(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(10, 12, 26, 225),
                                         IM_COL32(10, 12, 26, 225), IM_COL32(34, 12, 8, 235), IM_COL32(34, 12, 8, 235));
         const bool capturing = g_rebind.active;
-        const MK::Nav nav = capturing ? MK::Nav{} : MK::ReadNav();
+        MK::Nav nav = capturing ? MK::Nav{} : MK::ReadNav();
+        // Escape opens the menu as it goes down (HandleEvents): that press, and its repeats, are not also Back. ImGui
+        // may take the press a frame or two later (its input queue), so it counts as done once ImGui saw it go down
+        // and up again (or never saw it within half a second).
+        if (g_menu.escapeHeld) {
+            const bool down = ImGui::IsKeyDown(ImGuiKey_Escape);
+            if (down) g_menu.escapeSeenDown = true;
+            if ((g_menu.escapeSeenDown && !down) || (!g_menu.escapeSeenDown && ImGui::GetTime() - g_menu.escapeAt > 0.5)) {
+                g_menu.escapeHeld = false;
+            } else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                nav.back = false;
+            }
+        }
+        if (nav.up || nav.down || nav.left || nav.right || nav.confirm || nav.back) g_menu.mouse = false;
 
         // Banner.
         MK::Plate(c, -470, 176, 40, 222, 0x14182AFFu, 16.0f);
@@ -581,7 +604,7 @@ void DrawOptionsMenu() {
                 g_menu.tab = i;
                 g_menu.inRows = i != kTabResume && i != kTabOnline && i != kTabQuit;
                 g_menu.row = 0;
-                g_menu.first = 0;
+                g_menu.scroll = g_menu.scrollTarget = 0;
                 if (i == kTabResume) SetTopBarVisible(false);
                 if (i == kTabOnline) { OnlineMenu::SetOpen(true); SetTopBarVisible(false); }
                 if (i == kTabQuit) { if (g_menu.quitArmed) ExitForAuroraWindowClose(); g_menu.quitArmed = true; }
@@ -595,22 +618,44 @@ void DrawOptionsMenu() {
         // Rows of the chosen tab.
         std::vector<MenuRow> rows = TabRows(g_menu.tab);
         const int count = static_cast<int>(rows.size());
+        const ImGuiIO& io = ImGui::GetIO();
         g_menu.row = std::clamp(g_menu.row, 0, std::max(0, count - 1));
-        if (g_menu.row < g_menu.first) g_menu.first = g_menu.row;
-        if (g_menu.row >= g_menu.first + kVisibleRows) g_menu.first = g_menu.row - kVisibleRows + 1;
-        g_menu.first = std::clamp(g_menu.first, 0, std::max(0, count - kVisibleRows));
+        if (g_menu.scrollTab != g_menu.tab) {
+            g_menu.scrollTab = g_menu.tab;
+            g_menu.scroll = g_menu.scrollTarget = 0;
+        }
+        if (io.MouseDelta.x != 0 || io.MouseDelta.y != 0) g_menu.mouse = true;
+        if (io.MouseWheel != 0 && count > 0 && !capturing) {
+            g_menu.scrollTarget -= io.MouseWheel;
+            g_menu.mouse = true;
+        }
+        if (g_menu.follow) {
+            g_menu.follow = false;
+            g_menu.scrollTarget = std::clamp(g_menu.scrollTarget, static_cast<float>(g_menu.row - kVisibleRows + 1),
+                                             static_cast<float>(g_menu.row));
+        }
+        const float maxScroll = static_cast<float>(std::max(0, count - kVisibleRows));
+        g_menu.scrollTarget = std::clamp(g_menu.scrollTarget, 0.0f, maxScroll);
+        g_menu.scroll += (g_menu.scrollTarget - g_menu.scroll) * std::min(1.0f, io.DeltaTime * 18.0f);
+        if (std::fabs(g_menu.scrollTarget - g_menu.scroll) < 0.002f) g_menu.scroll = g_menu.scrollTarget;
+        g_menu.scroll = std::clamp(g_menu.scroll, 0.0f, maxScroll);
         std::string hint;
         if (count == 0) {
             const char* text = g_menu.tab == kTabResume ? "Back to the game." : g_menu.tab == kTabOnline ? "Play with friends or anyone online."
                                                                                                          : "Close Brawl Recompiled. Your settings are saved.";
             MK::Body(c, text, 155, 60, 20, MK::kDim, 1, 560);
         }
-        for (int i = g_menu.first; i < std::min(count, g_menu.first + kVisibleRows); ++i) {
-            const float y = 146 - (i - g_menu.first) * 40.0f;
-            const MK::Canvas& cc = c;
-            const ImVec2 lo = cc.P(-150, y + 17), hi = cc.P(460, y - 17);
-            const bool hovered = ImGui::IsMouseHoveringRect(lo, hi);
-            if (hovered && (ImGui::GetIO().MouseDelta.x != 0 || ImGui::GetIO().MouseDelta.y != 0)) {
+        // Rows part-way in or out are cut at the list's edges (the focus outline included).
+        constexpr float kListTop = 146 + 21, kListBottom = 146 - (kVisibleRows - 1) * 40.0f - 21;
+        const ImVec2 clipLo = c.P(-480, kListTop), clipHi = c.P(480, kListBottom);
+        const bool mouseInList = ImGui::IsMouseHoveringRect(clipLo, clipHi, false);
+        c.list->PushClipRect(clipLo, clipHi, true);
+        const int firstShown = static_cast<int>(std::floor(g_menu.scroll));
+        for (int i = firstShown; i < std::min(count, firstShown + kVisibleRows + 1); ++i) {
+            const float y = 146 - (i - g_menu.scroll) * 40.0f;
+            const ImVec2 lo = c.P(-150, y + 17), hi = c.P(460, y - 17);
+            const bool hovered = mouseInList && ImGui::IsMouseHoveringRect(lo, hi);
+            if (hovered && g_menu.mouse && !capturing) {
                 g_menu.inRows = true;
                 g_menu.row = i;
             }
@@ -618,17 +663,14 @@ void DrawOptionsMenu() {
             MenuRowDraw(c, rows[static_cast<size_t>(i)], y, focused);
             if (hovered && !capturing && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && rows[static_cast<size_t>(i)].enabled &&
                 rows[static_cast<size_t>(i)].change) {
-                const bool right = ImGui::GetIO().MousePos.x > c.P(330, 0).x;
+                const bool right = io.MousePos.x > c.P(330, 0).x;
                 rows[static_cast<size_t>(i)].change(rows[static_cast<size_t>(i)].bar >= 0 ? (right ? 1 : -1) : 0);
             }
-            if (focused) hint = rows[static_cast<size_t>(i)].hint;
         }
-        if (g_menu.first > 0) MK::Arrow(c, 478, 146, 12, 0, MK::kOrange);
-        if (g_menu.first + kVisibleRows < count) MK::Arrow(c, 478, 146 - (kVisibleRows - 1) * 40.0f, 12, 1, MK::kOrange);
-        if (ImGui::GetIO().MouseWheel != 0 && count > 0) {
-            g_menu.inRows = true;
-            g_menu.row = std::clamp(g_menu.row - static_cast<int>(ImGui::GetIO().MouseWheel), 0, count - 1);
-        }
+        c.list->PopClipRect();
+        if (g_menu.inRows && count > 0) hint = rows[static_cast<size_t>(g_menu.row)].hint;
+        if (g_menu.scroll > 0.01f) MK::Arrow(c, 478, 146, 12, 0, MK::kOrange);
+        if (g_menu.scroll < maxScroll - 0.01f) MK::Arrow(c, 478, 146 - (kVisibleRows - 1) * 40.0f, 12, 1, MK::kOrange);
 
         // Navigation.
         if (!g_menu.inRows) {
@@ -638,13 +680,13 @@ void DrawOptionsMenu() {
                 if (g_menu.tab == kTabResume) SetTopBarVisible(false);
                 else if (g_menu.tab == kTabOnline) { OnlineMenu::SetOpen(true); SetTopBarVisible(false); }
                 else if (g_menu.tab == kTabQuit) { if (nav.confirm && g_menu.quitArmed) ExitForAuroraWindowClose(); g_menu.quitArmed = nav.confirm; }
-                else if (count > 0) g_menu.inRows = true, g_menu.row = 0, g_menu.first = 0;
+                else if (count > 0) g_menu.inRows = true, g_menu.row = 0, g_menu.scroll = g_menu.scrollTarget = 0;
             }
             if (nav.back) SetTopBarVisible(false);
         } else if (count > 0) {
             MenuRow& row = rows[static_cast<size_t>(g_menu.row)];
-            if (nav.up) g_menu.row = (g_menu.row + count - 1) % count;
-            if (nav.down) g_menu.row = (g_menu.row + 1) % count;
+            if (nav.up) g_menu.row = (g_menu.row + count - 1) % count, g_menu.follow = true;
+            if (nav.down) g_menu.row = (g_menu.row + 1) % count, g_menu.follow = true;
             if (row.enabled && row.change) {
                 if (nav.confirm) row.change(row.bar >= 0 ? 1 : 0);
                 if (nav.right) row.change(1);
@@ -736,6 +778,7 @@ void RunTestHooks(const std::string& scene, double sceneSeconds) {
             g_menu.tab = std::clamp(list[i].first, 0, kTabCount - 1);
             g_menu.inRows = true;
             g_menu.row = list[i].second;
+            g_menu.follow = true;
             SetTopBarVisible(true);
             RT_LOGF(RT_TAG_RUNTIME, "[options test] tab %d row %d\n", g_menu.tab, g_menu.row);
         }

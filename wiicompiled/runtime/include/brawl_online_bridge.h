@@ -148,6 +148,8 @@ int DolphinControlsSiDevice(int port);
 void DolphinControlsRead(bool window_has_focus, Pad* pads, int* si_devices);
 // The port's Rumble/Motor (Dolphin's GCPad::SetOutput), 0 or 1.
 void DolphinControlsRumble(int port, double strength);
+// Dolphin's controls name this keyboard key (Dolphin's name, "ESCAPE") in a binding: it plays the game.
+bool DolphinControlsUseKey(const char* key);
 // The port's device line ("SDL/0/Nintendo Switch Pro Controller"), empty when Dolphin's controls are off.
 void DolphinControlsDevice(int port, char* out, size_t size);
 // Dolphin's Controllers window over the game (BRAWL_ONLINE_DOLPHIN: the netplay Dolphin's exe, as the

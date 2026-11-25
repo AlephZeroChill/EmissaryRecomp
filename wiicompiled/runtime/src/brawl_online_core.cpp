@@ -594,6 +594,7 @@ std::string DolphinControlsDevice(int port) {
     if (Enabled()) B::DolphinControlsDevice(port, text, sizeof(text));
     return text;
 }
+bool DolphinControlsUseKey(const char* key) { return Enabled() && B::DolphinControlsUseKey(key); }
 bool DolphinControllersAvailable() { return Enabled() && B::DolphinControllersAvailable(); }
 bool DolphinControllersShowing() { return Enabled() && B::DolphinControllersShowing(); }
 bool OpenDolphinControllers() { return Enabled() && B::DolphinControllersOpen(); }

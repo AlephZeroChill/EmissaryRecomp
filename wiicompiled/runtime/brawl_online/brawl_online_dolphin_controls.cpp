@@ -7,9 +7,13 @@
 #include "brawl_online_bridge.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 
@@ -37,6 +41,11 @@ std::chrono::steady_clock::time_point s_next_update{};
 std::chrono::steady_clock::time_point s_next_sdl_sync{};
 #ifdef _WIN32
 HANDLE s_window_process = nullptr;
+// Dolphin's Controllers window lives only as long as the game: a job that ends it when the game's process ends, however
+// it ends (closed, crash, _Exit, the launcher's kill). Left open, it kept the GameCube adapter, so the next game found no
+// controller and the next window said "Insufficient permissions" (Sarah's board, card 797). Dolphin saves each change
+// as it is made, and a posted WM_CLOSE doesn't close that window, so ending it loses nothing and needs no asking.
+HANDLE s_window_job = nullptr;
 #endif
 
 std::wstring Wide(const std::string& text) {
@@ -147,6 +156,25 @@ void DolphinControlsRumble(int port, double strength) {
     DP::SetRumble(port, strength);
 }
 
+bool DolphinControlsUseKey(const char* key) {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (!s_loaded || !DP::Active() || key == nullptr || *key == '\0') return false;
+        path = s_user + "/Config/GCPadNew.ini";
+    }
+    // Dolphin names keyboard keys by word in its expressions (Buttons/Start = ESCAPE, `ESCAPE` | RETURN).
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string word = key;
+    const auto partOfWord = [](char ch) { return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_'; };
+    for (size_t at = text.find(word); at != std::string::npos; at = text.find(word, at + 1)) {
+        const size_t end = at + word.size();
+        if ((at == 0 || !partOfWord(text[at - 1])) && (end >= text.size() || !partOfWord(text[end]))) return true;
+    }
+    return false;
+}
+
 void DolphinControlsDevice(int port, char* out, size_t size) {
     if (size == 0) return;
     std::snprintf(out, size, "%s", DP::DefaultDevice(port).c_str());
@@ -173,11 +201,27 @@ bool DolphinControllersOpen() {
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process)) {
+    if (s_window_job == nullptr) {
+        s_window_job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (s_window_job != nullptr &&
+            !SetInformationJobObject(s_window_job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+            CloseHandle(s_window_job);
+            s_window_job = nullptr;
+        }
+    }
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup,
+                        &process)) {
         std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: could not start %s (error %lu)\n", exe,
                      GetLastError());
         return false;
     }
+    if (s_window_job == nullptr || !AssignProcessToJobObject(s_window_job, process.hProcess)) {
+        std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: not tied to the game (error %lu)\n",
+                     GetLastError());
+    }
+    ResumeThread(process.hThread);
     CloseHandle(process.hThread);
     s_window_process = process.hProcess;
     std::fprintf(stderr, "[brawl-online] Dolphin's Controllers window: started (pid %lu)\n", process.dwProcessId);
@@ -194,6 +238,7 @@ bool DolphinControlsActive() { return false; }
 int DolphinControlsSiDevice(int) { return 0; }
 void DolphinControlsRead(bool, Pad*, int*) {}
 void DolphinControlsRumble(int, double) {}
+bool DolphinControlsUseKey(const char*) { return false; }
 void DolphinControlsDevice(int, char* out, size_t size) { if (size) *out = '\0'; }
 bool DolphinControllersAvailable() { return false; }
 bool DolphinControllersShowing() { return false; }
