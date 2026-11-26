@@ -20,6 +20,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <map>
+#include <tuple>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -843,6 +845,15 @@ void CoreProfileStart() {
     std::thread([target, file = std::string(path)] {
         struct Count { uint64_t self = 0, total = 0; };
         std::unordered_map<uint64_t, Count> counts;
+        // Samples whose leaf is outside the executable (ntdll, ucrtbase, libc++): by (leaf function, the first
+        // frame back inside the executable), so a wait or a memcpy can be told by who made it.
+        // key: leaf, the first frame in a module other than ntdll/KERNELBASE/kernel32 (who asked the OS: SDL3,
+        // xinput, hid...), the first frame back in the executable.
+        std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> outside;
+        HMODULE exeModule = GetModuleHandleA(nullptr);
+        const DWORD64 osModules[] = {reinterpret_cast<DWORD64>(GetModuleHandleA("ntdll.dll")),
+                                     reinterpret_cast<DWORD64>(GetModuleHandleA("KERNELBASE.dll")),
+                                     reinterpret_cast<DWORD64>(GetModuleHandleA("KERNEL32.DLL"))};
         uint64_t samples = 0;
         auto written = std::chrono::steady_clock::now();
         std::vector<uint64_t> seen;
@@ -854,11 +865,23 @@ void CoreProfileStart() {
             if (GetThreadContext(target, &ctx)) {
                 ++samples;
                 seen.clear();
+                uint64_t leaf = 0, via = 0;
+                bool leafOutside = false, attributed = false;
                 for (int depth = 0; depth < 64 && ctx.Rip; ++depth) {
                     DWORD64 image = 0;
                     PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
                     const uint64_t start = fn ? image + fn->BeginAddress : ctx.Rip;
-                    if (depth == 0) ++counts[start].self;
+                    if (depth == 0) {
+                        ++counts[start].self;
+                        leaf = start;
+                        leafOutside = image != reinterpret_cast<DWORD64>(exeModule);
+                    } else if (leafOutside && !attributed && image == reinterpret_cast<DWORD64>(exeModule)) {
+                        ++outside[{leaf, via ? via : leaf, start}];
+                        attributed = true;
+                    } else if (leafOutside && !via && image != osModules[0] && image != osModules[1] &&
+                               image != osModules[2]) {
+                        via = start;
+                    }
                     if (std::find(seen.begin(), seen.end(), start) == seen.end()) {
                         seen.push_back(start);
                         ++counts[start].total;
@@ -890,6 +913,27 @@ void CoreProfileStart() {
                     const char* base = std::strrchr(name, '\\');
                     std::fprintf(f, "%8llu %8llu %s+0x%llx\n", (unsigned long long)c.total, (unsigned long long)c.self,
                                  base ? base + 1 : name, (unsigned long long)(addr - reinterpret_cast<uintptr_t>(mod)));
+                }
+                std::vector<std::pair<uint64_t, std::tuple<uint64_t, uint64_t, uint64_t>>> pairs;
+                for (const auto& [key, n] : outside) pairs.push_back({n, key});
+                std::sort(pairs.rbegin(), pairs.rend());
+                const auto name = [](uint64_t addr, char* out, size_t size) {
+                    HMODULE mod = nullptr;
+                    char path[MAX_PATH] = "?";
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(addr), &mod))
+                        GetModuleFileNameA(mod, path, sizeof(path));
+                    const char* base = std::strrchr(path, '\\');
+                    std::snprintf(out, size, "%s+0x%llx", base ? base + 1 : path,
+                                  (unsigned long long)(addr - reinterpret_cast<uintptr_t>(mod)));
+                };
+                for (size_t i = 0; i < pairs.size() && i < 200; ++i) {
+                    char a[MAX_PATH + 32], v[MAX_PATH + 32], b[MAX_PATH + 32];
+                    name(std::get<0>(pairs[i].second), a, sizeof a);
+                    name(std::get<1>(pairs[i].second), v, sizeof v);
+                    name(std::get<2>(pairs[i].second), b, sizeof b);
+                    std::fprintf(f, "C %8llu %s %s %s\n", (unsigned long long)pairs[i].first, a, v, b);
                 }
                 std::fclose(f);
             }
