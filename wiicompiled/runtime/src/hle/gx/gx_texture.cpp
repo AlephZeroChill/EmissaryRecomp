@@ -825,8 +825,11 @@ static void StampTexObjRegisterIds(uint32_t oa, uint32_t tid) {
     }
 }
 
-// remember: a deferred draw's load (GX_HLE_PlanTexLoadForJob). An inline load (GX__LoadTexObj_HLE) never repeats so:
-// its GXLoadTexObj writes the map's register ids into the host object, so its next plan finds other host bytes.
+// remember: use and keep the object's remembered plan (above). Both loads do: a deferred draw's
+// (GX_HLE_PlanTexLoadForJob) and an inline one (GX__LoadTexObj_HLE). An inline load's GXLoadTexObj writes the map's
+// register ids into the host object, so the plan repeats for an object loaded into the same map as last time (a
+// material's textures, every frame: P+ ranked replays, ~420 inline loads a frame); one moved to another map finds
+// other host bytes and takes the full path, as before.
 static TexLoadPlan PlanTexLoad(uint32_t oa, uint32_t tid, bool remember = false) {
     StampTexObjRegisterIds(oa, tid);
     if (!remember) return PlanTexLoadFull(oa, tid);
@@ -930,7 +933,7 @@ static void WriteTexLoadGuestEffects() {
 
 extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
     G3D_REC_HLE(g3dn::kRecLoadTexObj, oa, tid);
-    const TexLoadPlan plan = PlanTexLoad(oa, tid);
+    const TexLoadPlan plan = PlanTexLoad(oa, tid, /*remember=*/true);
     if (!RunTexLoadPlan(plan, oa, tid, plan.obj)) return;
     WriteTexLoadGuestEffects();
 }
@@ -970,7 +973,7 @@ extern "C" void GX_HLE_RunTexLoadPlan(const void* in, uint32_t oa, uint32_t tid)
 // The stats line (g3d_native.cpp G3dNativeLogStats): per frame. Guest thread.
 extern "C" void GX_HLE_LogTexPlanStats(double frames) {
     if (frames <= 0 || s_texPlanJobs == 0) return;
-    RT_LOGF(RT_TAG_VI, "gx texture plans (deferred draws): %.1f/frame, remembered %.1f/frame, full %.1f/frame; "
+    RT_LOGF(RT_TAG_VI, "gx texture plans: %.1f/frame, remembered %.1f/frame, full %.1f/frame; "
             "checked %.1f/frame (GX_TEXPLAN_CHECK=1), %llu mismatches\n",
             s_texPlanJobs / frames, s_texPlanRemembered / frames, (s_texPlanJobs - s_texPlanRemembered) / frames,
             s_texPlanChecked / frames, static_cast<unsigned long long>(s_texPlanCheckBad));

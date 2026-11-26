@@ -25,6 +25,11 @@ extern "C" void GXShadowAfterDeferredDraw(int zCompLoc) {
   __gx->dirtyVAT = 0;
 }
 extern "C" uint32_t GXShadowDirtyState() { return __gx->dirtyState; }
+// The vertex descriptor as GXGetVtxDesc decodes it for GX_VA_PNMTXIDX..GX_VA_TEX7 (vcdLo, hasNrms in bit 31, vcdHi):
+// equal values decode to equal descriptors (runtime gx_dl.cpp ApplyAuroraVtxDesc's memo).
+extern "C" uint64_t GXShadowVcd() {
+  return (static_cast<uint64_t>(__gx->vcdHi) << 32) | __gx->vcdLo | (__gx->hasNrms ? 0x80000000u : 0u);
+}
 // The dirty bits alone (dirtyState, dirtyVAT). The runtime's vertex-state take-back (hle/g3d_native.cpp) mirrors
 // deferred draws some GX calls after them: it keeps the bits those calls set across GXShadowAfterDeferredDraw, which
 // clears the bits as they were right after each draw.

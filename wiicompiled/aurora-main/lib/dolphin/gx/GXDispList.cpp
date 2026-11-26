@@ -50,12 +50,12 @@ void process_compiled_display_list_bytes(const uint8_t* data, uint32_t nbytes, c
 
 extern "C" {
 bool GXDisplayListIsEmpty() {
-  return aurora::gx::fifo::in_display_list() && aurora::gx::fifo::detail::sDlWritePos == 0 &&
+  return aurora::gx::fifo::detail::sInDisplayList && aurora::gx::fifo::detail::sDlWritePos == 0 &&
          __gx->dirtyState == 0;
 }
 
 void GXBeginDisplayList(void* list, u32 size) {
-  CHECK(!aurora::gx::fifo::in_display_list(), "Display list began twice!");
+  CHECK(!aurora::gx::fifo::detail::sInDisplayList, "Display list began twice!");
 
   // Flush any pending dirty state before recording
   if (__gx->dirtyState != 0) {
@@ -104,7 +104,7 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
   }
 
   // Nested display-list calls add bytes instead of changing live renderer state.
-  if (aurora::gx::fifo::in_display_list()) {
+  if (aurora::gx::fifo::detail::sInDisplayList) {
     aurora::gx::fifo::write_data(data, nbytes);
     return;
   }
@@ -129,7 +129,7 @@ void GXCallDisplayListCompiled(const void* data, u32 nbytes, uint64_t digest) {
   if (*reinterpret_cast<u32*>(&__gx->vNum) != 0) {
     __GXSendFlushPrim();
   }
-  if (aurora::gx::fifo::in_display_list()) {
+  if (aurora::gx::fifo::detail::sInDisplayList) {
     aurora::gx::fifo::write_data(data, nbytes);
     return;
   }
@@ -157,7 +157,7 @@ void GXCallStateDisplayList(const void* data, u32 nbytes) {
   if (*reinterpret_cast<u32*>(&__gx->vNum) != 0) {
     __GXSendFlushPrim();
   }
-  if (aurora::gx::fifo::in_display_list()) {
+  if (aurora::gx::fifo::detail::sInDisplayList) {
     aurora::gx::fifo::write_data(data, nbytes);
     return;
   }
