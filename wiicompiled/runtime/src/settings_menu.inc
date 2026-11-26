@@ -9,7 +9,11 @@ struct MenuRow {
     std::string label, value, hint;
     std::function<void(int)> change;  // -1/+1 from left/right, 0 from A/Enter or a click
     bool enabled = true;
-    int bar = -1;  // 0..100: drawn as a volume bar
+    int bar = -1;  // 0..100: drawn as a slider
+    // A slider set straight to a position (0..100) by a click or a drag; the bool: let go, so save it.
+    std::function<void(int, bool)> setBar;
+    bool action = false;    // a button whatever its value says: A runs it, left and right don't change it
+    bool centered = false;  // a slider whose middle is its zero (brightness): filled from the middle
 };
 
 enum MenuTab { kTabResume, kTabGraphics, kTabAudio, kTabControls, kTabGameplay, kTabCheats, kTabMods, kTabOnline,
@@ -34,6 +38,8 @@ struct MenuState {
     bool escapeSeenDown = false;
     double escapeAt = 0;
     bool quitArmed = false;
+    bool startHeld = false;  // the START held to open the menu is still down: not a press in it
+    int sliderRow = -1;      // the row whose slider the mouse holds
     std::string flash;  // a line over the footer for a few seconds
     double flashUntil = 0;
     std::string pendingMod;  // a folder picked in the system's dialog, copied onto the SD card next frame
@@ -167,7 +173,11 @@ void VolumeRow(std::vector<MenuRow>& rows, const char* label, int& percent, void
                         percent = std::clamp(percent + step * 5, 0, 100);
                         apply(percent / 100.0f);
                         save(percent / 100.0f);
-                    }, true, percent});
+                    }, true, percent, [&percent, apply, save](int value, bool letGo) {
+                        percent = std::clamp(value, 0, 100);
+                        apply(percent / 100.0f);
+                        if (letGo) save(percent / 100.0f);
+                    }});
 }
 
 // Master volume and Mute only. Music, Sound effects, Voices, Menu sounds and "Quiet music while other media plays"
@@ -508,30 +518,121 @@ std::vector<MenuRow> TabRows(int tab) {
 }
 
 // ---- drawing ----
-// The rows' left and right edges and their value column. The list's scroll bar sits just right of the rows, inside
-// the layout's 960 width (Sarah's board: the up/down arrows it replaced were at x 478, cut off at a 16:9 window's edge).
-constexpr float kRowX0 = -150, kRowX1 = 432, kValueX = 308;
-constexpr float kScrollBarX = 460, kScrollBarHalfWidth = 4;
+// Layout units: 456 to the game picture's height, y up, 0 in the middle (MenuKit's canvas). The menu keeps inside
+// 1000 x 480 of them, so its slanted edges and glows stay inside any window, 4:3 to ultrawide (DrawOptionsMenu's scale).
+constexpr float kRowX0 = -190, kRowX1 = 428;  // the rows' plates
+constexpr float kRowTop = 144, kRowStep = 40, kRowHalf = 17;
+constexpr float kValX0 = 196, kValX1 = 420, kValMid = (kValX0 + kValX1) * 0.5f;  // the value column
+constexpr float kSliderX0 = 210, kSliderX1 = 356;                                // a slider's track
+constexpr float kScrollBarX = 452, kScrollBarHalfWidth = 4;
+constexpr float kTabX0 = -458, kTabX1 = -222;
+constexpr float kListTop = kRowTop + kRowHalf + 4, kListBottom = kRowTop - (kVisibleRows - 1) * kRowStep - kRowHalf - 4;
+constexpr float kHintY = -172, kFooterY = -219;
 
-void MenuRowDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused) {
-    const float x0 = kRowX0, x1 = kRowX1;
-    MK::Plate(c, x0, y - 17, x1, y + 17, focused ? 0x2B3350FFu : 0x1C2133FFu, 7.0f, row.enabled ? 1.0f : 0.55f);
-    if (focused) c.list->AddRect(c.P(x0 - 4, y + 19), c.P(x1 + 4, y - 19), MK::Col(MK::kOrange, 0.6f + 0.4f * std::sin(c.t * 6.0f)), 0, 0, 2.0f);
-    MK::Body(c, row.label, x0 + 18, y, 16, row.enabled ? MK::kSnow : MK::kDim, 0, 300);
-    const float vx = kValueX;
-    std::string value = row.value;  // Brawl's title font has no parentheses
-    value.erase(std::remove_if(value.begin(), value.end(), [](char ch) { return ch == '(' || ch == ')'; }), value.end());
-    if (row.bar >= 0) {
-        c.list->AddRectFilled(c.P(vx - 100, y + 5), c.P(vx + 60, y - 5), MK::Col(0x0B0D16FFu));
-        c.list->AddRectFilled(c.P(vx - 100, y + 5), c.P(vx - 100 + 160.0f * row.bar / 100.0f, y - 5), MK::Col(MK::kOrange));
-        MK::Text(c, *MK::TitleFont(), value, x1 - 32, y, 17, MK::kSnow, 0xFFE7B0FFu, 1, 70, true);
-    } else if (!value.empty()) {
-        MK::Text(c, *MK::TitleFont(), value, vx, y, 18, row.value == "ON" ? 0xB8FFB0FFu : MK::kSnow,
-                 row.value == "OFF" ? MK::kDim : 0xFFE7B0FFu, 1, 230, true);
+enum class RowKind { Choice, Toggle, Slider, Action };
+
+bool IsActionValue(const std::string& value) {
+    static const std::set<std::string> kActions = {"", "OPEN", "OPEN FOLDER", "OPEN FILE", "RESTART", "INSTALL",
+                                                   "CHOOSE FOLDER", "F5", "F7"};
+    return kActions.count(value) != 0;
+}
+
+RowKind KindOf(const MenuRow& row) {
+    if (row.bar >= 0) return RowKind::Slider;
+    // A key or button binding: A starts it, left and right have nothing to go through.
+    if (row.action || IsActionValue(row.value) || row.label.rfind("Key: ", 0) == 0 || row.label.rfind("Button: ", 0) == 0)
+        return RowKind::Action;
+    if (row.value == "ON" || row.value == "OFF") return RowKind::Toggle;
+    return RowKind::Choice;
+}
+
+// A slanted shape like Plate's, flat and without an edge: the value column's well.
+void SlantFill(const MK::Canvas& c, float x0, float y0, float x1, float y1, float slant, uint32_t color, float alpha) {
+    c.list->AddQuadFilled(c.P(x0 + slant, y1), c.P(x1 + slant, y1), c.P(x1 - slant, y0), c.P(x0 - slant, y0), MK::Col(color, alpha));
+}
+
+void ValueText(const MK::Canvas& c, const std::string& text, float x, float y, float size, uint32_t top, uint32_t bottom,
+               int originH, float maxWidth, float alpha = 1.0f) {
+    std::string value = text;  // Brawl's title font has no parentheses
+    if (!MK::HaveVectorFonts()) value.erase(std::remove_if(value.begin(), value.end(), [](char ch) { return ch == '(' || ch == ')'; }), value.end());
+    if (MK::HaveVectorFonts()) MK::VText(c, MK::Fonts().display, value, x, y, size, top, bottom, originH, maxWidth, false, alpha);
+    else MK::Text(c, *MK::TitleFont(), value, x, y, size, top, bottom, originH, maxWidth, true);
+}
+
+// A slider's position (0..100) under the mouse.
+int SliderValueAt(const MK::Canvas& c, float mouseX) {
+    const float x = (mouseX - c.view.centerX) / c.view.scale;
+    return static_cast<int>(std::lround(std::clamp((x - kSliderX0) / (kSliderX1 - kSliderX0), 0.0f, 1.0f) * 100.0f));
+}
+
+void SliderDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused, float alpha) {
+    const float r = c.view.scale * 3.5f;
+    const float knob = kSliderX0 + (kSliderX1 - kSliderX0) * std::clamp(row.bar, 0, 100) / 100.0f;
+    c.list->AddRectFilled(c.P(kSliderX0, y + 3.5f), c.P(kSliderX1, y - 3.5f), MK::Col(MK::kInk, alpha), r);
+    const float from = row.centered ? (kSliderX0 + kSliderX1) * 0.5f : kSliderX0;
+    if (std::fabs(knob - from) > 0.5f) {
+        const float a = std::min(from, knob), b = std::max(from, knob);
+        c.list->AddRectFilled(c.P(a, y + 3.5f), c.P(b, y - 3.5f), MK::Col(focused ? MK::kOrange : 0xC86A20FFu, alpha), r);
     }
-    if (focused && row.enabled && row.change && row.bar >= 0) {
-        MK::Arrow(c, vx - 115, y, 14, 2, MK::kOrange);
-        MK::Arrow(c, x1 + 10, y, 14, 3, MK::kOrange);
+    if (row.centered) c.list->AddRectFilled(c.P(from - 0.6f, y + 6), c.P(from + 0.6f, y - 6), MK::Col(MK::kDim, alpha * 0.6f));
+    c.list->AddRect(c.P(kSliderX0, y + 3.5f), c.P(kSliderX1, y - 3.5f), MK::Col(0x3A4160FFu, alpha), r, 0, std::max(1.0f, c.view.scale * 0.6f));
+    const float kr = (focused ? 8.5f : 7.0f) * c.view.scale;
+    const ImVec2 k = c.P(knob, y);
+    c.list->AddCircleFilled(ImVec2(k.x, k.y + c.view.scale), kr + c.view.scale, MK::Col(MK::kInk, alpha * 0.6f), 24);
+    c.list->AddCircleFilled(k, kr, MK::Col(MK::kSnow, alpha), 24);
+    c.list->AddCircle(k, kr, MK::Col(focused ? MK::kOrange : 0x8A8FA8FFu, alpha), 24, std::max(1.0f, c.view.scale * 1.6f));
+    ValueText(c, row.value, kValX1 - 4, y, 17, MK::kSnow, 0xFFE7B0FFu, 2, kValX1 - kSliderX1 - 18, alpha);
+}
+
+void ToggleDraw(const MK::Canvas& c, bool on, float y, bool focused, float alpha) {
+    const float w = 66, h = 24, x0 = kValMid - w * 0.5f, x1 = kValMid + w * 0.5f;
+    const float r = h * 0.5f * c.view.scale;
+    c.list->AddRectFilled(c.P(x0, y + h * 0.5f), c.P(x1, y - h * 0.5f), MK::Col(on ? MK::kOrange : MK::kInk, alpha), r);
+    c.list->AddRect(c.P(x0, y + h * 0.5f), c.P(x1, y - h * 0.5f), MK::Col(on ? 0xFFC86AFFu : (focused ? 0x6A7090FFu : 0x3A4160FFu), alpha),
+                    r, 0, std::max(1.0f, c.view.scale * 1.2f));
+    const float kx = on ? x1 - h * 0.5f : x0 + h * 0.5f;
+    c.list->AddCircleFilled(c.P(kx, y), (h * 0.5f - 3.5f) * c.view.scale, MK::Col(on ? MK::kSnow : 0x8A8FA8FFu, alpha), 24);
+    ValueText(c, on ? "ON" : "OFF", on ? x0 + 21 : x1 - 23, y, 14, on ? 0x2A1A00FFu : MK::kDim, on ? 0x4A3000FFu : MK::kDim, 1, 30, alpha);
+}
+
+void ChoiceDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused, bool hovered, float alpha) {
+    SlantFill(c, kValX0, y - 12, kValX1, y + 12, 4.0f, 0x0F1220FFu, alpha * 0.85f);
+    ValueText(c, row.value, kValMid, y, 18, MK::kSnow, 0xFFE7B0FFu, 1, kValX1 - kValX0 - 64, alpha);
+    if (!row.enabled || !row.change) return;
+    // The arrows say left and right go through it: orange on the focused row, faint on the rest.
+    const uint32_t arrow = focused ? MK::kOrange : hovered ? 0x9EA3BCFFu : 0x4E5470FFu;
+    MK::Arrow(c, kValX0 + 16, y, 11, 2, arrow);
+    MK::Arrow(c, kValX1 - 16, y, 11, 3, arrow);
+}
+
+void ActionDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused, float alpha) {
+    const std::string text = row.value.empty() ? std::string() : row.value;
+    if (text.empty()) return;
+    const float w = std::min(kValX1 - kValX0 - 8,
+                             (MK::HaveVectorFonts() ? MK::VTextWidth(c, MK::Fonts().display, text, 15) : 9.0f * text.size()) + 34);
+    const float x0 = kValMid - w * 0.5f, x1 = kValMid + w * 0.5f;
+    MK::Plate(c, x0, y - 12, x1, y + 12, focused ? 0x4A5A90FFu : 0x323B5EFFu, 5.0f, alpha);
+    if (focused) MK::PlateOutline(c, x0, y - 12, x1, y + 12, 5.0f, 2.0f, MK::kOrange, alpha, 1.2f);
+    ValueText(c, text, kValMid, y, 15, MK::kSnow, 0xFFE7B0FFu, 1, w - 18, alpha);
+}
+
+void MenuRowDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused, bool hovered) {
+    const float alpha = row.enabled ? 1.0f : 0.5f;
+    MK::Plate(c, kRowX0, y - kRowHalf, kRowX1, y + kRowHalf, focused ? 0x2B3350FFu : 0x1C2133FFu, 7.0f, row.enabled ? 1.0f : 0.6f);
+    if (focused) {
+        // A steady orange edge in the plate's own slant (it was a blinking rectangle around a slanted plate), and a bar
+        // at its left end.
+        const float pulse = 0.8f + 0.2f * std::sin(c.t * 4.0f);
+        MK::PlateOutline(c, kRowX0, y - kRowHalf, kRowX1, y + kRowHalf, 7.0f, 2.2f, MK::kOrange, pulse, 1.4f);
+        c.list->AddQuadFilled(c.P(kRowX0 + 7 + 2, y + kRowHalf - 3), c.P(kRowX0 + 7 + 7, y + kRowHalf - 3),
+                              c.P(kRowX0 - 7 + 7 + 3.5f, y - kRowHalf + 3), c.P(kRowX0 - 7 + 2 + 3.5f, y - kRowHalf + 3), MK::Col(MK::kOrange));
+    }
+    MK::Body(c, row.label, kRowX0 + 22, y, 16, row.enabled ? (focused ? 0xFFFFFFFFu : MK::kSnow) : MK::kDim, 0, kValX0 - kRowX0 - 40);
+    switch (KindOf(row)) {
+    case RowKind::Slider: SliderDraw(c, row, y, focused, alpha); break;
+    case RowKind::Toggle: ToggleDraw(c, row.value == "ON", y, focused, alpha); break;
+    case RowKind::Action: ActionDraw(c, row, y, focused, alpha); break;
+    case RowKind::Choice: ChoiceDraw(c, row, y, focused, hovered, alpha); break;
     }
 }
 
@@ -573,12 +674,123 @@ void ScrollBarDraw(const MK::Canvas& c, float top, float bottom, int count, floa
     c.list->AddRectFilled(c.P(x0, thumbTop), c.P(x1, thumbTop - thumbH), MK::Col(lit ? 0xFFC86AFFu : MK::kOrange), r);
 }
 
+// `text` broken at spaces into lines no wider than maxPx pixels at `px`.
+std::vector<std::string> WrapWords(ImFont* font, float px, const std::string& text, float maxPx) {
+    std::vector<std::string> lines;
+    std::string line;
+    for (size_t i = 0; i <= text.size();) {
+        size_t j = text.find(' ', i);
+        if (j == std::string::npos) j = text.size();
+        const std::string word = text.substr(i, j - i);
+        const std::string trial = line.empty() ? word : line + " " + word;
+        if (!line.empty() && font->CalcTextSizeA(px, FLT_MAX, 0.0f, trial.c_str()).x > maxPx) {
+            lines.push_back(line);
+            line = word;
+        } else {
+            line = trial;
+        }
+        i = j + 1;
+    }
+    if (!line.empty()) lines.push_back(line);
+    return lines;
+}
+
+// The focused row's explanation under the list, in two lines at most (smaller when it is long: a cheat's notes).
+void HintDraw(const MK::Canvas& c, const std::string& text, uint32_t color) {
+    if (text.empty()) return;
+    const float x0 = kRowX0 + 6, width = kRowX1 - kRowX0 - 12;
+    if (MK::HaveVectorFonts()) {
+        ImFont* font = MK::Fonts().body;
+        float size = 13.5f;
+        std::vector<std::string> lines;
+        for (; size >= 10.0f; size -= 0.5f) {
+            lines = WrapWords(font, std::max(6.0f, std::round(size * c.view.scale)), text, width * c.view.scale);
+            if (lines.size() <= 2) break;
+        }
+        for (size_t i = 0; i < std::min<size_t>(lines.size(), 2); ++i)
+            MK::VText(c, font, lines[i], x0, kHintY - (size + 4.0f) * i, size, color, color, 0);
+        return;
+    }
+    const auto lines = GameLayout::WrapText(*MK::MenuFont(), GameLayout::Utf16(text), 15, width);
+    for (size_t i = 0; i < std::min<size_t>(lines.size(), 2); ++i)
+        GameLayout::DrawText(c.list, c.view, *MK::MenuFont(), lines[i], x0, kHintY - 17.0f * i, 15, color, color, 1.0f, 0, 1);
+}
+
+// A controller button or a key, as the footer and the header show them: `kind` 0 a round face button (A, B), 1 a
+// long one (START, L, R), 2 a key. Returns its width.
+float ButtonGlyph(const MK::Canvas& c, int kind, const std::string& name, float x, float y, uint32_t color, bool draw = true) {
+    const float h = 19;
+    float w = h;
+    if (kind != 0) w = (MK::HaveVectorFonts() ? MK::VTextWidth(c, MK::Fonts().display, name, 12) : 8.0f * name.size()) + 14;
+    w = std::max(w, h);
+    if (!draw) return w;
+    const ImVec2 lo = c.P(x, y + h * 0.5f), hi = c.P(x + w, y - h * 0.5f);
+    if (kind == 0) {
+        const ImVec2 mid = c.P(x + w * 0.5f, y);
+        c.list->AddCircleFilled(mid, h * 0.5f * c.view.scale, MK::Col(color), 24);
+        c.list->AddCircle(mid, h * 0.5f * c.view.scale, MK::Col(MK::kInk, 0.8f), 24, std::max(1.0f, c.view.scale));
+    } else if (kind == 1) {
+        c.list->AddRectFilled(lo, hi, MK::Col(color), h * 0.5f * c.view.scale);
+    } else {
+        c.list->AddRectFilled(lo, hi, MK::Col(0x2A3150FFu), 3.5f * c.view.scale);
+        c.list->AddRect(lo, hi, MK::Col(0x8A8FA8FFu), 3.5f * c.view.scale, 0, std::max(1.0f, c.view.scale));
+    }
+    if (name == "<>") {
+        MK::Arrow(c, x + w * 0.5f - 4.5f, y, 8, 2, MK::kSnow);
+        MK::Arrow(c, x + w * 0.5f + 4.5f, y, 8, 3, MK::kSnow);
+    } else {
+        ValueText(c, name, x + w * 0.5f, y, kind == 0 ? 13 : 12, kind == 0 ? 0xFFFFFFFFu : MK::kSnow, kind == 0 ? 0xFFFFFFFFu : MK::kSnow, 1, w - 4);
+    }
+    return w;
+}
+
+// The footer: what each button does, as the controller or the keyboard has it (whichever was used last).
+void FooterDraw(const MK::Canvas& c) {
+    MK::Plate(c, -462, kFooterY - 15, 462, kFooterY + 15, 0x10131FFFu, 8.0f);
+    struct Prompt {
+        int kind;
+        const char* name;
+        uint32_t color;
+        const char* word;
+    };
+    const bool pad = MK::LastInputController();
+    const Prompt controller[] = {{0, "A", 0x1FA88AFFu, "choose"}, {1, "<>", 0x4A5272FFu, "change"},
+                                 {0, "B", 0xD8392BFFu, "back"}, {1, "START", 0x6A7090FFu, "close"}};
+    const Prompt keyboard[] = {{2, "ENTER", 0, "choose"}, {2, "<>", 0, "change"}, {2, "ESC", 0, "back"}, {2, "F10", 0, "close"}};
+    const Prompt* list = pad ? controller : keyboard;
+    constexpr float kWordSize = 15, kGap = 7, kSpace = 30;
+    float total = 0;
+    for (int i = 0; i < 4; ++i) {
+        total += ButtonGlyph(c, list[i].kind, list[i].name, 0, 0, 0, false) + kGap;
+        total += (MK::HaveVectorFonts() ? MK::VTextWidth(c, MK::Fonts().label, list[i].word, kWordSize * 1.1f) : 8.0f * std::strlen(list[i].word));
+        if (i < 3) total += kSpace;
+    }
+    float x = -total * 0.5f;
+    for (int i = 0; i < 4; ++i) {
+        x += ButtonGlyph(c, list[i].kind, list[i].name, x, kFooterY, list[i].color) + kGap;
+        MK::Body(c, list[i].word, x, kFooterY + 1.5f, kWordSize, MK::kDim, 0);  // lower case: centred on its x-height
+        x += (MK::HaveVectorFonts() ? MK::VTextWidth(c, MK::Fonts().label, list[i].word, kWordSize * 1.1f) : 8.0f * std::strlen(list[i].word)) + kSpace;
+    }
+}
+
+// The next tab with rows (Graphics, Audio, Controls, ...), for a controller's L and R.
+int StepRowsTab(int tab, int step) {
+    for (int i = 0; i < kTabCount; ++i) {
+        tab = StepTab(tab, step);
+        if (tab != kTabResume && tab != kTabOnline && tab != kTabQuit) break;
+    }
+    return tab;
+}
+
 void DrawOptionsMenu() {
     if (!g_topBarVisible) {
         g_menu.inRows = false;
         g_menu.quitArmed = false;
         g_menu.escapeHeld = false;
         g_menu.dragging = false;
+        g_menu.sliderRow = -1;
+        // Controllers are still read while the menu is closed, so a button already down when it opens is not a press.
+        if (!OnlineMenu::IsOpen()) (void)MK::ReadNav();
         return;
     }
     {
@@ -599,13 +811,14 @@ void DrawOptionsMenu() {
     if (ImGui::Begin("##options", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollWithMouse)) {
         MK::Canvas c{ImGui::GetWindowDrawList(), GameLayout::GameView(), static_cast<float>(ImGui::GetTime())};
-        c.view.centerX = vp->Pos.x + vp->Size.x * 0.5f;
-        c.view.centerY = vp->Pos.y + vp->Size.y * 0.5f;
-        c.view.scale = std::min(vp->Size.y / 470.0f, vp->Size.x / 960.0f);
+        c.view.centerX = std::round(vp->Pos.x + vp->Size.x * 0.5f);
+        c.view.centerY = std::round(vp->Pos.y + vp->Size.y * 0.5f);
+        // The whole menu, slants and glows included, inside the window (at 16:9 its plates ran off both sides).
+        c.view.scale = std::min(vp->Size.y / 480.0f, vp->Size.x / 1000.0f);
         ImGui::SetWindowFocus();
         // The game stays visible behind a dark veil, as in its own pause menu.
-        c.list->AddRectFilledMultiColor(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(10, 12, 26, 225),
-                                        IM_COL32(10, 12, 26, 225), IM_COL32(34, 12, 8, 235), IM_COL32(34, 12, 8, 235));
+        c.list->AddRectFilledMultiColor(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(10, 12, 26, 228),
+                                        IM_COL32(10, 12, 26, 228), IM_COL32(34, 12, 8, 238), IM_COL32(34, 12, 8, 238));
         const bool capturing = g_rebind.active;
         MK::Nav nav = capturing ? MK::Nav{} : MK::ReadNav();
         // Escape opens the menu as it goes down (HandleEvents): that press, and its repeats, are not also Back. ImGui
@@ -620,25 +833,45 @@ void DrawOptionsMenu() {
                 nav.back = false;
             }
         }
-        if (nav.up || nav.down || nav.left || nav.right || nav.confirm || nav.back) g_menu.mouse = false;
+        // START held to open the menu (PollMenuButton) is not also its first press in it.
+        if (g_menu.startHeld) {
+            if (!nav.startHeld) g_menu.startHeld = false;
+            nav.start = false;
+        }
+        // START closes the menu, as it leaves a game's pause; A chooses.
+        const bool close = nav.start;
+        nav.confirm = nav.confirm && !nav.start && !nav.startHeld;
+        if (nav.up || nav.down || nav.left || nav.right || nav.confirm || nav.back || nav.prevTab || nav.nextTab) g_menu.mouse = false;
 
-        // Banner.
-        MK::Plate(c, -470, 176, 40, 222, 0x14182AFFu, 16.0f);
-        c.list->AddRectFilled(c.P(-470, 178), c.P(60, 174), MK::Col(MK::kOrange));
-        MK::Text(c, *MK::TitleFont(), "OPTIONS", -320, 200, 44, 0xFFF3B0FFu, MK::kOrange, 1, 0, true);
-        MK::Text(c, *MK::TitleFont(), kTabNames[g_menu.tab], -140, 197, 24, MK::kSnow, 0xFFC86AFFu, 0, 200, true);
-        MK::SmashBall(c, 380, 194, 56, c.t * 0.35f);
+        // Banner: OPTIONS, the tab, and (a controller last used) the L and R that change it.
+        if (!TabShown(g_menu.tab)) g_menu.tab = kTabGraphics;
+        MK::Plate(c, -462, 178, 210, 224, 0x14182AFFu, 14.0f);
+        c.list->AddRectFilledMultiColor(c.P(-462, 176.5f), c.P(330, 173), MK::Col(MK::kOrange), MK::Col(MK::kOrange, 0.0f),
+                                        MK::Col(MK::kOrange, 0.0f), MK::Col(MK::kOrange));
+        MK::Text(c, *MK::TitleFont(), "OPTIONS", -442, 201, 44, 0xFFF3B0FFu, MK::kOrange, 0, 0, true);
+        const float titleW = MK::HaveVectorFonts() ? MK::VTextWidth(c, MK::Fonts().display, "OPTIONS", 44 * 0.94f) : 240.0f;
+        float tx = -442 + titleW + 26;
+        const bool rowsTab = g_menu.tab != kTabResume && g_menu.tab != kTabOnline && g_menu.tab != kTabQuit;
+        const bool padPrompts = MK::LastInputController() && rowsTab;
+        if (padPrompts) tx += ButtonGlyph(c, 1, "L", tx, 199, 0x4A5272FFu) + 10;
+        const float nameW = MK::HaveVectorFonts() ? std::min(200.0f, MK::VTextWidth(c, MK::Fonts().display, kTabNames[g_menu.tab], 24 * 0.94f)) : 200.0f;
+        MK::Text(c, *MK::TitleFont(), kTabNames[g_menu.tab], tx, 198, 24, MK::kSnow, 0xFFC86AFFu, 0, 200, true);
+        if (padPrompts) ButtonGlyph(c, 1, "R", tx + nameW + 10, 199, 0x4A5272FFu);
+        MK::SmashBall(c, 404, 200, 52, c.t * 0.35f);
 
         // Tabs.
-        if (!TabShown(g_menu.tab)) g_menu.tab = kTabGraphics;
-        int tabFocus = g_menu.inRows ? -1 : g_menu.tab;
+        int shownTabs = 0;
+        for (int i = 0; i < kTabCount; ++i) shownTabs += TabShown(i) ? 1 : 0;
+        const float tabStep = std::min(kRowStep, (kRowTop - (kHintY - 14)) / std::max(1, shownTabs - 1));
+        const int tabFocus = g_menu.inRows ? -1 : g_menu.tab;
         for (int i = 0, shown = 0; i < kTabCount; ++i) {
             if (!TabShown(i)) continue;
-            const float y = 146 - shown++ * 37.0f;
+            const float y = kRowTop - shown++ * tabStep;
+            const float half = std::min(16.0f, tabStep * 0.5f - 3.0f);
             const uint32_t color = i == kTabQuit ? MK::kPlayer[0] : i == g_menu.tab ? 0x3A4670FFu : 0x232A42FFu;
             const std::string label = i == kTabQuit && g_menu.quitArmed ? "QUIT? PRESS AGAIN" : kTabNames[i];
             int focus = tabFocus;
-            if (MK::Button(c, i, focus, false, -455, y - 15, -205, y + 15, label, color, true, 18.0f)) {
+            if (MK::Button(c, i, focus, false, kTabX0, y - half, kTabX1, y + half, label, color, true, 21.0f)) {
                 g_menu.tab = i;
                 g_menu.inRows = i != kTabResume && i != kTabOnline && i != kTabQuit;
                 g_menu.row = 0;
@@ -648,9 +881,7 @@ void DrawOptionsMenu() {
                 if (i == kTabQuit) { if (g_menu.quitArmed) ExitForAuroraWindowClose(); g_menu.quitArmed = true; }
             }
             if (focus != tabFocus && focus == i && !g_menu.inRows) g_menu.tab = i;  // hovered
-            if (i == g_menu.tab && !g_menu.inRows) {
-                MK::Arrow(c, -195, y, 14, 3, MK::kOrange);
-            }
+            if (i == g_menu.tab && g_menu.inRows) MK::Arrow(c, kTabX1 + 14, y, 13, 3, MK::kOrange);
         }
 
         // Rows of the chosen tab.
@@ -661,6 +892,7 @@ void DrawOptionsMenu() {
         if (g_menu.scrollTab != g_menu.tab) {
             g_menu.scrollTab = g_menu.tab;
             g_menu.scroll = g_menu.scrollTarget = 0;
+            g_menu.sliderRow = -1;
         }
         if (io.MouseDelta.x != 0 || io.MouseDelta.y != 0) g_menu.mouse = true;
         if (io.MouseWheel != 0 && count > 0 && !capturing) {
@@ -681,37 +913,80 @@ void DrawOptionsMenu() {
         if (count == 0) {
             const char* text = g_menu.tab == kTabResume ? "Back to the game." : g_menu.tab == kTabOnline ? "Play with friends or anyone online."
                                                                                                          : "Close Brawl Recompiled. Your settings are saved.";
-            MK::Body(c, text, 155, 60, 20, MK::kDim, 1, 560);
+            MK::Body(c, text, (kRowX0 + kRowX1) * 0.5f, 60, 20, MK::kDim, 1, kRowX1 - kRowX0);
         }
+
+        // A slider held with the mouse follows it, and is saved when let go.
+        if (g_menu.sliderRow >= 0) {
+            const bool alive = g_menu.sliderRow < count && rows[static_cast<size_t>(g_menu.sliderRow)].setBar && !capturing;
+            if (alive) {
+                MenuRow& row = rows[static_cast<size_t>(g_menu.sliderRow)];
+                const int value = SliderValueAt(c, io.MousePos.x);
+                const bool held = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+                if (value != row.bar || !held) row.setBar(value, !held);
+                if (!held) g_menu.sliderRow = -1;
+                rows = TabRows(g_menu.tab);  // drawn with the new value this frame
+            } else {
+                g_menu.sliderRow = -1;
+            }
+        }
+
         // Rows part-way in or out are cut at the list's edges (the focus outline included).
-        constexpr float kListTop = 146 + 21, kListBottom = 146 - (kVisibleRows - 1) * 40.0f - 21;
-        const ImVec2 clipLo = c.P(-480, kListTop), clipHi = c.P(480, kListBottom);
+        const ImVec2 clipLo = c.P(kRowX0 - 30, kListTop), clipHi = c.P(kScrollBarX - 12, kListBottom);
         ScrollBarDraw(c, kListTop - 4, kListBottom + 4, count, maxScroll, capturing);
-        // While the scroll bar's thumb is dragged, the rows the mouse passes over are not chosen or clicked.
-        const bool mouseInList = !g_menu.dragging && ImGui::IsMouseHoveringRect(clipLo, clipHi, false);
+        // While the scroll bar's thumb or a slider is dragged, the rows the mouse passes over are not chosen or clicked.
+        const bool mouseInList = !g_menu.dragging && g_menu.sliderRow < 0 && ImGui::IsMouseHoveringRect(clipLo, clipHi, false);
         c.list->PushClipRect(clipLo, clipHi, true);
         const int firstShown = static_cast<int>(std::floor(g_menu.scroll));
+        const float mouseX = (io.MousePos.x - c.view.centerX) / c.view.scale;
         for (int i = firstShown; i < std::min(count, firstShown + kVisibleRows + 1); ++i) {
-            const float y = 146 - (i - g_menu.scroll) * 40.0f;
-            const ImVec2 lo = c.P(kRowX0, y + 17), hi = c.P(kRowX1, y - 17);
+            const float y = kRowTop - (i - g_menu.scroll) * kRowStep;
+            const ImVec2 lo = c.P(kRowX0 - 7, y + kRowHalf), hi = c.P(kRowX1 + 7, y - kRowHalf);
             const bool hovered = mouseInList && ImGui::IsMouseHoveringRect(lo, hi);
             if (hovered && g_menu.mouse && !capturing) {
                 g_menu.inRows = true;
                 g_menu.row = i;
             }
             const bool focused = g_menu.inRows && g_menu.row == i;
-            MenuRowDraw(c, rows[static_cast<size_t>(i)], y, focused);
-            if (hovered && !capturing && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && rows[static_cast<size_t>(i)].enabled &&
-                rows[static_cast<size_t>(i)].change) {
-                const bool right = io.MousePos.x > c.P(kValueX, 0).x;
-                rows[static_cast<size_t>(i)].change(rows[static_cast<size_t>(i)].bar >= 0 ? (right ? 1 : -1) : 0);
+            MenuRow& row = rows[static_cast<size_t>(i)];
+            MenuRowDraw(c, row, y, focused || (g_menu.sliderRow == i), hovered);
+            if (!hovered || capturing || !ImGui::IsMouseClicked(ImGuiMouseButton_Left) || !row.enabled) continue;
+            // A click: a slider takes the value under the mouse (and follows it while held); a choice's arrows step
+            // back and forward through it, the rest of its row forward; a switch or a button anywhere on its row.
+            switch (KindOf(row)) {
+            case RowKind::Slider:
+                if (mouseX >= kSliderX0 - 14 && mouseX <= kSliderX1 + 14) {
+                    if (row.setBar) {
+                        g_menu.sliderRow = i;
+                        row.setBar(SliderValueAt(c, io.MousePos.x), false);
+                    } else if (row.change) {
+                        row.change(SliderValueAt(c, io.MousePos.x) > row.bar ? 1 : -1);
+                    }
+                }
+                break;
+            case RowKind::Choice:
+                if (row.change) row.change(mouseX >= kValX0 && mouseX < kValX0 + 34 ? -1 : mouseX > kValX1 - 34 && mouseX <= kValX1 + 8 ? 1 : 0);
+                break;
+            default:
+                if (row.change) row.change(0);
+                break;
             }
         }
         c.list->PopClipRect();
         if (g_menu.inRows && count > 0) hint = rows[static_cast<size_t>(g_menu.row)].hint;
 
         // Navigation.
-        if (!g_menu.inRows) {
+        if (close) {
+            SetTopBarVisible(false);
+        } else if (nav.prevTab || nav.nextTab) {
+            const int tab = StepRowsTab(g_menu.tab, nav.nextTab ? 1 : -1);
+            if (tab != g_menu.tab) {
+                g_menu.tab = tab;
+                g_menu.row = 0;
+                g_menu.scroll = g_menu.scrollTarget = 0;
+                g_menu.quitArmed = false;
+            }
+        } else if (!g_menu.inRows) {
             if (nav.up) g_menu.tab = StepTab(g_menu.tab, -1), g_menu.quitArmed = false;
             if (nav.down) g_menu.tab = StepTab(g_menu.tab, 1), g_menu.quitArmed = false;
             if (nav.confirm || nav.right) {
@@ -723,16 +998,16 @@ void DrawOptionsMenu() {
             if (nav.back) SetTopBarVisible(false);
         } else if (count > 0) {
             MenuRow& row = rows[static_cast<size_t>(g_menu.row)];
+            const RowKind kind = KindOf(row);
             if (nav.up) g_menu.row = (g_menu.row + count - 1) % count, g_menu.follow = true;
             if (nav.down) g_menu.row = (g_menu.row + 1) % count, g_menu.follow = true;
             if (row.enabled && row.change) {
-                if (nav.confirm) row.change(row.bar >= 0 ? 1 : 0);
-                if (nav.right) row.change(1);
+                // A on a slider does nothing (it used to raise it a step).
+                if (nav.confirm && kind != RowKind::Slider) row.change(0);
+                if (nav.right && kind != RowKind::Action) row.change(1);
                 if (nav.left) {
-                    // Left on an action (nothing to go left through) leads back to the tabs instead.
-                    static const std::set<std::string> kActions = {"", "OPEN", "OPEN FOLDER", "OPEN FILE", "RESTART", "INSTALL",
-                                                                   "CHOOSE FOLDER", "F5", "F7"};
-                    if (kActions.count(row.value) != 0) g_menu.inRows = false;
+                    // Left on a button (nothing to go left through) leads back to the tabs instead.
+                    if (kind == RowKind::Action) g_menu.inRows = false;
                     else row.change(-1);
                 }
             } else if (nav.left) {
@@ -743,38 +1018,54 @@ void DrawOptionsMenu() {
             g_menu.inRows = false;
         }
 
-        // Footer: the focused row's explanation, then the buttons.
-        MK::Plate(c, -470, -232, 470, -200, 0x10131FFFu, 8.0f);
+        // Under the rows: the focused row's explanation (or a message for a few seconds), then the buttons.
         const bool flashing = ImGui::GetTime() < g_menu.flashUntil && !g_menu.flash.empty();
         if (g_rebind.active) {
             hint = g_rebind.kind == RebindKind::Controller ? "Press the controller button for " + g_rebind.label + "."
                                                            : "Press a key or click a mouse button for " + g_rebind.label + ". Backspace clears it.";
         }
-        // Up to two lines under the rows (a cheat's notes can be long).
-        const auto lines = GameLayout::WrapText(*MK::MenuFont(), GameLayout::Utf16(flashing ? g_menu.flash : hint), 15, 600);
-        for (size_t i = 0; i < std::min<size_t>(lines.size(), 2); ++i) {
-            GameLayout::DrawText(c.list, c.view, *MK::MenuFont(), lines[i], -150, -164 - 17.0f * i, 15,
-                                 flashing ? MK::kGold : MK::kDim, flashing ? MK::kGold : MK::kDim, 1.0f, 0, 1);
-        }
-        MK::Body(c, "A / Enter: choose    Left / Right: change    B / Esc: back    F10 / Home: close", 0, -216, 15, MK::kDim, 1, 900);
+        HintDraw(c, flashing ? g_menu.flash : hint, flashing ? MK::kGold : MK::kDim);
+        FooterDraw(c);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
     if (g_rebind.active) PollRebind(false);
 }
 
-// Home (guide) on any controller, or Back and Start held together, opens and closes the menu.
+// Home (guide) on any controller, or Back and Start held together, opens and closes the menu. A GameCube controller has
+// neither: START held for a second opens it, outside a fight (the game takes no input while the menu is open, and a
+// fight goes on).
 void PollMenuButton() {
-    static bool wasDown = false;
-    bool down = false;
+    static bool wasDown = false, startWasDown = false, startCounts = false;
+    static double startAt = 0;
+    bool down = false, start = false;
     for (u32 i = 0; i < 8 && SDL_GetKeyboardFocus() != nullptr; ++i) {
         SDL_Gamepad* pad = PADGetSDLGamepadForIndex(i);
         if (pad == nullptr) continue;
         down = down || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE) ||
                (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START));
+        start = start || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START);
     }
-    if (down && !wasDown && !OnlineMenu::IsOpen() && !StartupScreenVisible()) SetTopBarVisible(!g_topBarVisible);
+    const bool blocked = OnlineMenu::IsOpen() || StartupScreenVisible();
+    if (down && !wasDown && !blocked) {
+        SetTopBarVisible(!g_topBarVisible);
+        g_menu.startHeld = g_topBarVisible && start;  // Back+Start's START is not also a press in the menu
+    }
     wasDown = down;
+    // A press counts only if it began with the menu closed (the START that closes the menu, still held, does not open it
+    // again).
+    if (start && !startWasDown) {
+        startAt = ImGui::GetTime();
+        startCounts = !g_topBarVisible && !down;
+    }
+    startWasDown = start;
+    if (start && startCounts && !down && ImGui::GetTime() - startAt >= 1.0) {
+        startCounts = false;
+        if (!g_topBarVisible && !blocked && SaveStates::SceneName() != "scMelee") {
+            SetTopBarVisible(true);
+            g_menu.startHeld = true;
+        }
+    }
 }
 
 // ---- game speed: fast-forward, or the fast menus ----
@@ -789,14 +1080,14 @@ bool TransitionOrInfo(const std::string& scene) {
     return changing || scene == "scStrap" || scene == "scPrizeInfo";
 }
 
-// Tests: BRAWL_OPTIONS_TAB=<n> opens the options menu on tab n once the game is up; BRAWL_STATE_TEST=1 saves 5 s
+// Tests: BRAWL_OPTIONS_TAB=<n> opens the options menu on tab n once the game is up (its title or main menu); BRAWL_STATE_TEST=1 saves 5 s
 // into the first match, then loads it at 9 s and 14 s.
 void RunTestHooks(const std::string& scene, double sceneSeconds) {
     // A list ("3,5,6") shows each tab for 4 s; "1:9" is tab 1 with its row 9 picked (the list scrolls to it).
     static const char* tabs = std::getenv("BRAWL_OPTIONS_TAB");
     static double openedAt = -1;
     static size_t shown = SIZE_MAX;
-    if (tabs != nullptr && !StartupScreenVisible() && scene == "muMenuMain") {
+    if (tabs != nullptr && !StartupScreenVisible() && (scene == "muMenuMain" || scene == "scTitle")) {
         if (openedAt < 0) openedAt = ImGui::GetTime();
         std::vector<std::pair<int, int>> list;
         for (const char* p = tabs; *p != '\0';) {

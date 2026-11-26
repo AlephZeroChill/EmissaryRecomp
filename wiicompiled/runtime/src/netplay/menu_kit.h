@@ -9,6 +9,7 @@
 #include <aurora/imgui.h>
 #include <dolphin/pad.h>
 #include <imgui.h>
+#include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
 
@@ -16,7 +17,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cfloat>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -41,7 +45,17 @@ inline uint32_t Shade(uint32_t rgba, float f) {
 // ---- input: edges of directions and buttons from every controller, the keyboard and the mouse ----
 struct Nav {
     bool up = false, down = false, left = false, right = false, confirm = false, back = false;
+    bool start = false;                     // a controller's Start went down (it is in `confirm` too)
+    bool prevTab = false, nextTab = false;  // a controller's L / R (shoulder or trigger) went down
+    bool startHeld = false;                 // Start is held on a controller
 };
+
+// The menus' last input came from a controller (true) or from the keyboard and mouse (false): which button prompts
+// they show.
+inline bool& LastInputController() {
+    static bool controller = false;
+    return controller;
+}
 
 // The buttons that are the game's A and B on a controller, so the menus confirm and go back with the same buttons the
 // game does: a GameCube controller's B is SDL's west button (east is its X), a Wii U Pro Controller's A is east and its
@@ -78,8 +92,8 @@ inline FaceButtons FaceButtonsFor(u32 index, SDL_Gamepad* pad) {
 
 inline Nav ReadNav(bool typing = false) {
     static uint32_t prevHeld = 0;
-    static double nextRepeat = 0.0;
-    enum : uint32_t { kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kA = 16, kB = 32 };
+    static double nextRepeat = 0.0, repeatStart = 0.0;
+    enum : uint32_t { kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kA = 16, kB = 32, kStart = 64, kL = 128, kR = 256 };
     uint32_t held = 0;
     // Only the game window in front reads controllers (two games on one PC share them).
     for (u32 i = 0; i < 8 && SDL_GetKeyboardFocus() != nullptr; ++i) {
@@ -92,28 +106,48 @@ inline Nav ReadNav(bool typing = false) {
         if (b(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || lx < -20000) held |= kLeft;
         if (b(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || lx > 20000) held |= kRight;
         const FaceButtons face = FaceButtonsFor(i, pad);
-        if (b(face.a) || b(SDL_GAMEPAD_BUTTON_START)) held |= kA;
+        if (b(face.a)) held |= kA;
         if (b(face.b)) held |= kB;
+        if (b(SDL_GAMEPAD_BUTTON_START)) held |= kStart;
+        // L and R: the shoulders, or the triggers pressed past half (a GameCube controller's L and R are triggers, and
+        // its Z is SDL's right shoulder).
+        if (b(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) || SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) held |= kL;
+        if ((b(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) && SDL_GetGamepadType(pad) != SDL_GAMEPAD_TYPE_GAMECUBE) ||
+            SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000)
+            held |= kR;
     }
     const double now = ImGui::GetTime();
     uint32_t pressed = held & ~prevHeld;
-    // A held direction repeats, as menus do.
+    // A held direction repeats, as menus do, faster once it has been held a while (a volume from 0 to 100 in about two
+    // seconds).
     const uint32_t dirs = held & (kUp | kDown | kLeft | kRight);
     if (dirs != 0 && (dirs & prevHeld) == dirs && now >= nextRepeat) {
         pressed |= dirs;
-        nextRepeat = now + 0.11;
+        nextRepeat = now + (now - repeatStart > 1.0 ? 0.045 : 0.09);
     } else if ((pressed & (kUp | kDown | kLeft | kRight)) != 0) {
-        nextRepeat = now + 0.4;
+        nextRepeat = now + 0.35;
+        repeatStart = now;
     }
+    if ((held & ~prevHeld) != 0) LastInputController() = true;
     prevHeld = held;
     Nav nav;
     nav.up = (pressed & kUp) || ImGui::IsKeyPressed(ImGuiKey_UpArrow);
     nav.down = (pressed & kDown) || ImGui::IsKeyPressed(ImGuiKey_DownArrow);
     nav.left = (pressed & kLeft) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow);
     nav.right = (pressed & kRight) || ImGui::IsKeyPressed(ImGuiKey_RightArrow);
-    nav.confirm = (pressed & kA) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
+    nav.start = (pressed & kStart) != 0;
+    nav.startHeld = (held & kStart) != 0;
+    nav.prevTab = (pressed & kL) != 0;
+    nav.nextTab = (pressed & kR) != 0;
+    nav.confirm = (pressed & (kA | kStart)) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
                   (!typing && ImGui::IsKeyPressed(ImGuiKey_Space));
     nav.back = (pressed & kB) || ImGui::IsKeyPressed(ImGuiKey_Escape);
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.InputQueueCharacters.Size > 0 || io.MouseWheel != 0 || ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+        ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
+        ImGui::IsKeyPressed(ImGuiKey_RightArrow) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+        std::fabs(io.MouseDelta.x) + std::fabs(io.MouseDelta.y) > 2.0f)
+        LastInputController() = false;
     return nav;
 }
 
@@ -125,6 +159,57 @@ struct Canvas {
     ImVec2 P(float x, float y) const { return ImVec2(view.centerX + x * view.scale, view.centerY - y * view.scale); }
 };
 
+// ---- vector fonts, drawn at the screen's own resolution ----
+// Brawl Online's build ships TrueType fonts in Sys/Resources beside the program: Barlow Condensed (Brawl Online's
+// headline face, brawlonline.net's) for titles, buttons and values, and Noto Sans (Dolphin's too) for sentences and for
+// any letter Barlow lacks. The game's own fonts are bitmaps 20 to 32 pixels tall, blurred when a big window draws them
+// several times that size. Without the TrueType files the menus draw with the game's fonts as before.
+struct VectorFonts {
+    ImFont* display = nullptr;  // Barlow Condensed Black Italic
+    ImFont* label = nullptr;    // Barlow Condensed SemiBold
+    ImFont* body = nullptr;     // Noto Sans
+};
+
+inline const VectorFonts& Fonts() {
+    static const VectorFonts fonts = [] {
+        VectorFonts f;
+        const char* base = SDL_GetBasePath();
+        if (base == nullptr) return f;
+        const std::filesystem::path dir = std::filesystem::u8path(base) / "Sys" / "Resources";
+        auto path = [&](const char* file) {
+            std::error_code ec;
+            const auto p = dir / file;
+            if (!std::filesystem::exists(p, ec)) return std::string();
+            const auto utf8 = p.u8string();  // ImGui opens files by UTF-8 name
+            return std::string(utf8.begin(), utf8.end());
+        };
+        const std::string noto = path("NotoSans-Regular.ttf"), notoJp = path("NotoSansJP-Regular.ttf");
+        ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+        auto add = [&](const std::string& file, const char* name) -> ImFont* {
+            if (file.empty()) return nullptr;
+            ImFontConfig config;
+            std::snprintf(config.Name, sizeof config.Name, "%s", name);
+            ImFont* font = atlas->AddFontFromFileTTF(file.c_str(), 0.0f, &config);
+            if (font == nullptr) return nullptr;
+            // Letters the face lacks (in a controller's name, say) come from Noto Sans, then Noto Sans JP.
+            for (const std::string* fallback : {&noto, &notoJp}) {
+                if (fallback->empty() || *fallback == file) continue;
+                ImFontConfig merge;
+                merge.MergeMode = true;
+                atlas->AddFontFromFileTTF(fallback->c_str(), 0.0f, &merge);
+            }
+            return font;
+        };
+        f.display = add(path("BarlowCondensed-BlackItalic.ttf"), "Menu display");
+        f.label = add(path("BarlowCondensed-SemiBold.ttf"), "Menu label");
+        f.body = add(noto, "Menu body");
+        if (f.display == nullptr || f.label == nullptr || f.body == nullptr) f = VectorFonts{};
+        return f;
+    }();
+    return fonts;
+}
+inline bool HaveVectorFonts() { return Fonts().display != nullptr; }
+
 inline std::shared_ptr<GL::Font> TitleFont() {
     static const auto font = GL::LoadFont("/system/font/font_hira.brfnt");
     return font;
@@ -134,8 +219,63 @@ inline std::shared_ptr<GL::Font> MenuFont() {
     return GL::FontReady(font.get()) ? font : TitleFont();
 }
 
+inline ImVec4 ColF(uint32_t rgba, float alpha) { return ImGui::ColorConvertU32ToFloat4(Col(rgba, alpha)); }
+
+// `text` in a vector font, `size` layout units tall, its capitals centred on y: originH 0 starts it at x, 1 centres it
+// there, 2 ends it there. Text wider than maxWidth is drawn smaller. Top to bottom it fades from `top` to `bottom`;
+// `outline` draws a dark edge around it, as Brawl's titles have. Placed on whole pixels, so it stays sharp. Returns its
+// width in layout units.
+inline float VText(const Canvas& c, ImFont* font, const std::string& text, float x, float y, float size, uint32_t top,
+                   uint32_t bottom, int originH = 1, float maxWidth = 0.0f, bool outline = false, float alpha = 1.0f) {
+    if (text.empty() || font == nullptr) return 0.0f;
+    float px = std::max(6.0f, std::round(size * c.view.scale));
+    float width = font->CalcTextSizeA(px, FLT_MAX, 0.0f, text.c_str()).x;
+    if (maxWidth > 0.0f && width > maxWidth * c.view.scale) {
+        px = std::max(6.0f, std::floor(px * maxWidth * c.view.scale / width));
+        width = font->CalcTextSizeA(px, FLT_MAX, 0.0f, text.c_str()).x;
+    }
+    const float ascent = font->GetFontBaked(px)->Ascent;
+    const ImVec2 at = c.P(x, y);
+    // Capitals are about 0.7 of the size tall: their middle goes on y.
+    const ImVec2 pos(std::round(at.x - width * 0.5f * originH), std::round(at.y + px * 0.35f - ascent));
+    if (outline) {
+        const float d = std::max(1.0f, std::round(px * 0.065f));
+        for (int j = 0; j < 8; ++j) {
+            const float a = j * 0.785398f;
+            c.list->AddText(font, px, ImVec2(pos.x + std::round(std::cos(a) * d), pos.y + std::round(std::sin(a) * d)),
+                            Col(kInk, alpha), text.c_str());
+        }
+    }
+    const int first = c.list->VtxBuffer.Size;
+    c.list->AddText(font, px, pos, Col(top, alpha), text.c_str());
+    if (top != bottom) {
+        const float y1 = pos.y + ascent, y0 = y1 - px * 0.72f;
+        const ImVec4 a = ColF(top, alpha), b = ColF(bottom, alpha);
+        for (int i = first; i < c.list->VtxBuffer.Size; ++i) {
+            ImDrawVert& v = c.list->VtxBuffer[i];
+            const float t = std::clamp((v.pos.y - y0) / std::max(1.0f, y1 - y0), 0.0f, 1.0f);
+            v.col = ImGui::ColorConvertFloat4ToU32(ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t,
+                                                          a.w + (b.w - a.w) * t));
+        }
+    }
+    return width / c.view.scale;
+}
+
+// How wide `text` is in layout units at `size`.
+inline float VTextWidth(const Canvas& c, ImFont* font, const std::string& text, float size) {
+    if (font == nullptr) return 0.0f;
+    const float px = std::max(6.0f, std::round(size * c.view.scale));
+    return font->CalcTextSizeA(px, FLT_MAX, 0.0f, text.c_str()).x / c.view.scale;
+}
+
 inline void Text(const Canvas& c, const GL::Font& font, const std::string& text, float x, float y, float size, uint32_t top,
           uint32_t bottom, int originH = 1, float maxWidth = 0.0f, bool outline = false) {
+    if (HaveVectorFonts()) {
+        // In the game's title font's place, Barlow's black italic (a little smaller: its letters are bigger).
+        VText(c, &font == TitleFont().get() ? Fonts().display : Fonts().label, text, x, y, size * 0.94f, top, bottom, originH,
+              maxWidth, outline);
+        return;
+    }
     const auto u = GL::Utf16(text);
     if (maxWidth > 0.0f) {
         const float w = GL::MeasureText(font, u, size);
@@ -152,6 +292,10 @@ inline void Text(const Canvas& c, const GL::Font& font, const std::string& text,
 
 inline void Body(const Canvas& c, const std::string& text, float x, float y, float size, uint32_t color = kSnow, int originH = 1,
           float maxWidth = 0.0f) {
+    if (HaveVectorFonts()) {
+        VText(c, Fonts().label, text, x, y, size * 1.1f, color, color, originH, maxWidth);
+        return;
+    }
     Text(c, *MenuFont(), text, x, y, size, color, color, originH, maxWidth);
 }
 
@@ -176,8 +320,18 @@ inline void Plate(const Canvas& c, float x0, float y0, float x1, float y1, uint3
                  mr = c.P(x1 + Edge(ym), ym), bl = c.P(x0 + Edge(y0), y0), br = c.P(x1 + Edge(y0), y0);
     c.list->AddQuadFilled(tl, tr, mr, ml, Col(Shade(color, 1.22f), alpha));
     c.list->AddQuadFilled(ml, mr, br, bl, Col(color, alpha));
-    c.list->AddLine(ml, mr, Col(Shade(color, 1.45f), alpha * 0.5f), 1.0f);
-    c.list->AddQuad(tl, tr, br, bl, Col(kInk, alpha), 3.0f);
+    c.list->AddLine(ml, mr, Col(Shade(color, 1.45f), alpha * 0.5f), std::max(1.0f, c.view.scale * 0.5f));
+    // The edge grows with the window (it was 3 pixels at any size: heavy in a small window, a hairline in 4K).
+    c.list->AddQuad(tl, tr, br, bl, Col(kInk, alpha), std::max(1.5f, c.view.scale * 1.4f));
+}
+
+// The outline of Plate()'s shape, `grow` layout units outside it: a focused plate's edge.
+inline void PlateOutline(const Canvas& c, float x0, float y0, float x1, float y1, float slant, float grow, uint32_t color,
+                         float alpha, float thickness) {
+    const float g = grow;
+    const ImVec2 pts[4] = {c.P(x0 + slant - g, y1 + g), c.P(x1 + slant + g, y1 + g), c.P(x1 - slant + g, y0 - g),
+                           c.P(x0 - slant - g, y0 - g)};
+    c.list->AddPolyline(pts, 4, Col(color, alpha), ImDrawFlags_Closed, std::max(1.0f, thickness * c.view.scale));
 }
 
 // A button: hovered or focused it glows; true when clicked, or confirmed while focused.

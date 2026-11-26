@@ -116,6 +116,10 @@ if(BRAWL_ONLINE_ROOT)
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/OSD_Font.ttf"
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSans-Regular.ttf"
         "${BRAWL_ONLINE_ROOT}/dolphin/Data/Sys/Resources/NotoSansJP-Regular.ttf"
+        # The options menu's titles, buttons and values (netplay/menu_kit.h; OFL, THIRD-PARTY-NOTICES.md).
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/BarlowCondensed-BlackItalic.ttf"
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/BarlowCondensed-SemiBold.ttf"
+        "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/BarlowCondensed-OFL.txt"
         # Emissary's title card (tools/make_emissary_title.py).
         "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_mask.png"
         "${MKW_RUNTIME_SOURCE_DIR}/assets/brawl_online/emissary_wordmark.png"

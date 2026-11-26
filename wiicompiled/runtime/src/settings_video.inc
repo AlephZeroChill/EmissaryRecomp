@@ -194,7 +194,11 @@ void PictureRows(std::vector<MenuRow>& rows) {
                         g_sharpening = std::clamp(g_sharpening + step * 10, 0, 100);
                         ApplyPictureAdjustments();
                         RuntimeConfigFile::SetSharpening(g_sharpening);
-                    }, true, g_sharpening});
+                    }, true, g_sharpening, [](int value, bool letGo) {
+                        g_sharpening = std::clamp(value, 0, 100);
+                        ApplyPictureAdjustments();
+                        if (letGo) RuntimeConfigFile::SetSharpening(g_sharpening);
+                    }});
     const auto adjustRow = [&rows](const char* label, int& value, bool (*save)(int32_t)) {
         rows.push_back({label, value > 0 ? "+" + std::to_string(value) : std::to_string(value), "Left and right change it.",
                         [&value, save](int step) {
@@ -202,7 +206,12 @@ void PictureRows(std::vector<MenuRow>& rows) {
                             value = std::clamp(value + step * 5, -50, 50);
                             ApplyPictureAdjustments();
                             save(value);
-                        }, true, value + 50});
+                        }, true, value + 50, [&value, save](int position, bool letGo) {
+                            value = std::clamp(position - 50, -50, 50);
+                            ApplyPictureAdjustments();
+                            if (letGo) save(value);
+                        }});
+        rows.back().centered = true;
     };
     adjustRow("Brightness", g_brightness, RuntimeConfigFile::SetBrightness);
     adjustRow("Contrast", g_contrast, RuntimeConfigFile::SetContrast);
