@@ -1,5 +1,5 @@
 // settings_video.inc - how the game looks: quality presets, anti-aliasing (MSAA), anisotropic filtering, V-Sync's
-// automatic setting (off on a G-Sync / FreeSync screen, display_refresh.h) and the picture adjustments drawn in the
+// automatic setting (off, unless a G-Sync / FreeSync screen would tear; display_refresh.h) and the picture adjustments drawn in the
 // present pass (sharpening, brightness, contrast, vibrance). All of it is display only: nothing here reaches the
 // game's memory, so online play is the same whatever each player picks. Included by settings_overlay.cpp inside its
 // anonymous namespace, after the graphics state it shares (resolution, bloom, frame rate) and before
@@ -121,19 +121,21 @@ void InitializeVideoSettings() {
             BloomOn() ? "on" : "off", g_vsyncAuto ? "auto" : (g_vsync.load() ? "on" : "off"), g_sharpening);
 }
 
-// V-Sync's automatic setting, each frame: off while the screen follows the frames and they stay under its refresh
-// (G-Sync and FreeSync show each frame when it is ready, so nothing tears and nothing waits for a refresh), on
-// otherwise.
+// V-Sync's automatic setting, each frame, on every platform: off, so presents never wait for a refresh (Brawl Online
+// board: "if gsync is not detected, vsync should default to OFF, on all playforms for the recomp"). The one time it
+// goes on is a screen that follows the frames (G-Sync, FreeSync) when they would come at least as fast as its
+// refresh: past that the screen tears like a fixed one. Detection is Windows only (display_refresh.h), so on macOS
+// and Linux auto is always off.
 void UpdateAutoVSync() {
     if (!g_vsyncAuto) return;
     const double hz = DisplayRefresh::RefreshHz();
     const uint32_t target = kFrameInterpolationTargetFps[static_cast<size_t>(g_frameInterpolationMode)];
     const double fps = target != 0 ? static_cast<double>(target) : 60.0;
-    const bool on = !(DisplayRefresh::VariableRefresh() == 1 && hz > 0 && fps < 0.96 * hz);
+    const bool on = DisplayRefresh::VariableRefresh() == 1 && hz > 0 && fps >= 0.96 * hz;
     if (on != g_vsync.load()) {
         g_vsync.store(on);
         aurora_set_vsync(on);
-        RT_LOGF(RT_TAG_CONFIG, "V-Sync (automatic): %s\n", on ? "on" : "off, the screen follows the frames");
+        RT_LOGF(RT_TAG_CONFIG, "V-Sync (automatic): %s\n", on ? "on, the frames reach the G-Sync screen's refresh" : "off");
     }
 }
 
@@ -167,11 +169,12 @@ void AntiAliasingRows(std::vector<MenuRow>& rows) {
 }
 
 void VSyncRow(std::vector<MenuRow>& rows) {
-    // AUTO -> ON -> OFF. Auto shows what it chose: off only on a screen that follows the frames (UpdateAutoVSync).
+    // AUTO -> ON -> OFF. Auto shows what it chose (UpdateAutoVSync): G-SYNC when off on a screen that follows the
+    // frames, OFF when off on any other, ON on a G-Sync screen the frames would outrun.
     const int mode = g_vsyncAuto ? 0 : (g_vsync.load() ? 1 : 2);
-    const std::string value = g_vsyncAuto ? (g_vsync.load() ? "AUTO: ON" : "AUTO: G-SYNC") : OnOff(g_vsync.load());
-    rows.push_back({"V-Sync", value,
-                    "No screen tearing; the game follows your screen's refresh. Auto: off on a G-Sync or FreeSync screen.",
+    const char* autoValue = g_vsync.load() ? "AUTO: ON" : (DisplayRefresh::VariableRefresh() == 1 ? "AUTO: G-SYNC" : "AUTO: OFF");
+    const std::string value = g_vsyncAuto ? autoValue : OnOff(g_vsync.load());
+    rows.push_back({"V-Sync", value, "No screen tearing; the game follows your screen's refresh.",
                     [mode](int step) {
                         const int next = Cycle(mode, step, 3);
                         if (next == 0) {

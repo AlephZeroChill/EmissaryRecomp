@@ -46,7 +46,7 @@ struct RuntimeUserConfig {
     std::optional<bool> spinningCoins;  // NSMBW: [video] spinning_coins, animated tiles
     std::optional<bool> frameGraph;     // NSMBW: [video] frame_graph, frame times under the FPS counter
     std::optional<bool> vsync;          // NSMBW: [video] vsync, presents wait for the display (Windows)
-    // [video] vsync = "auto" (or no key): V-Sync on, except while the screen follows the frames (G-Sync, FreeSync).
+    // [video] vsync = "auto" (or no key): V-Sync off, except on a G-Sync/FreeSync screen the frames would outrun.
     bool vsyncAuto = true;
     std::optional<uint32_t> msaa;         // [video] msaa: 1 (off), 2, 4 or 8 samples
     std::optional<uint32_t> anisotropy;   // [video] anisotropy: 1 (off), 2, 4, 8 or 16
@@ -264,8 +264,8 @@ inline void EnsureConfigFile() {
               "# resolution_multiplier = 2.25\n"
               "# 0 (off), 120 or 180\n"
               "frame_interpolation_fps = 0\n"
-              "# wait for the display when presenting: no screen tearing. \"auto\": on, except on a G-Sync or\n"
-              "# FreeSync screen that follows the frames (nothing tears there, and nothing waits)\n"
+              "# wait for the display when presenting: no screen tearing. \"auto\": off, except on a G-Sync or\n"
+              "# FreeSync screen when the frames would come as fast as its refresh\n"
               "vsync = \"auto\"\n"
               "# 0 = original 4:3, 1 = 16:9, 2 = fill the screen, 3 = cinematic 2.39:1\n"
               "aspect_mode = 1\n"

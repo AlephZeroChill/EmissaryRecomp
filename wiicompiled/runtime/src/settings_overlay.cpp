@@ -149,7 +149,7 @@ bool g_skipUnreadyPipelines = RuntimeConfigFile::SkipUnreadyPipelines(true);
 bool g_disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
 bool g_showFps = RuntimeConfigFile::ShowFps(false);  // off unless turned on
 bool g_frameGraph = RuntimeConfigFile::FrameGraph(false);
-std::atomic<bool> g_vsync{RuntimeConfigFile::VSync(true)};  // default on: no tearing
+std::atomic<bool> g_vsync{RuntimeConfigFile::VSync(false)};  // auto (no true/false key) starts off: UpdateAutoVSync
 #if defined(__APPLE__)
 bool g_metalFxSpatialUpscaling = RuntimeConfigFile::MetalFxSpatialUpscaling(false);
 #endif
