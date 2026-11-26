@@ -1462,6 +1462,22 @@ void finalize_frame_interpolation() noexcept {
     paletteSlotKeys.clear();
     resolvedSlots.assign(paletteDraws.size() * MaxPnMtx, ResolvedSlot{});
     resolvedProjectionEntry.assign(paletteDraws.size(), kNoPreparedPair);
+    // Coupled units: palettes that share a matrix are one mesh split across draws (g3d loads at most 10 matrices a
+    // draw, so a skinned body or shell is several draws whose seams use the same bones). Whatever moves one of them in
+    // the inserted frames must move all of them alike, or the seams open: duplicated, held and glided per draw,
+    // Squirtle's shell and head and Kirby's body showed the stage through pixel-wide cracks (bug report #358).
+    static std::vector<uint32_t> paletteUnit;  // union-find parent per palette
+    paletteUnit.resize(paletteDraws.size());
+    for (uint32_t palette = 0; palette < paletteUnit.size(); ++palette) {
+      paletteUnit[palette] = palette;
+    }
+    const auto unitOf = [&](uint32_t palette) {
+      while (paletteUnit[palette] != palette) {
+        paletteUnit[palette] = paletteUnit[paletteUnit[palette]];
+        palette = paletteUnit[palette];
+      }
+      return palette;
+    };
 
     for (uint32_t palette = 0; palette < paletteDraws.size(); ++palette) {
       const auto& transform = s_currentFrameTransforms[paletteDraws[palette]].transform;
@@ -1488,6 +1504,11 @@ void finalize_frame_interpolation() noexcept {
       size_t runEnd = runStart + 1;
       while (runEnd < paletteSlotKeys.size() &&
              paletteSlotKeys[runEnd].hash == paletteSlotKeys[runStart].hash) {
+        const uint32_t a = unitOf(paletteSlotKeys[runStart].palette);
+        const uint32_t b = unitOf(paletteSlotKeys[runEnd].palette);
+        if (a != b) {
+          paletteUnit[std::max(a, b)] = std::min(a, b);
+        }
         ++runEnd;
       }
       // Where this matrix was last frame, per the draws that did match. Partners that
@@ -1585,6 +1606,27 @@ void finalize_frame_interpolation() noexcept {
       }
     }
 
+    // A unit with an unresolved palette duplicates as a whole, as one palette does (a draw with no staged copies
+    // shows its own pose in every inserted frame too).
+    static std::vector<uint8_t> unitValid;
+    unitValid.assign(paletteDraws.size(), 1);
+    for (uint32_t palette = 0; palette < paletteDraws.size(); ++palette) {
+      const uint32_t draw = paletteDraws[palette];
+      if (preparedTransformState[draw] == 0 || !preparedTransforms[draw].indexedValid) {
+        unitValid[unitOf(palette)] = 0;
+      }
+    }
+    for (uint32_t palette = 0; palette < paletteDraws.size(); ++palette) {
+      if (!unitValid[unitOf(palette)]) {
+        preparedTransforms[paletteDraws[palette]].indexedValid = false;
+      }
+    }
+    // The draw that speaks for a draw's unit (itself outside one).
+    const auto unitKey = [&](size_t draw) -> size_t {
+      const int32_t palette = paletteDrawIndex[draw];
+      return palette < 0 ? draw : paletteDraws[unitOf(static_cast<uint32_t>(palette))];
+    };
+
     // Predict: which draws carry their motion forward, their step, and the glide back from what the previous frame
     // showed ahead of the game.
     std::vector<uint8_t> predictHold;
@@ -1597,12 +1639,32 @@ void finalize_frame_interpolation() noexcept {
       uint64_t held = 0, predicted = 0, glided = 0;
       uint32_t moving = 0, reversed = 0;
       float largest = 0.0f;
+      // One decision per coupled unit (unitKey): its members' pairs are pooled for the hold gates and the median
+      // step, and every member takes the unit's step, hold and glide, so the mesh's seams stay shut.
+      static std::vector<std::pair<size_t, size_t>> unitOrder;  // (unit key, draw)
+      unitOrder.clear();
       for (size_t index = 0; index < s_currentFrameTransforms.size(); ++index) {
-        if (preparedTransformState[index] == 0) {
-          continue;
+        if (preparedTransformState[index] != 0) {
+          unitOrder.emplace_back(unitKey(index), index);
         }
-        auto& entry = s_currentFrameTransforms[index];
-        const auto& prepared = preparedTransforms[index];
+      }
+      std::sort(unitOrder.begin(), unitOrder.end());
+      for (size_t unitStart = 0; unitStart < unitOrder.size();) {
+        size_t unitEnd = unitStart + 1;
+        while (unitEnd < unitOrder.size() && unitOrder[unitEnd].first == unitOrder[unitStart].first) {
+          ++unitEnd;
+        }
+        const size_t members = unitEnd - unitStart;
+        const size_t first = unitStart;
+        unitStart = unitEnd;
+        const auto member = [&](size_t k) -> FrameTransformEntry& {
+          return s_currentFrameTransforms[unitOrder[first + k].second];
+        };
+        const auto previousOf = [&](size_t k) -> const FrameTransformEntry* {
+          const size_t previousIndex = currentToPrevious[unitOrder[first + k].second];
+          return previousIndex < s_previousFrameTransforms.size() ? &s_previousFrameTransforms[previousIndex]
+                                                                  : nullptr;
+        };
         for (auto& v : steps) v.clear();
         depths.clear();
         bool hold = false;
@@ -1619,71 +1681,81 @@ void finalize_frame_interpolation() noexcept {
           for (size_t c = 0; c < 3; ++c) steps[c].push_back(step[c]);
           depths.push_back(preparedPairs[offset].current.m2.w());
         };
-        if (entry.transform.indexedMatrices) {
-          if (!prepared.indexedValid) {
-            hold = true;
-          } else {
-            for (size_t slot = 0; slot < MaxPnMtx && !hold; ++slot) {
-              if ((entry.transform.usedMatrixMask & (1u << slot)) != 0) addPair(prepared.indexedPairOffsets[slot]);
+        for (size_t k = 0; k < members && !hold; ++k) {
+          const auto& entry = s_currentFrameTransforms[unitOrder[first + k].second];
+          const auto& prepared = preparedTransforms[unitOrder[first + k].second];
+          if (entry.transform.indexedMatrices) {
+            if (!prepared.indexedValid) {
+              hold = true;
+            } else {
+              for (size_t slot = 0; slot < MaxPnMtx && !hold; ++slot) {
+                if ((entry.transform.usedMatrixMask & (1u << slot)) != 0) addPair(prepared.indexedPairOffsets[slot]);
+              }
             }
+          } else {
+            addPair(prepared.nonIndexedPairOffset);
           }
-        } else {
-          addPair(prepared.nonIndexedPairOffset);
         }
         if (hold || steps[0].empty()) {
-          ++held;
+          held += members;
           continue;
         }
+        std::array<float, 3> velocity{};
         for (size_t c = 0; c < 3; ++c) {
           auto& v = steps[c];
           std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
-          entry.velocity[c] = v[v.size() / 2];
+          velocity[c] = v[v.size() / 2];
         }
         std::nth_element(depths.begin(), depths.begin() + static_cast<std::ptrdiff_t>(depths.size() / 2), depths.end());
-        entry.depth = depths[depths.size() / 2];
-        entry.stepped = true;
-        {
-          const size_t previousIndex = currentToPrevious[index];
-          if (predict_jumps(entry, previousIndex < s_previousFrameTransforms.size()
-                                       ? &s_previousFrameTransforms[previousIndex]
-                                       : nullptr)) {
-            ++held;
-            continue;
-          }
+        const float depth = depths[depths.size() / 2];
+        bool jumps = false;
+        for (size_t k = 0; k < members; ++k) {
+          auto& entry = member(k);
+          entry.velocity = velocity;
+          entry.depth = depth;
+          entry.stepped = true;
+          jumps = jumps || predict_jumps(entry, previousOf(k));
         }
-        predictHold[index] = 0;
-        ++predicted;
-        entry.predicted = true;
+        if (jumps) {
+          held += members;
+          continue;
+        }
+        for (size_t k = 0; k < members; ++k) {
+          predictHold[unitOrder[first + k].second] = 0;
+          member(k).predicted = true;
+        }
+        predicted += members;
         // Glide: the previous frame's last shown slot put this draw `overshoot` ahead of where the game had it. When
         // this frame turns it back (a dash dance turning, a float starting), drawing it as the game has it now jumps
         // back by up to a whole frame of motion in one presented frame, against the fraction of a frame every other
         // presented frame moves. The part of that jump that undoes the overshoot is drawn as an offset instead and
         // faded out over kGlideFrames. Motion that goes on, or starts from rest, was never shown ahead and does not
-        // glide; a large correction is a teleport or a respawn and snaps. One offset per draw (the median of its
-        // matrices'): gliding each bone by its own amount stretched skinned meshes in Melee Unlocked.
-        const size_t previousIndex = currentToPrevious[index];
-        if (previousIndex >= s_previousFrameTransforms.size()) {
-          continue;
+        // glide; a large correction is a teleport or a respawn and snaps. One offset per unit (the median of its
+        // matrices'): gliding each bone by its own amount stretched skinned meshes in Melee Unlocked, and each draw by
+        // its own opened the seams between them (#358). The unit's first member predicted last frame speaks for it.
+        const FrameTransformEntry* previousEntry = nullptr;
+        for (size_t k = 0; k < members && previousEntry == nullptr; ++k) {
+          const auto* p = previousOf(k);
+          if (p != nullptr && p->predicted) previousEntry = p;
         }
-        const auto& previousEntry = s_previousFrameTransforms[previousIndex];
-        if (!previousEntry.predicted) {
+        if (previousEntry == nullptr) {
           continue;
         }
         {
-          const auto& p = previousEntry.velocity;
-          const auto& v = entry.velocity;
+          const auto& p = previousEntry->velocity;
+          const auto& v = velocity;
           const float pp = p[0] * p[0] + p[1] * p[1] + p[2] * p[2], vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
           if (pp > kJoltMinStep * kJoltMinStep && vv > kJoltMinStep * kJoltMinStep) {
-            ++moving;
-            reversed += p[0] * v[0] + p[1] * v[1] + p[2] * v[2] < 0.0f ? 1u : 0u;
+            moving += static_cast<uint32_t>(members);
+            reversed += p[0] * v[0] + p[1] * v[1] + p[2] * v[2] < 0.0f ? static_cast<uint32_t>(members) : 0u;
           }
         }
-        const float fade = previousEntry.glides ? glide_fade(shownFraction) : 0.0f;
+        const float fade = previousEntry->glides ? glide_fade(shownFraction) : 0.0f;
         std::array<float, 3> glide{};
         bool any = false, snap = false;
         for (size_t c = 0; c < 3; ++c) {
-          const float overshoot = previousEntry.velocity[c] * shownFraction + previousEntry.glide[c] * fade;
-          const float jump = overshoot - entry.velocity[c];
+          const float overshoot = previousEntry->velocity[c] * shownFraction + previousEntry->glide[c] * fade;
+          const float jump = overshoot - velocity[c];
           float g = 0.0f;
           if (std::isfinite(overshoot) && std::isfinite(jump) && overshoot * jump > 0.0f &&
               std::abs(jump) >= kGlideMin) {
@@ -1697,9 +1769,11 @@ void finalize_frame_interpolation() noexcept {
         if (snap || !any) {
           continue;
         }
-        entry.glide = glide;
-        entry.glides = true;
-        ++glided;
+        for (size_t k = 0; k < members; ++k) {
+          member(k).glide = glide;
+          member(k).glides = true;
+        }
+        glided += members;
         for (const float g : glide) largest = std::max(largest, std::abs(g));
       }
       if (moving >= kJoltMinDraws && reversed * 2 > moving) {
