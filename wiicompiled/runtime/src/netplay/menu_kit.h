@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -42,6 +43,39 @@ struct Nav {
     bool up = false, down = false, left = false, right = false, confirm = false, back = false;
 };
 
+// The buttons that are the game's A and B on a controller, so the menus confirm and go back with the same buttons the
+// game does: a GameCube controller's B is SDL's west button (east is its X), a Wii U Pro Controller's A is east and its
+// B south. A controller on a port uses that port's mapping (a player's remap too); one on no port, its kind's default.
+struct FaceButtons {
+    SDL_GamepadButton a = SDL_GAMEPAD_BUTTON_SOUTH, b = SDL_GAMEPAD_BUTTON_EAST;
+};
+
+inline FaceButtons FaceButtonsFor(u32 index, SDL_Gamepad* pad) {
+    FaceButtons face;
+    const SDL_GamepadType type = SDL_GetGamepadType(pad);
+    const char* name = SDL_GetGamepadName(pad);
+    if (type == SDL_GAMEPAD_TYPE_GAMECUBE ||
+        (type == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO && SDL_GetGamepadProduct(pad) == 0x2073)) {
+        face.b = SDL_GAMEPAD_BUTTON_WEST;
+    } else if (name != nullptr && std::strstr(name, "Wii U Pro Controller") != nullptr) {
+        face.a = SDL_GAMEPAD_BUTTON_EAST;
+        face.b = SDL_GAMEPAD_BUTTON_SOUTH;
+    }
+    for (u32 port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+        if (PADGetIndexForPort(port) != static_cast<s32>(index)) continue;
+        u32 count = 0;
+        const PADButtonMapping* mapping = PADGetButtonMappings(port, &count);
+        for (u32 j = 0; mapping != nullptr && j < count; ++j) {
+            if (mapping[j].nativeButton >= SDL_GAMEPAD_BUTTON_COUNT) continue;
+            const auto native = static_cast<SDL_GamepadButton>(mapping[j].nativeButton);
+            if (mapping[j].padButton == PAD_BUTTON_A) face.a = native;
+            if (mapping[j].padButton == PAD_BUTTON_B) face.b = native;
+        }
+        break;
+    }
+    return face;
+}
+
 inline Nav ReadNav(bool typing = false) {
     static uint32_t prevHeld = 0;
     static double nextRepeat = 0.0;
@@ -57,8 +91,9 @@ inline Nav ReadNav(bool typing = false) {
         if (b(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || ly > 20000) held |= kDown;
         if (b(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || lx < -20000) held |= kLeft;
         if (b(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || lx > 20000) held |= kRight;
-        if (b(SDL_GAMEPAD_BUTTON_SOUTH) || b(SDL_GAMEPAD_BUTTON_START)) held |= kA;
-        if (b(SDL_GAMEPAD_BUTTON_EAST)) held |= kB;
+        const FaceButtons face = FaceButtonsFor(i, pad);
+        if (b(face.a) || b(SDL_GAMEPAD_BUTTON_START)) held |= kA;
+        if (b(face.b)) held |= kB;
     }
     const double now = ImGui::GetTime();
     uint32_t pressed = held & ~prevHeld;
