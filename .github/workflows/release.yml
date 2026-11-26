@@ -1,5 +1,5 @@
 # EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines, the Linux program
-# and the macOS one (Apple silicon), built on GitHub's own runners; the downloads EmissaryRecomp-<tag>-Windows.zip /
+# and the macOS one (Apple silicon), built on GitHub's own runners (macOS: Sarah's Mac when it is there, see mac-runner); the downloads EmissaryRecomp-<tag>-Windows.zip /
 # -Linux.tar.gz / -macOS.tar.gz,
 # manifest.json and SHA256SUMS, published as the GitHub release <tag>. A tag with a suffix (v0.7.0-rc.1) is a
 # prerelease; a release is published without becoming /releases/latest (what launchers install) until a maintainer
@@ -62,8 +62,58 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  # Where the macOS build runs: Sarah's Mac (her self-hosted runner, labels self-hosted, macOS, ARM64, brawlmac; set up
+  # with brawlonline.net's tools/ci/mac-runner, switched on and off there with ~/runners/ci) when it answers, GitHub's
+  # macos-15 otherwise (often a long queue). GITHUB_TOKEN can't read runner status, so this starts mac-ping.yml (one
+  # job on the Mac's labels) and waits up to 90 s for it to start; not started: the ping is cancelled. The Mac
+  # running another job of this repository counts as there. The variable MAC_RUNNER (JSON labels) skips the question.
+  mac-runner:
     needs: check
+    if: needs.check.outputs.published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write  # start and cancel mac-ping.yml
+    outputs:
+      runs_on: ${{ steps.pick.outputs.runs_on }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          OVERRIDE: ${{ vars.MAC_RUNNER }}
+        run: |
+          set +e +o pipefail  # any failed question ends in GitHub's runner, never in a failed job
+          mac='["self-hosted","macOS","ARM64","brawlmac"]'
+          github='["macos-15"]'
+          pick() { echo "runs_on=$1" >> "$GITHUB_OUTPUT"; echo "macOS build: $1 ($2)"; exit 0; }
+          [ -z "$OVERRIDE" ] || pick "$OVERRIDE" "MAC_RUNNER"
+          for run in $(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=30" --jq '.workflow_runs[].id' 2>/dev/null); do
+            if gh api "repos/$REPO/actions/runs/$run/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] | select(.status == "in_progress" and (.labels | index("brawlmac"))) | .id' 2>/dev/null | grep -q .; then
+              pick "$mac" "the Mac is running run $run"
+            fi
+          done
+          nonce="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          gh workflow run mac-ping.yml -R "$REPO" --ref "$DEFAULT_BRANCH" -f nonce="$nonce" ||
+            pick "$github" "could not start mac-ping.yml"
+          ping_run=""
+          for i in $(seq 1 18); do
+            sleep 5
+            [ -n "$ping_run" ] || ping_run="$(gh api "repos/$REPO/actions/workflows/mac-ping.yml/runs?event=workflow_dispatch&per_page=20" \
+              --jq ".workflow_runs[] | select(.display_title == \"mac ping $nonce\") | .id" 2>/dev/null | head -n 1)"
+            [ -n "$ping_run" ] || continue
+            status="$(gh api "repos/$REPO/actions/runs/$ping_run/jobs" --jq '.jobs[0].status // ""' 2>/dev/null)"
+            case "$status" in
+              in_progress|completed) pick "$mac" "the Mac answered (mac-ping run $ping_run)" ;;
+            esac
+          done
+          [ -z "$ping_run" ] || gh run cancel "$ping_run" -R "$REPO" || true
+          pick "$github" "the Mac did not answer within 90 s"
+
+  build:
+    needs: [check, mac-runner]
     if: needs.check.outputs.published != 'true'
     name: build (${{ matrix.name }})
     strategy:
@@ -78,8 +128,8 @@ jobs:
             os: windows-2025
             old-cpu: true
           - name: macos
-            os: macos-15  # Apple silicon (arm64), what the macOS build is for
-    runs-on: ${{ matrix.os }}
+            os: macos-15  # Apple silicon (arm64), what the macOS build is for; mac-runner picks the runner
+    runs-on: ${{ matrix.name == 'macos' && fromJSON(needs.mac-runner.outputs.runs_on) || matrix.os }}
     timeout-minutes: 355
     defaults:
       run:
@@ -88,7 +138,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # Sarah's Mac has its own Python 3.12+ as python/python3 on the runner's PATH (tools/ci/mac-runner).
       - uses: actions/setup-python@v5
+        if: runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
 
@@ -127,12 +179,23 @@ jobs:
       # cache saved by a run on the default branch is what tag runs and other branches start from. Only from the same
       # runner image: a precompiled header records the system headers' times, and a new image (macOS's Xcode SDK, the
       # first v0.7.1 runs) makes clang refuse it ("has been modified since the precompiled header ... was built").
+      # Sarah's Mac keeps the build folder itself, in its runner's CI_CACHE (outside the checkout, which is cleaned
+      # every run), one per SDK and compiler (as with the image below: a precompiled header records the system headers).
+      - name: Build folder (Sarah's Mac)
+        if: runner.environment == 'self-hosted' && runner.os == 'macOS'
+        run: |
+          key="$(xcrun --show-sdk-build-version)-$(clang --version | head -1 | shasum | cut -c1-12)"
+          keep="${CI_CACHE:?the runner's .env sets CI_CACHE}/build-${{ matrix.name }}-$key"
+          for old in "$CI_CACHE"/build-${{ matrix.name }}-*; do [[ $old == "$keep" ]] || rm -rf "$old"; done
+          mkdir -p "$keep"
+          rm -rf build && ln -s "$keep" build
+          echo "Build folder: $keep ($(du -sh "$keep" | cut -f1))"
       - name: Runner image
         id: image
         run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Restore the build cache
         id: cache
-        if: vars.EMISSARY_BUILD_CACHE != 'off'
+        if: vars.EMISSARY_BUILD_CACHE != 'off' && runner.environment == 'github-hosted'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
@@ -165,7 +228,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           command -v ninja >/dev/null || brew install ninja
-          EMISSARY_RELEASE_IN_PLACE=1 EMISSARY_RELEASE_WORK="$PWD/build/ci"             bash tools/release-macos.sh "$PWD" "$EMISSARY_GAME" "$PWD/out/macos-native" 3 "$TAG" "$GITHUB_SHA"
+          EMISSARY_RELEASE_IN_PLACE=1 EMISSARY_RELEASE_WORK="$PWD/build/ci"             bash tools/release-macos.sh "$PWD" "$EMISSARY_GAME" "$PWD/out/macos-native" "$(sysctl -n hw.ncpu)" "$TAG" "$GITHUB_SHA"
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -181,7 +244,7 @@ jobs:
 
       # A cache that can't be saved never fails the build (the next run builds from scratch).
       - name: Save the build cache
-        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch' && runner.environment == 'github-hosted'
         continue-on-error: true
         env:
           EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
@@ -193,7 +256,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/cache"  # only there when a cache was restored
           python tools/ci/game_code.py cache-save --dir build --out "$RUNNER_TEMP/cache/build-${{ matrix.name }}.tar.gz.gpg" "${skip[@]}"
       - name: Upload the build cache
-        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch' && runner.environment == 'github-hosted'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:

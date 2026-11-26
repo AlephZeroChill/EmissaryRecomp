@@ -186,6 +186,19 @@ repository starts it: a pushed tag `v*.*.*` (built and published), or Actions > 
 branch (a prerelease suffix, and whether to publish; unpublished files stay a workflow artifact for 7 days). It has no
 `pull_request` or `pull_request_target` trigger, and none must ever be added to it: its jobs decrypt the game's code.
 
+The macOS program builds on Sarah's Mac when it is there (2026-11-26), GitHub's `macos-15` otherwise: a self-hosted
+runner (`sarah-mac`, labels `self-hosted, macOS, ARM64, brawlmac`; registered with a token from the repository's
+owner, set up and switched on and off with brawlonline.net's `tools/ci/mac-runner`, there `docs/ci.md` "Sarah's Mac").
+GitHub's macOS runners often queue for a long time; hers is an M4 Max. The `mac-runner` job asks it: it starts
+`mac-ping.yml` (one job on those labels) and waits up to 90 s for that job to start, else cancels it and the build goes
+to `macos-15` (GITHUB_TOKEN can't read runner status). The variable `MAC_RUNNER` (JSON labels, e.g. `["macos-15"]`)
+skips the question. On the Mac the job takes Python from the Mac (not setup-python), builds with all its cores, and
+keeps its build folder in the runner's own `ci-cache` (one per SDK and compiler) instead of the encrypted Actions
+cache; the game's code is still deleted from the runner's temporary folder at the end. A self-hosted runner runs any
+workflow that asks for its labels, so no workflow here may ever run on pull requests (a fork's pull request can bring
+its own workflow: the repository should require approval for all outside contributors' runs, Settings > Actions >
+General).
+
 ### The game's code
 
 The build translates Brawl's `sys/main.dol` and `files/module/*.rel`: 127 files, 25 MB of the disc, nothing else
@@ -253,7 +266,7 @@ when the CI repository does not exist.
 | C | GitHub's runners in a public repository Sarah owns (a fork), the game's code encrypted in a private one | the two repositories, the deploy key and the secrets (`setup_ci.py`, as their owner) | free, three platforms at once, about half an hour to an hour from scratch; only Sarah (and what she pushes) can run it; the game's files are on GitHub, encrypted, in a private repository, decrypted on GitHub's runners for each build; the launcher points at the fork's releases |
 | D | GitHub's runners in a private repository | as C | logs and artifacts private, but 2-core runners and 2,000 free minutes a month (Windows minutes count twice): a few releases a month at most; players cannot download a private repository's releases, so they would be published elsewhere |
 | E | A runner on a home server or VPS | the machine; a Linux runner | one OS (Linux); those machines are already busy. The Windows engines are built with llvm-mingw, which also runs on Linux, so a Linux machine could cross-compile them, but the build (`build-brawl.ps1`, `Prepare-PortableTools.ps1`) is Windows-only today |
-| F | macOS (later) | `macos-15` runners (arm64, 3 cores, 7 GB, free in a public repository) | the game, Brawl Online's core and the launcher play on Apple silicon since 2026-11-25 (`tools/release-macos.sh`); CI's `macos` job (2026-11-26) |
+| F | macOS (later) | `macos-15` runners (arm64, 3 cores, 7 GB, free in a public repository); since 2026-11-26 Sarah's Mac first (above) | the game, Brawl Online's core and the launcher play on Apple silicon since 2026-11-25 (`tools/release-macos.sh`); CI's `macos` job (2026-11-26) |
 
 The repository variable or the secrets missing, every job is skipped, so the same workflow serves B and C.
 
