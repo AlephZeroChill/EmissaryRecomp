@@ -267,6 +267,30 @@ if (AURORA_ENABLE_GX)
     FetchContent_MakeAvailable(glslang)
   endif ()
 
+  # SPIR-V -> HLSL for SDL_GPU's Direct3D 12 backend on Windows (lib/gpu/shader_d3d12.cpp), which then compiles
+  # the HLSL with Windows' own d3dcompiler_47.dll (DXBC). Only the GLSL and HLSL writers: no CLI, MSL, C++, C API,
+  # reflection or tests.
+  if (WIN32 AND NOT TARGET spirv-cross-hlsl)
+    message(STATUS "aurora: Fetching SPIRV-Cross")
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_MSL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_STATIC ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(spirv_cross
+      URL https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz
+      URL_HASH SHA256=f708982e88b763ef5b0394ed468fc2c3628f68cdab89f2e7a946cd628c04e721
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(spirv_cross)
+  endif ()
+
   if (NOT TARGET imgui)
     message(STATUS "aurora: Fetching imgui")
     FetchContent_Declare(imgui

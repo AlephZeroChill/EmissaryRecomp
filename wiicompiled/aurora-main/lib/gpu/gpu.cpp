@@ -20,6 +20,7 @@
 
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
+#include "../system_info.hpp"
 #include "../window.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 
@@ -588,6 +589,7 @@ static bool gfx_flag(std::string_view flag) {
 //   dumpshaders  write every generated GX shader to <cache>/shaders
 //   debug      create the device with SDL's GPU debug mode (backend validation)
 //   immediate  require immediate presentation (diagnose swapchain contention)
+//   dxc        Direct3D 12: DXIL from dxcompiler.dll beside the program instead of DXBC from d3dcompiler_47
 static void load_gfx_flags() {
   g_gfxFlags.clear();
   const char* env = std::getenv("AURORA_GFX_FLAGS");
@@ -746,6 +748,21 @@ VulkanDeviceFacts read_vulkan_device_facts(const std::string& name) {
     }
   }
   SDL_Vulkan_UnloadLibrary();
+#else
+  (void)name;
+#endif
+  return facts;
+}
+
+// Direct3D 12's device, from DXGI's list of adapters, matched by the name SDL_GPU gives (the adapter's
+// description). DXGI has no device type: an adapter with at most 512 MiB of its own memory is a processor's
+// graphics (Intel's report 128 MiB, AMD's 512 at most). The memory is the adapter's own, as Vulkan's device-local
+// heap is for a graphics card.
+VulkanDeviceFacts read_dxgi_device_facts(const std::string& name) {
+  VulkanDeviceFacts facts;
+#if defined(_WIN32)
+  facts.read = system_info::dxgi_adapter_memory(name, facts.memoryBytes);
+  facts.integrated = facts.read && facts.memoryBytes <= (uint64_t{512} << 20);
 #else
   (void)name;
 #endif
@@ -1162,8 +1179,14 @@ bool initialize(AuroraBackend auroraBackend) {
     return false;
   }
   // GX shaders are generated at run time, so the device must take a language aurora can compile now:
-  // MSL (Metal compiles it) or SPIR-V (glslang, lib/gpu/shader.cpp).
+  // MSL (Metal compiles it) or SPIR-V (glslang, lib/gpu/shader.cpp), and on Windows DXBC or DXIL (that SPIR-V
+  // through SPIRV-Cross and d3dcompiler_47 or DXC, lib/gpu/shader_d3d12.cpp) for Direct3D 12.
+#if defined(AURORA_GPU_D3D12_SHADERS)
+  constexpr SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV |
+                                          SDL_GPU_SHADERFORMAT_DXBC | SDL_GPU_SHADERFORMAT_DXIL;
+#else
   constexpr SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
   if (g_device == nullptr) {
     g_device = SDL_CreateGPUDevice(formats, gfx_flag("debug"), driver);
     if (g_device == nullptr) {
@@ -1176,8 +1199,9 @@ bool initialize(AuroraBackend auroraBackend) {
   const char* name = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, nullptr);
   g_adapterName = name != nullptr ? name : g_backendName;
   Log.info("Graphics device: {} on {}", g_adapterName, g_backendName);
-  if (g_backendName == "vulkan") {
-    g_deviceFacts = read_vulkan_device_facts(g_adapterName);
+  if (g_backendName == "vulkan" || g_backendName == "direct3d12") {
+    g_deviceFacts = g_backendName == "vulkan" ? read_vulkan_device_facts(g_adapterName)
+                                              : read_dxgi_device_facts(g_adapterName);
     if (g_deviceFacts.read) {
       Log.info("Graphics device: {} GPU, {} MiB of memory", g_deviceFacts.integrated ? "integrated" : "discrete",
                g_deviceFacts.memoryBytes >> 20);

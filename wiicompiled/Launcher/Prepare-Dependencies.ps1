@@ -50,6 +50,11 @@ $packages = @(
         Pins = @(@{ File = $auroraExtern; Text = 'https://files.twilitrealm.dev/freetype-2.14.3.tar.gz' })
     },
     [pscustomobject]@{
+        Name = 'glslang'; File = 'glslang-16.6.0.tar.gz'
+        Uris = @('https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz')
+        Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz' })
+    },
+    [pscustomobject]@{
         Name = 'imgui'; File = 'imgui-1.92.2b.tar.gz'
         Uris = @('https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz')
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/ocornut/imgui/archive/refs/tags/v1.92.2b.tar.gz' },
@@ -66,6 +71,11 @@ $packages = @(
         Name = 'png'; File = 'libpng-1.6.58.tar.gz'
         Uris = @('https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz')
         Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz' })
+    },
+    [pscustomobject]@{
+        Name = 'spirv_cross'; File = 'SPIRV-Cross-vulkan-sdk-1.4.363.0.tar.gz'
+        Uris = @('https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz')
+        Pins = @(@{ File = $auroraExtern; Text = 'https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz' })
     },
     [pscustomobject]@{
         Name = 'xxhash'; File = 'xxHash-0.8.4.tar.gz'

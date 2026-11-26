@@ -612,13 +612,15 @@ constexpr const char* backend_name(AuroraBackend backend) noexcept {
 }
 
 #ifdef AURORA_ENABLE_GX
-// The SDL_GPU drivers per platform, most preferred first.
+// The SDL_GPU drivers per platform, most preferred first. Windows: Vulkan, which every release since v0.7.0 played on
+// and which builds a new shader ~10x faster (Direct3D 12 compiles HLSL first, until shader_d3d12.cpp has it cached);
+// Direct3D 12 for a PC whose Vulkan can't start (no driver, older Intel graphics, Windows on ARM).
 constexpr std::array PreferredBackendOrder{
 #if defined(__APPLE__)
     BACKEND_METAL,
 #elif defined(_WIN32)
-    BACKEND_D3D12,
     BACKEND_VULKAN,
+    BACKEND_D3D12,
 #else
     BACKEND_VULKAN,
 #endif

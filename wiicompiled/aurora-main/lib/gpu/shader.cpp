@@ -1,6 +1,9 @@
 #include "shader.hpp"
 
 #include "../internal.hpp"
+#if defined(AURORA_GPU_D3D12_SHADERS)
+#include "shader_d3d12.hpp"
+#endif
 
 #include <fmt/format.h>
 #include <glslang/Include/glslang_c_interface.h>
@@ -380,6 +383,49 @@ glslang_stage_t glslang_stage(const Interface& iface) {
   }
   return iface.stage == SDL_GPU_SHADERSTAGE_VERTEX ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT;
 }
+
+// What SDL_CreateGPUShader / SDL_CreateGPUComputePipeline get: MSL source, SPIR-V, or (Direct3D 12) the SPIR-V
+// made into DXBC or DXIL (shader_d3d12.cpp).
+struct Bytecode {
+  std::vector<uint32_t> spirv;
+  std::vector<uint8_t> bytes;
+  const Uint8* code = nullptr;
+  size_t size = 0;
+  const char* entry = "main";
+  SDL_GPUShaderFormat format = SDL_GPU_SHADERFORMAT_SPIRV;
+};
+
+bool make_bytecode(Language lang, const Interface& iface, const std::string& source, const char* label,
+                   Bytecode& out) {
+  if (lang == Language::MSL) {
+    out.code = reinterpret_cast<const Uint8*>(source.c_str());
+    out.size = source.size();
+    out.entry = entry_name(iface);
+    out.format = SDL_GPU_SHADERFORMAT_MSL;
+    return true;
+  }
+  out.spirv = compile_spirv(glslang_stage(iface), source, label);
+  if (out.spirv.empty()) {
+    return false;
+  }
+#if defined(AURORA_GPU_D3D12_SHADERS)
+  if (const SDL_GPUShaderFormat format = d3d12::format(); format != 0) {
+    out.bytes = d3d12::compile(out.spirv, iface.compute, iface.stage, label);
+    if (out.bytes.empty()) {
+      log_source(label, source);
+      return false;
+    }
+    out.code = out.bytes.data();
+    out.size = out.bytes.size();
+    out.format = format;
+    return true;
+  }
+#endif
+  out.code = reinterpret_cast<const Uint8*>(out.spirv.data());
+  out.size = out.spirv.size() * sizeof(uint32_t);
+  out.format = SDL_GPU_SHADERFORMAT_SPIRV;
+  return true;
+}
 } // namespace
 
 Language language() noexcept {
@@ -401,19 +447,15 @@ Shader create(const Interface& iface, std::string_view helpers, std::string_view
   const Language lang = language();
   const auto source = assemble(lang, iface, helpers, body);
   dump_source(label, lang, source);
-  std::vector<uint32_t> spirv;
-  if (lang == Language::GLSL) {
-    spirv = compile_spirv(glslang_stage(iface), source, label);
-    if (spirv.empty()) {
-      return nullptr;
-    }
+  Bytecode bytecode;
+  if (!make_bytecode(lang, iface, source, label, bytecode)) {
+    return nullptr;
   }
   const SDL_GPUShaderCreateInfo info{
-      .code_size = lang == Language::GLSL ? spirv.size() * sizeof(uint32_t) : source.size(),
-      .code = lang == Language::GLSL ? reinterpret_cast<const Uint8*>(spirv.data())
-                                     : reinterpret_cast<const Uint8*>(source.c_str()),
-      .entrypoint = lang == Language::GLSL ? "main" : entry_name(iface),
-      .format = lang == Language::GLSL ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_MSL,
+      .code_size = bytecode.size,
+      .code = bytecode.code,
+      .entrypoint = bytecode.entry,
+      .format = bytecode.format,
       .stage = iface.stage,
       .num_samplers = static_cast<Uint32>(iface.textures.size()),
       .num_storage_textures = 0,
@@ -437,19 +479,15 @@ ComputePipeline create_compute(const Interface& iface, std::string_view helpers,
   compute.compute = true;
   const auto source = assemble(lang, compute, helpers, body);
   dump_source(label, lang, source);
-  std::vector<uint32_t> spirv;
-  if (lang == Language::GLSL) {
-    spirv = compile_spirv(GLSLANG_STAGE_COMPUTE, source, label);
-    if (spirv.empty()) {
-      return nullptr;
-    }
+  Bytecode bytecode;
+  if (!make_bytecode(lang, compute, source, label, bytecode)) {
+    return nullptr;
   }
   const SDL_GPUComputePipelineCreateInfo info{
-      .code_size = lang == Language::GLSL ? spirv.size() * sizeof(uint32_t) : source.size(),
-      .code = lang == Language::GLSL ? reinterpret_cast<const Uint8*>(spirv.data())
-                                     : reinterpret_cast<const Uint8*>(source.c_str()),
-      .entrypoint = lang == Language::GLSL ? "main" : "cs_main",
-      .format = lang == Language::GLSL ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_MSL,
+      .code_size = bytecode.size,
+      .code = bytecode.code,
+      .entrypoint = bytecode.entry,
+      .format = bytecode.format,
       .num_samplers = static_cast<Uint32>(compute.textures.size()),
       .num_readonly_storage_textures = 0,
       .num_readonly_storage_buffers = count_buffers(compute.storageBuffers),

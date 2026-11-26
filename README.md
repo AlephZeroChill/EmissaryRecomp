@@ -209,7 +209,7 @@ the manifest, the Linux build machine and the CI runner are in [`docs/releases.m
 |---|---|
 | `wiicompiled/translator` | PowerPC to C++ static recompiler (C#) |
 | `wiicompiled/runtime` | Runtime and Wii SDK HLE (OS, DVD, NAND, SD, WPAD/KPAD, AX audio, VI, GX) |
-| `wiicompiled/aurora-main` | Aurora: Wii GX on WebGPU (Dawn / Direct3D 12) |
+| `wiicompiled/aurora-main` | Aurora: Wii GX on SDL_GPU (Vulkan, or Direct3D 12 on Windows; Metal on macOS) |
 | `wiicompiled/projects/brawl` | This game's project: function map, module layout, code handler, tools |
 | `launcher` | The launcher (WinForms; `linux\` is the same pages in Avalonia) |
 | `tools` | Build and packaging scripts |
