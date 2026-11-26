@@ -142,6 +142,12 @@ void PollChatKey() {
 }
 
 void Start() {
+    // No ImGui gamepad navigation (aurora turns it on): with the chat box focused, holding a
+    // GameCube controller's B (SDL's west button, ImGui's gamepad Menu) opened ImGui's window
+    // list, a dark box in the middle of the screen, and the stick moved the chat window. The
+    // runtime's menus read controllers themselves (MenuKit::ReadNav); in Dolphin ImGui never
+    // sees a controller.
+    ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     // Dolphin's: the OSD font a player put in User/Load, else the one in Sys/Resources (copied
     // beside the executable).
     const std::string resources = File::GetSysDirectory() + RESOURCES_DIR DIR_SEP;
