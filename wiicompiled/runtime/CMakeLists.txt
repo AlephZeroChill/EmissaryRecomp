@@ -112,6 +112,10 @@ option(MKW_HZ_PERF_HOT_COUNTERS "Horizon per-call perf counters" ON)
 # Training: -1.45M game-thread instructions/frame (-17.5%), gameplay hash identical over the match, MEM2
 # differs. Default OFF.
 option(MKW_FAST_FLOAT "Host float instructions instead of bit-exact Gekko float emulation" OFF)
+# MKW_ACCURATE_NANS (include/isa/ppc_isa_float.h): Gekko's NaN results (operand order, positive default NaN), as
+# Dolphin's AccurateNaNs. OFF, the default, keeps the host's NaN, as the Dolphin Brawl Online plays Project+ with
+# (AccurateNaNs off): no NaN check after each float and paired-single operation.
+option(MKW_ACCURATE_NANS "Gekko's NaN results instead of the host's (Dolphin's AccurateNaNs)" OFF)
 
 option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
 option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
@@ -139,6 +143,9 @@ if(NOT MKW_HZ_PERF_HOT_COUNTERS)
 endif()
 if(MKW_FAST_FLOAT)
     list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_FAST_FLOAT=1)
+endif()
+if(MKW_ACCURATE_NANS)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_ACCURATE_NANS=1)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

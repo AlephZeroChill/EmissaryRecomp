@@ -38,6 +38,27 @@
 #define MKW_FAST_FLOAT 0
 #endif
 
+// MKW_ACCURATE_NANS=1: a NaN result is the one Gekko gives (the first NaN operand in guest order, quieted, else the
+// positive default NaN; nmadd/nmsub leave a NaN result unnegated), as Dolphin with AccurateNaNs on. 0, the default:
+// the NaN the host instruction gives, which nmadd/nmsub negate like any other result, as Dolphin's JITs with
+// AccurateNaNs off, the setting Brawl Online's Dolphin plays Project+ with (Dolphin's default; no game setting turns it
+// on for RSBE01). Only NaN results differ, and Dolphin's x86 and ARM JITs differ from each other the same way, so
+// games that sync across them sync with this too. The checks it drops are on every float and paired-single operation.
+#ifndef MKW_ACCURATE_NANS
+#define MKW_ACCURATE_NANS 0
+#endif
+
+// The nmadd/nmsub negation of a result (see MKW_ACCURATE_NANS).
+template <typename T>
+inline T PpcNegateMaddResultInline(T result)
+{
+#if MKW_ACCURATE_NANS
+    return std::isnan(result) ? result : -result;
+#else
+    return -result;
+#endif
+}
+
 inline uint64_t PpcBitCastToU64Inline(double value)
 {
     uint64_t integral = 0;
@@ -137,9 +158,14 @@ inline PpcPairVec PpcBroadcastPs1Inline(double value)
 #endif
 }
 
+// The paired nmadd/nmsub negation: every lane but a NaN one (MKW_ACCURATE_NANS), or every lane.
 inline PpcPairVec PpcNegateNonNanLanesInline(PpcPairVec value)
 {
-#if defined(__x86_64__)
+#if !MKW_ACCURATE_NANS && defined(__x86_64__)
+    return _mm_xor_ps(value, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))));
+#elif !MKW_ACCURATE_NANS && defined(__aarch64__)
+    return vneg_f32(value);
+#elif defined(__x86_64__)
     const __m128 signMask = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)));
     const __m128 negated = _mm_xor_ps(value, signMask);
     const __m128 ordered = _mm_cmpord_ps(value, value);
@@ -452,15 +478,23 @@ MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PpcResolveNanSlow(d
     return PpcBitCastToDoubleInline(0x7FF8000000000000ull);
 }
 
+// Without MKW_ACCURATE_NANS, the host's NaN.
 inline double PpcResolveNanInline(double result, double a, double b, double c = 0.0)
 {
+#if !MKW_ACCURATE_NANS
+    (void)a;
+    (void)b;
+    (void)c;
+    return result;
+#else
     if (!std::isnan(result)) [[likely]] return result;
     return PpcResolveNanSlow(a, b, c);
+#endif
 }
 
-// The NaN a two-operand op produces: PpcResolveNanInline on every host (exact), except under MKW_FAST_FLOAT, which
-// keeps the host's NaN. (Skipping it on AArch64 relied on FPCR.DN being clear and still differed for a quiet NaN in a
-// with a signalling NaN in b; not taken.)
+// The NaN a two-operand op produces: PpcResolveNanInline on every host, except under MKW_FAST_FLOAT, which keeps the
+// host's NaN even with MKW_ACCURATE_NANS. (Skipping it on AArch64 relied on FPCR.DN being clear and still differed for
+// a quiet NaN in a with a signalling NaN in b; not taken.)
 inline double PpcResolveNan2Inline(double result, double a, double b)
 {
 #if MKW_FAST_FLOAT
@@ -556,14 +590,12 @@ inline double PpcFmsubInline(double a, double c, double b)
 
 inline double PpcFnmaddInline(double a, double c, double b)
 {
-    const double result = PpcFmaddInline(a, c, b);
-    return std::isnan(result) ? result : -result;
+    return PpcNegateMaddResultInline(PpcFmaddInline(a, c, b));
 }
 
 inline double PpcFnmsubInline(double a, double c, double b)
 {
-    const double result = PpcFmsubInline(a, c, b);
-    return std::isnan(result) ? result : -result;
+    return PpcNegateMaddResultInline(PpcFmsubInline(a, c, b));
 }
 
 inline double PpcFmaddsBody(double a, double c, double b)
@@ -582,14 +614,14 @@ inline double PpcFnmaddsBody(double a, double c, double b)
 {
     const float result = PpcForceSingleValueBody(
         PpcAccurateSingleMaddIntermediateInline<false>(a, c, b));
-    return static_cast<double>(std::isnan(result) ? result : -result);
+    return static_cast<double>(PpcNegateMaddResultInline(result));
 }
 
 inline double PpcFnmsubsBody(double a, double c, double b)
 {
     const float result = PpcForceSingleValueBody(
         PpcAccurateSingleMaddIntermediateInline<true>(a, c, b));
-    return static_cast<double>(std::isnan(result) ? result : -result);
+    return static_cast<double>(PpcNegateMaddResultInline(result));
 }
 
 // fmuls / fmadds / fmsubs / fnmadds / fnmsubs whose C operand the translator proved single-precision (an lfs, a
@@ -626,13 +658,13 @@ extern "C" inline double PPC_FmsubsSingleC(double a, double c, double b)
 extern "C" inline double PPC_FnmaddsSingleC(double a, double c, double b)
 {
     const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<false, true>(a, c, b));
-    return static_cast<double>(std::isnan(result) ? result : -result);
+    return static_cast<double>(PpcNegateMaddResultInline(result));
 }
 
 extern "C" inline double PPC_FnmsubsSingleC(double a, double c, double b)
 {
     const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<true, true>(a, c, b));
-    return static_cast<double>(std::isnan(result) ? result : -result);
+    return static_cast<double>(PpcNegateMaddResultInline(result));
 }
 
 // The entry points translated code calls (see PpcForceSingleValueBody).
@@ -675,9 +707,9 @@ inline double PpcFnmsubsInline(double a, double c, double b)
     return MKW_OUTLINE_GUEST_OPS_SELECT(PpcFnmsubsOutlined, PpcFnmsubsBody)(a, c, b);
 }
 
-#if MKW_FAST_FLOAT
-// Fast float: paired-single results keep the host's NaN (no guest-order payload selection), so the per-op NaN
-// check and its out-of-line resolution compile away.
+#if MKW_FAST_FLOAT || !MKW_ACCURATE_NANS
+// Fast float or no MKW_ACCURATE_NANS: paired-single results keep the host's NaN (no guest-order payload selection),
+// so the per-op NaN check and its out-of-line resolution compile away.
 inline constexpr uint64_t PpcPairNanLaneBitsInline(PpcPairVec) { return 0; }
 #elif defined(__aarch64__)
 inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
@@ -687,7 +719,7 @@ inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
 
 #endif // defined(__aarch64__)
 
-#if defined(__x86_64__) && !MKW_FAST_FLOAT
+#if defined(__x86_64__) && !MKW_FAST_FLOAT && MKW_ACCURATE_NANS
 inline uint64_t PpcPairNanLaneBitsInline(PpcPairVec value)
 {
     // Only the low two lanes represent guest values. In particular, the unused

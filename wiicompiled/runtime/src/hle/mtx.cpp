@@ -177,12 +177,12 @@ inline F4 FusedMulAdd(F4 a, F4 b, F4 c)
     return result;
 }
 
-// ps_mul (PpcMulPairInline): Exact applies the NaN fixup.
+// ps_mul (PpcMulPairInline): Exact applies the NaN fixup (only with MKW_ACCURATE_NANS, as PpcMulPairInline).
 template <bool Exact>
 inline F4 Mul(F4 a, F4 b)
 {
     const F4 r = a * b;
-    if (Exact && AnyNan(r)) return ResolveNanLanes(r, a, b, F4{0.0f, 0.0f, 0.0f, 0.0f});
+    if (Exact && MKW_ACCURATE_NANS && AnyNan(r)) return ResolveNanLanes(r, a, b, F4{0.0f, 0.0f, 0.0f, 0.0f});
     return r;
 }
 
@@ -191,7 +191,7 @@ template <bool Exact>
 inline F4 Madd(F4 multiplicand, F4 multiplier, F4 addend)
 {
     const F4 r = FusedMulAdd(multiplicand, multiplier, addend);
-    if (Exact && AnyNan(r)) return ResolveNanLanes(r, multiplicand, addend, multiplier);
+    if (Exact && MKW_ACCURATE_NANS && AnyNan(r)) return ResolveNanLanes(r, multiplicand, addend, multiplier);
     return r;
 }
 
