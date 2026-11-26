@@ -354,6 +354,28 @@ char *SDL_SYS_GetCurrentDirectory(void)
 [==[#if !defined(__FreeBSD__) && !defined(__APPLE__) /* WiiCompiled: see AuroraSDL3Patches.cmake */
 #define DETACH_KERNEL_DRIVER
 #endif]==])
+
+  # GameCube adapter (WUP-028, and adapters in its Wii U mode): every stick and trigger byte as the controller sent it.
+  # SDL stretched each axis from the range it had seen (at first 128 +-88) to the whole Sint16 range, so a byte of
+  # 128+80 read as 128+116, and aurora's dead zone then took out everything under about 21 on each axis: a box
+  # controller's modifier coordinates (and a stick's small values) reached the game unlike on Dolphin, which passes
+  # the bytes through (Brawl Online board: "modifiers don't seem to work on emissary ... the coordinates are not the
+  # same"). Now an axis is (byte - 128) * 256, the same for the triggers, and the joystick says so in its properties
+  # ("WiiCompiled.gamecube.raw_axes"), where aurora's PADRead looks before it takes the bytes back (pad.cpp).
+  set(_gc "${sdl_source_dir}/src/joystick/hidapi/SDL_hidapi_gamecube.c")
+  _aurora_sdl3_replace("${_gc}" "GameCube adapter: raw axes"
+[==[    axis_value = (Sint16)HIDAPI_RemapVal(curSlot[off], ctx->min_axis[i * SDL_GAMEPAD_AXIS_COUNT + axis], ctx->max_axis[i * SDL_GAMEPAD_AXIS_COUNT + axis], SDL_MIN_SINT16, SDL_MAX_SINT16); \]==]
+[==[    axis_value = (Sint16)(((int)curSlot[off] - 128) * 256); /* WiiCompiled: the byte as is, AuroraSDL3Patches.cmake */ \]==])
+  _aurora_sdl3_replace("${_gc}" "GameCube adapter: raw axes (property)"
+[==[            joystick->nbuttons = 12;
+            joystick->naxes = SDL_GAMEPAD_AXIS_COUNT;
+            if (ctx->wireless[i]) {]==]
+[==[            joystick->nbuttons = 12;
+            joystick->naxes = SDL_GAMEPAD_AXIS_COUNT;
+            if (!ctx->pc_mode) { /* WiiCompiled: axes are (byte - 128) * 256, AuroraSDL3Patches.cmake */
+                SDL_SetBooleanProperty(SDL_GetJoystickProperties(joystick), "WiiCompiled.gamecube.raw_axes", true);
+            }
+            if (ctx->wireless[i]) {]==])
 endfunction()
 
 # Script mode (FetchContent PATCH_COMMAND).

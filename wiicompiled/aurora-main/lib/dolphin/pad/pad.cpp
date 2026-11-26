@@ -5,6 +5,7 @@
 #include <dolphin/si.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_joystick.h>
+#include <SDL3/SDL_timer.h>
 
 #include <algorithm>
 #include <array>
@@ -675,6 +676,90 @@ static Sint16 _get_axis_value(const aurora::input::GameController* controller, /
   return 0;
 }
 
+// GameCube controllers on the adapter (WUP-028, or one in its Wii U mode): the sticks and triggers as the controller
+// sent them, which is what Dolphin and the console give the game. Through SDL's gamepad axes they were stretched
+// (SDL scaled each axis from the range it had seen, at first 128 +-88, to the whole range) and then lost everything
+// under the dead zone on each axis (8000, about 21 of the controller's 127), so a box controller's modifier
+// coordinates came out as other ones. The vendored SDL sends the bytes as (byte - 128) * 256 on the joystick's axes
+// and marks the joystick (cmake/AuroraSDL3Patches.cmake, "GameCube adapter: raw axes"); the gamepad layer above them
+// remaps with floats and is a unit out on some values, so the joystick's own axes are read. The origin is the
+// controller's values when it was plugged in (Dolphin's GCAdapter takes it then too), taken off the way the SDK's
+// PADRead does (ClampS8 / ClampU8). Only with the default axis mapping: a remapped axis keeps the mapping.
+// Opening the gamepad sets SDL's trigger axes to their minimum until the adapter's next report (every 8 ms), so the
+// origin waits kOriginDelayMs after the controller shows up; until then the controller reads neutral.
+constexpr Uint64 kOriginDelayMs = 50;
+struct GameCubeOrigin {
+  SDL_JoystickID joystick = 0;
+  Uint64 seenAt = 0;
+  bool taken = false;
+  std::array<int, SDL_GAMEPAD_AXIS_COUNT> bytes{128, 128, 128, 128, 0, 0};
+};
+static std::array<GameCubeOrigin, PAD_CHANMAX> g_gameCubeOrigins{};
+
+static bool uses_default_axes(const aurora::input::GameController* controller) {
+  for (const auto& def : g_defaultAxes) {
+    const auto it = std::find_if(controller->m_axisMapping.begin(), controller->m_axisMapping.end(),
+                                 [&def](const auto& mapping) { return mapping.padAxis == def.padAxis; });
+    if (it == controller->m_axisMapping.end() || it->nativeAxis.nativeAxis != def.nativeAxis.nativeAxis ||
+        it->nativeAxis.sign != def.nativeAxis.sign || it->nativeButton != def.nativeButton) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The SDK's ClampS8 / ClampU8 (value and origin as the status has them: sticks less 128).
+static s8 sdk_clamp_s8(int value, const int origin) {
+  if (origin > 0) {
+    value = std::max(value, -128 + origin);
+  } else if (origin < 0) {
+    value = std::min(value, 127 + origin);
+  }
+  return static_cast<s8>(value - origin);
+}
+static u8 sdk_clamp_u8(const int value, const int origin) { return static_cast<u8>(std::max(value, origin) - origin); }
+
+static bool read_gamecube_raw(const aurora::input::GameController* controller, const u32 port, PADStatus& status) {
+  if (!controller->m_isGameCube) {
+    return false;
+  }
+  SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller->m_controller);
+  if (joystick == nullptr ||
+      !SDL_GetBooleanProperty(SDL_GetJoystickProperties(joystick), "WiiCompiled.gamecube.raw_axes", false) ||
+      !uses_default_axes(controller)) {
+    return false;
+  }
+  GameCubeOrigin& origin = g_gameCubeOrigins[port];
+  const SDL_JoystickID id = SDL_GetJoystickID(joystick);
+  if (origin.joystick != id) {
+    origin = GameCubeOrigin{};
+    origin.joystick = id;
+    origin.seenAt = SDL_GetTicks();
+  }
+  if (!origin.taken && SDL_GetTicks() - origin.seenAt < kOriginDelayMs) {
+    status.stickX = status.stickY = status.substickX = status.substickY = 0;
+    status.triggerLeft = status.triggerRight = 0;
+    return true;
+  }
+  std::array<int, SDL_GAMEPAD_AXIS_COUNT> bytes{};
+  for (int axis = 0; axis < SDL_GAMEPAD_AXIS_COUNT; ++axis) {
+    bytes[axis] = std::clamp(SDL_GetJoystickAxis(joystick, axis) / 256 + 128, 0, 255);
+  }
+  if (!origin.taken) {
+    origin.taken = true;
+    origin.bytes = bytes;
+  }
+  status.stickX = sdk_clamp_s8(bytes[SDL_GAMEPAD_AXIS_LEFTX] - 128, origin.bytes[SDL_GAMEPAD_AXIS_LEFTX] - 128);
+  status.stickY = sdk_clamp_s8(bytes[SDL_GAMEPAD_AXIS_LEFTY] - 128, origin.bytes[SDL_GAMEPAD_AXIS_LEFTY] - 128);
+  status.substickX = sdk_clamp_s8(bytes[SDL_GAMEPAD_AXIS_RIGHTX] - 128, origin.bytes[SDL_GAMEPAD_AXIS_RIGHTX] - 128);
+  status.substickY = sdk_clamp_s8(bytes[SDL_GAMEPAD_AXIS_RIGHTY] - 128, origin.bytes[SDL_GAMEPAD_AXIS_RIGHTY] - 128);
+  status.triggerLeft =
+      sdk_clamp_u8(bytes[SDL_GAMEPAD_AXIS_LEFT_TRIGGER], origin.bytes[SDL_GAMEPAD_AXIS_LEFT_TRIGGER]);
+  status.triggerRight =
+      sdk_clamp_u8(bytes[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER], origin.bytes[SDL_GAMEPAD_AXIS_RIGHT_TRIGGER]);
+  return true;
+}
+
 static void neutralize_status(PADStatus& status) {
   status.button = 0;
   status.stickX = 0;
@@ -1002,6 +1087,8 @@ static u32 read_pads(PADStatus* status, const bool peek) {
 
       status[i].triggerLeft = static_cast<int8_t>(tl);
       status[i].triggerRight = static_cast<int8_t>(tr);
+      // A GameCube controller on the adapter: its own sticks and triggers instead (see read_gamecube_raw).
+      read_gamecube_raw(controller, i, status[i]);
 
       if (controller->m_hasRumble) {
         rumbleSupport |= PAD_CHAN0_BIT >> i;
