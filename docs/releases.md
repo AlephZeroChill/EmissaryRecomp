@@ -262,7 +262,12 @@ The repository variable or the secrets missing, every job is skipped, so the sam
 1. Commit the core change on brawlonline.net's `main` (EmissaryRecomp work goes there since 2026-11-25; the
    `emissary-recomp` branch is retired). A lock needs a commit on GitHub: until Sarah pushes `main` herself, push
    that commit to the `emissary-brawlonline` branch (`git push origin <commit>:emissary-brawlonline`), never to
-   `main`.
+   `main`. Or, without the monorepo's history, push a snapshot of only the files `tools/fetch_brawl_online.py`
+   reads (its `PATHS`, the submodules' gitlinks, `.gitmodules`; a parentless commit made with a scratch index:
+   `read-tree --empty`, `ls-tree -r <main> -- <PATHS> | update-index --index-info`, `write-tree`, `commit-tree`) to
+   this repository's `brawl-online-core` branch, as v0.7.0 does (d666af2 = brawlonline.net main eba52007e).
 2. In `brawl_online.lock`: the new `commit`, and `appVersion` = the Brawl Online release that commit contains.
-3. Bump `VERSION`, commit, and release. A player's launcher updates to the new `/releases/latest` before its next
+3. Bump `VERSION`, commit, and release. Only when the core changed: Brawl Online's matchmaking holds a recomp to the
+   `brawlOnline` of the latest release's manifest (since 2026-11-26), not to the launcher's newest build, so a launcher
+   release alone needs no recomp release. A player's launcher updates to the new `/releases/latest` before its next
    game (never during one, nor between the games of a Ranked set).
