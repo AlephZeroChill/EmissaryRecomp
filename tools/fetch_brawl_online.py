@@ -48,6 +48,10 @@ PATHS = [
     'dolphin/Source/Core/Core/Rollback/GameplayOnlineBackend.h',
     'dolphin/Source/Core/Core/Rollback/InputTrace.cpp',
     'dolphin/Source/Core/Core/Rollback/InputTrace.h',
+    # Input suggestions ("subframe rollback", core/standalone since brawlonline.net e4259e6b7).
+    'dolphin/Source/Core/Core/Rollback/InputSuggest.cpp',
+    'dolphin/Source/Core/Core/Rollback/InputSuggest.h',
+    'dolphin/Source/Core/Core/Rollback/InputSuggestSource.h',
     'dolphin/Source/Core/Core/Online/MatchQoS.cpp',
     'dolphin/Source/Core/Core/Online/MatchQoS.h',
     # A room's SPECIAL page: P+'s Special Versus box from the game's SD card image (core/standalone, card 806).
@@ -148,7 +152,9 @@ def fetch(dest: Path, repo: str, commit: str, app_version: str | None) -> Path:
     git('init', '-q', cwd=dest)
     git('remote', 'add', 'origin', repo, cwd=dest)
     git('config', 'core.sparseCheckout', 'true', cwd=dest)
-    git('sparse-checkout', 'set', '--no-cone', *PATHS, cwd=dest)
+    # Anchored at the top: a pattern without an inner slash ('core/') matches at any depth, and where git ignores case
+    # (Windows, macOS) that took all of dolphin/Source/Core/, so a file missing from PATHS failed only Linux's build.
+    git('sparse-checkout', 'set', '--no-cone', *['/' + p for p in PATHS], cwd=dest)
     git('-c', 'protocol.version=2', 'fetch', '-q', '--depth', '1', '--no-tags', '--filter=blob:none', 'origin', commit,
         cwd=dest)
     git('checkout', '-q', 'FETCH_HEAD', cwd=dest)
