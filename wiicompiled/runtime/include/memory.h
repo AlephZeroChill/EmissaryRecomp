@@ -1,5 +1,7 @@
 #pragma once
 
+#include "guest_memory_map.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -11,13 +13,16 @@
 class Memory {
 public:
 
-    static constexpr size_t kMem1Size = 24u * 1024u * 1024u;
-    // The game sees a retail console's 64 MiB (system_bridge.cpp); the mapping above it holds the translated .rel
-    // modules' homes (hle/brawl_modules.cpp) and, just above them, the runtime FST.
-    static constexpr size_t kMem2Size = 80u * 1024u * 1024u;
+    // The banks and their views are guest_memory_map.h's table; these name its numbers.
+    // MEM1 as the game knows it (24 MiB, what the OS reports); its bank, every view's copy, is 32 MiB, as on Dolphin.
+    static constexpr size_t kMem1Size = GuestMemoryMap::Info(GuestMemoryMap::Bank::Mem1).guestSize;
+    static constexpr size_t kMem1BankSize = GuestMemoryMap::Info(GuestMemoryMap::Bank::Mem1).size;
+    // MEM2's bank: the game sees a retail console's 64 MiB (system_bridge.cpp); above it, the translated .rel modules'
+    // homes (hle/brawl_modules.cpp) and, just above them, the runtime FST.
+    static constexpr size_t kMem2Size = GuestMemoryMap::Info(GuestMemoryMap::Bank::Mem2).size;
     // Dolphin exposes a 256 KiB locked-cache compatibility window.
-    static constexpr uint32_t kLockedCacheBase = 0xE0000000u;
-    static constexpr size_t kLockedCacheSize = 0x40000u;
+    static constexpr uint32_t kLockedCacheBase = GuestMemoryMap::Info(GuestMemoryMap::Bank::LockedCache).primary;
+    static constexpr size_t kLockedCacheSize = GuestMemoryMap::Info(GuestMemoryMap::Bank::LockedCache).size;
     static constexpr uint32_t kMem1PhysicalBase = 0x00000000u;
     static constexpr uint32_t kMem1CachedBase = 0x80000000u;
     static constexpr uint32_t kMem1UncachedBase = 0xC0000000u;

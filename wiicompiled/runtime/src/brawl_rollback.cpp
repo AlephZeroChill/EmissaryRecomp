@@ -205,7 +205,7 @@ void DiscoverRegions() {
 #endif
         // Register the two RAM backing allocations once for retained HLE pointers.
         // WriteWatch::Add reuses these mappings for their selected subranges.
-        BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase,Memory::kMem1Size)),Memory::kMem1Size,Memory::kMem1CachedBase});
+        BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase,Memory::kMem1BankSize)),Memory::kMem1BankSize,Memory::kMem1CachedBase});
         BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem2CachedBase,Memory::kMem2Size)),Memory::kMem2Size,Memory::kMem2CachedBase});
         for(auto r:session.ranges){
             session.writeWatch->Add(Memory::GetPointer(r.addr,r.size),r.size,packed,r.addr);

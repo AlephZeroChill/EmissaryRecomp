@@ -125,7 +125,7 @@ void SnapshotRegions(const uint32_t* addrs, const uint32_t* sizes, size_t count)
 #else
     s_snap.watch = std::make_unique<BrawlRollback::WriteWatch>();
 #endif
-    BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase, Memory::kMem1Size)), Memory::kMem1Size, Memory::kMem1CachedBase});
+    BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem1CachedBase, Memory::kMem1BankSize)), Memory::kMem1BankSize, Memory::kMem1CachedBase});
     BrawlDirtyMemory::hosts.push_back({reinterpret_cast<uintptr_t>(Memory::GetPointer(Memory::kMem2CachedBase, Memory::kMem2Size)), Memory::kMem2Size, Memory::kMem2CachedBase});
     for (size_t i = 0; i < count; ++i) {
         uint8_t* host = Memory::GetPointer(addrs[i], sizes[i]);

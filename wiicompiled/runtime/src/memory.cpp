@@ -28,14 +28,8 @@
 #include <windows.h>
 #include <dbghelp.h>
 #endif
-#if MKW_LEAN_MEMORY && !defined(_WIN32) && !defined(__SWITCH__)
-#include <cerrno>
-#include <sys/mman.h>
-#endif
-#if MKW_LEAN_MEMORY && defined(__SWITCH__)
-// platform/horizon.c: the lean window's address space, and backing for the parts in use (BackLeanWindow).
-extern "C" void* HorizonLeanWindowReserve(uint64_t size);
-extern "C" uint32_t HorizonLeanWindowBack(uint8_t* target, uint64_t size);
+#if MKW_LEAN_MEMORY
+#include "lean_window.h"  // the window's address space and its backing, per OS
 #endif
 
 MemoryInline::PageEntry MemoryInline::g_pageTable[MemoryInline::kPageCount]{};
@@ -155,7 +149,8 @@ void MemoryInline::WriteResolvedFallback(uint32_t addr, T value) {
         const uint32_t top = addr >> 28;
         const uint32_t last = addr + static_cast<uint32_t>(sizeof(T)) - 1u;
         if (g_leanFallbackFast &&
-            ((top == 0x8u && offset + sizeof(T) <= 0x01800000u) || (top == 0x9u && offset + sizeof(T) <= 0x04000000u)) &&
+            ((top == 0x8u && offset + sizeof(T) <= Memory::kMem1BankSize) ||
+             (top == 0x9u && offset + sizeof(T) <= Memory::kMem2Size)) &&
             RecompMod::g_executableWriteGuardPages[addr >> RecompMod::kExecutableWriteGuardPageShift].load(
                 std::memory_order_relaxed) == 0 &&
             RecompMod::g_executableWriteGuardPages[last >> RecompMod::kExecutableWriteGuardPageShift].load(
@@ -268,6 +263,17 @@ void BuildPageTable() {
 }
 
 #if MKW_LEAN_MEMORY
+// Where the regions put each bank in the lean window: the window offsets of its copies (one per region, guest address &
+// kLeanMask, duplicates folded) and a copy's size. Config::WiiDefaults gives one region per bank copy of every view of
+// guest_memory_map.h's table, so MEM1's views fold onto 0x00000000, 0x02000000, 0x04000000 and 0x06000000, MEM2's
+// onto 0x10000000 and the locked cache onto 0x20000000. A region outside the table is a bank of its own.
+struct LeanBankCopies {
+    std::string name;
+    uint64_t size = 0;
+    std::vector<uint64_t> offsets;
+};
+std::vector<LeanBankCopies> g_leanBankCopies;  // Memory::Init's; RefreshLeanStorePolicy reads it
+
 // The lean store policy (memory_access.h): one byte per 64 KiB of the window, set where a guest store must take
 // the checked Memory::Write* path. Every chunk not wholly inside a guest region, so a store no region maps raises
 // the checked path's AccessViolation, as without the window (most of those chunks have no backing at all:
@@ -306,6 +312,17 @@ void RefreshLeanStorePolicy() {
             if (RecompMod::g_executableWriteGuardPages[first + sub].load(std::memory_order_relaxed) != 0)
                 mark((first + sub) << MemoryInline::kWritableSubPageShift);
     }
+    // A bank's copies (MEM1's mirrors) share their flags: a store to code through any copy takes the checked path,
+    // where WriteScalar hands GuestCodePatch the code's own address (GuestMemoryMap::Canonical).
+    for (const LeanBankCopies& bank : g_leanBankCopies) {
+        if (bank.offsets.size() < 2) continue;
+        constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;
+        for (uint64_t chunk = 0; chunk < (bank.size >> kShift); ++chunk) {
+            uint8_t flags = 0;
+            for (const uint64_t offset : bank.offsets) flags |= policy[(offset >> kShift) + chunk];
+            for (const uint64_t offset : bank.offsets) policy[(offset >> kShift) + chunk] = flags;
+        }
+    }
     // A resolved write range of at most 64 KiB starting in chunk c lies in c and c + 1 (the last chunk's next one is
     // past the window), so its one test reads both.
     for (uint64_t chunk = 0; chunk + 1 < kChunks; ++chunk)
@@ -326,9 +343,12 @@ void RefreshLeanStorePolicy() {
 // maps it) raised an AccessViolation, which is fatal from translated code as well. So a run that hits no fatal error
 // without the window touches only backed bytes with it.
 uint64_t g_leanBackedBytes = 0;
+// The window's 64 KiB chunks already backed (aliased views share their backing): BackLeanWindow's, and MEM1's and its
+// mirrors' shared views (MapLeanBanks).
+uint8_t g_leanChunkBacked[MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift];
 void BackLeanWindow(uint64_t offset, uint64_t size) {
     constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;  // backing granularity: one policy chunk, 64 KiB
-    static uint8_t backed[MemoryInline::kLeanWindowSize >> kShift];  // aliased views share their backing
+    uint8_t* const backed = g_leanChunkBacked;
     const uint64_t end = (offset + size + (uint64_t{1} << kShift) - 1) >> kShift;
     for (uint64_t first = offset >> kShift; first < end;) {
         uint64_t last = first;
@@ -339,13 +359,7 @@ void BackLeanWindow(uint64_t offset, uint64_t size) {
         }
         uint8_t* const at = MemoryInline::LeanBaseAtInit() + (first << kShift);
         const uint64_t bytes = (last - first) << kShift;
-#if defined(_WIN32)
-        const uint32_t rc = VirtualAlloc(at, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr ? 0 : GetLastError();
-#elif defined(__SWITCH__)
-        const uint32_t rc = HorizonLeanWindowBack(at, bytes);
-#else
-        const uint32_t rc = mprotect(at, bytes, PROT_READ | PROT_WRITE) == 0 ? 0 : errno;
-#endif
+        const uint32_t rc = LeanWindow::Commit(at, bytes);
         if (rc != 0) {
             std::ostringstream message;
             message << "lean memory: could not back window bytes 0x" << std::hex << (first << kShift) << "+0x" << bytes
@@ -369,8 +383,12 @@ void RefreshFastPathTables() {
         MemoryInline::g_sparseWritablePageTables[page] = nullptr;
         sparseStorage[page].reset();
 
+        // Executable ranges are registered at their bank's primary view (guest_memory_map.h): every other view of
+        // the same bytes (MEM1's mirrors, the uncached and physical views) takes the primary page's classification.
+        const uint32_t guardPage =
+            GuestMemoryMap::Canonical(page << MemoryInline::kPageShift) >> MemoryInline::kPageShift;
         const bool coarseExecutable =
-            RecompMod::g_executableWriteGuardCoarsePages[page].load(
+            RecompMod::g_executableWriteGuardCoarsePages[guardPage].load(
                 std::memory_order_relaxed) != 0;
         MemoryInline::g_fullWritablePageBias[page] = coarseExecutable ? 0 : bias;
         if (!coarseExecutable || bias == 0)
@@ -378,23 +396,22 @@ void RefreshFastPathTables() {
 
         auto sparse = std::make_unique<MemoryInline::SparseWritablePageTable>();
         bool hasExecutableSubPage = false;
-        bool hasWritableSubPage = false;
-        const uint32_t firstExactPage =
-            page * MemoryInline::kWritableSubPagesPerPage;
+        const uint32_t firstGuardPage =
+            guardPage * MemoryInline::kWritableSubPagesPerPage;
         for (uint32_t subPage = 0;
              subPage < MemoryInline::kWritableSubPagesPerPage; ++subPage) {
             const bool executable =
-                RecompMod::g_executableWriteGuardPages[firstExactPage + subPage].load(
+                RecompMod::g_executableWriteGuardPages[firstGuardPage + subPage].load(
                     std::memory_order_relaxed) != 0;
             hasExecutableSubPage |= executable;
-            hasWritableSubPage |= !executable;
             sparse->encodedBias[subPage] = executable ? 0 : bias;
         }
 
-        // A homogeneous executable page has no writable fast path; a
-        // homogeneous data page already uses g_fullWritablePageBias. Retain an
-        // allocation only for the intended mixed case.
-        if (hasExecutableSubPage && hasWritableSubPage) {
+        // A page holding code keeps its table even when every sub-page is code: the fast path's last check reads
+        // the exact 4 KiB guard at the store's own address, which for another view of the code (a MEM1 mirror) is
+        // not set, so only the table's zero biases keep such a store off the native path. A homogeneous data page
+        // already uses g_fullWritablePageBias.
+        if (hasExecutableSubPage) {
             MemoryInline::g_sparseWritablePageTables[page] = sparse.get();
             sparseStorage[page] = std::move(sparse);
         }
@@ -503,37 +520,122 @@ Region& ResolveRegion(uint32_t address, size_t length) {
     throw Memory::AccessViolation(address, length, "no mapped region");
 }
 
+// A region's backing (guest_memory_map.h): its bank's, which every view of the bank shares; anything else owns its own.
 GuestFlat::Backing ClassifyBacking(uint32_t baseAddress) {
-    // MEM1: physical (0x00000000), cached (0x80000000), uncached (0xC0000000)
-    if ((baseAddress >= Memory::kMem1PhysicalBase &&
-         baseAddress < Memory::kMem1PhysicalBase + Memory::kMem1Size) ||
-        (baseAddress >= Memory::kMem1CachedBase &&
-         baseAddress < Memory::kMem1CachedBase + Memory::kMem1Size) ||
-        (baseAddress >= Memory::kMem1UncachedBase &&
-         baseAddress < Memory::kMem1UncachedBase + Memory::kMem1Size)) {
-        return GuestFlat::Backing::Mem1;
+    const GuestMemoryMap::Location at = GuestMemoryMap::Decode(baseAddress);
+    if (at.bank == nullptr) return GuestFlat::Backing::Owned;
+    switch (at.bank->bank) {
+    case GuestMemoryMap::Bank::Mem1: return GuestFlat::Backing::Mem1;
+    case GuestMemoryMap::Bank::Mem2: return GuestFlat::Backing::Mem2;
+    case GuestMemoryMap::Bank::LockedCache: break;
     }
-    // MEM1's mirrors (Config::WiiDefaults): every 32 MiB of 0x80000000-0x87FFFFFF and 0xC0000000-0xC7FFFFFF.
-    if (((baseAddress & 0xF8000000u) == Memory::kMem1CachedBase ||
-         (baseAddress & 0xF8000000u) == Memory::kMem1UncachedBase) &&
-        (baseAddress & 0x01FFFFFFu) < Memory::kMem1Size) {
-        return GuestFlat::Backing::Mem1;
-    }
-
-    // Expanded MEM2 holds Brawl's prelinked modules above the retail 64 MiB.
-    // Physical, cached and uncached views alias the same backing.
-    if ((baseAddress >= Memory::kMem2PhysicalBase &&
-         baseAddress < Memory::kMem2PhysicalEnd) ||
-        (baseAddress >= Memory::kMem2CachedBase &&
-         baseAddress < Memory::kMem2CachedEnd) ||
-        (baseAddress >= Memory::kMem2UncachedBase &&
-         baseAddress < Memory::kMem2UncachedEnd)) {
-        return GuestFlat::Backing::Mem2;
-    }
-
     return GuestFlat::Backing::Owned;
 }
 
+#if MKW_LEAN_MEMORY
+
+std::vector<LeanBankCopies> LeanBankLayout(const std::vector<Memory::RegionConfig>& regions) {
+    std::vector<LeanBankCopies> banks;
+    std::vector<std::pair<const GuestMemoryMap::BankInfo*, size_t>> index;
+    for (const auto& region : regions) {
+        if (region.sizeBytes == 0) continue;
+        const uint64_t offset = region.baseAddress & MemoryInline::kLeanMask;
+        if (offset + region.sizeBytes > MemoryInline::kLeanWindowSize)
+            throw std::runtime_error("lean memory: region '" + region.name + "' does not fit the window");
+        const GuestMemoryMap::BankInfo* const bank = GuestMemoryMap::Decode(region.baseAddress).bank;
+        auto it = std::find_if(index.begin(), index.end(),
+                               [&](const auto& entry) { return bank != nullptr && entry.first == bank; });
+        if (it == index.end()) {
+            index.emplace_back(bank, banks.size());
+            banks.push_back({bank ? bank->name : region.name, region.sizeBytes, {}});
+            it = index.end() - 1;
+        }
+        LeanBankCopies& copies = banks[it->second];
+        copies.size = std::max<uint64_t>(copies.size, region.sizeBytes);
+        if (std::find(copies.offsets.begin(), copies.offsets.end(), offset) == copies.offsets.end())
+            copies.offsets.push_back(offset);
+    }
+    return banks;
+}
+
+// Backs the regions' banks in the window. A bank at one window offset is private memory there (BackLeanWindow). A bank
+// at several (MEM1) is one shared object mapped at each, as Dolphin's MEM1 masks every address below 0x08000000 and as
+// the flat build's views share one section: a store through any copy is the same store. Each copy's slice of
+// rollback's dirty map (kLeanDirtyOffset + offset / 64) is likewise one object mapped at every copy's slice, so that
+// store sets the bank's mark, and the byte a pair mark spills past each slice's end
+// (BrawlDirtyMemory::LeanMarkBlockPair) is backed: where copies are adjacent it is the next copy's first mark (shared:
+// a harmless extra mark of the bank's first block), and after the last copy private memory.
+// Every bank reads zero after. Horizon cannot map one object twice (svcMapMemory moves the pages): there the copies are
+// separate memory, as before this table, and say so in the log; elsewhere a failed mapping ends the start-up.
+void MapLeanBanks(const std::vector<LeanBankCopies>& banks, uint8_t* window) {
+    constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;
+    constexpr uint64_t kChunk = uint64_t{1} << kShift;
+    const auto backPrivately = [&](const LeanBankCopies& bank) {
+        for (const uint64_t offset : bank.offsets) {
+            BackLeanWindow(offset, bank.size);
+            BackLeanWindow(MemoryInline::kLeanDirtyOffset + (offset >> 6), ((bank.size - 1) >> 6) + 2);
+            std::memset(window + offset, 0, bank.size);
+        }
+    };
+    const auto unbacked = [&](uint64_t offset, uint64_t size) {
+        for (uint64_t chunk = offset >> kShift; chunk < (offset + size + kChunk - 1) >> kShift; ++chunk)
+            if (g_leanChunkBacked[chunk] != 0) return false;
+        return true;
+    };
+    for (const LeanBankCopies& bank : banks) {
+        if (bank.offsets.size() == 1) {
+            backPrivately(bank);
+            continue;
+        }
+        const uint64_t marksSize = bank.size >> 6;
+        std::vector<uint8_t*> data, marks;
+        bool shareable = bank.size % kChunk == 0 && marksSize % kChunk == 0;
+        for (const uint64_t offset : bank.offsets) {
+            const uint64_t marksOffset = MemoryInline::kLeanDirtyOffset + (offset >> 6);
+            shareable = shareable && offset % kChunk == 0 && marksOffset % kChunk == 0 && unbacked(offset, bank.size) &&
+                        unbacked(marksOffset, marksSize);
+            data.push_back(window + offset);
+            marks.push_back(window + marksOffset);
+        }
+        std::string error = "a copy not 64 KiB aligned, or already backed";
+        if (shareable && LeanWindow::MapShared(bank.size, data.data(), static_cast<int>(data.size()), &error) &&
+            LeanWindow::MapShared(marksSize, marks.data(), static_cast<int>(marks.size()), &error)) {
+            for (size_t i = 0; i < data.size(); ++i) {
+                const uint64_t dataChunk = static_cast<uint64_t>(data[i] - window) >> kShift;
+                const uint64_t marksChunk = static_cast<uint64_t>(marks[i] - window) >> kShift;
+                std::memset(g_leanChunkBacked + dataChunk, 1, bank.size >> kShift);
+                std::memset(g_leanChunkBacked + marksChunk, 1, marksSize >> kShift);
+            }
+            g_leanBackedBytes += bank.size + marksSize;
+            for (size_t i = 0; i < marks.size(); ++i)  // each slice's spill byte (often the next copy's first, shared)
+                BackLeanWindow(static_cast<uint64_t>(marks[i] - window) + marksSize, 1);
+            std::memset(data[0], 0, bank.size);
+            std::memset(marks[0], 0, marksSize);
+            // The copies are one memory: a byte stored through the first reads back through every other.
+            for (const auto& views : {std::make_pair(&data, bank.size), std::make_pair(&marks, marksSize)}) {
+                uint8_t* const probe = (*views.first)[0] + views.second - 1;
+                *probe = 0x5A;
+                for (const uint8_t* view : *views.first)
+                    if (view[views.second - 1] != 0x5A)
+                        throw std::runtime_error("lean memory: " + bank.name + "'s copies do not share their memory");
+                *probe = 0;
+            }
+            RT_LOG(RT_TAG_MEMORY) << "lean window: " << bank.name << "'s " << data.size()
+                                  << " copies share one memory and one set of dirty marks" << std::endl;
+            continue;
+        }
+#if defined(__SWITCH__)
+        RT_LOG(RT_TAG_MEMORY) << "lean window: " << bank.name << "'s " << data.size()
+                              << " copies are separate memory here (" << error
+                              << "): its mirrors read zero where Dolphin reads " << bank.name << std::endl;
+        backPrivately(bank);
+#else
+        RT_LOG(RT_TAG_MEMORY) << "lean window: could not share " << bank.name << "'s copies: " << error << std::endl;
+        throw std::runtime_error("lean memory: could not share " + bank.name + "'s copies: " + error);
+#endif
+    }
+}
+#endif
 
 template <typename T>
 T ReadScalar(uint32_t address) {
@@ -576,7 +678,10 @@ void WriteScalar(uint32_t address, T value) {
     }
 #endif
     BrawlDirtyMemory::Mark(address,sizeof(T));
-    if (RecompMod::HandleExecutableWrite(address, sizeof(T), static_cast<uint64_t>(value))) {
+    // Executable ranges are registered at their bank's primary view: a store through any other (a MEM1 mirror, an
+    // uncached or physical view) is checked at the address of the same bytes there.
+    if (RecompMod::HandleExecutableWrite(GuestMemoryMap::Canonical(address), sizeof(T),
+                                         static_cast<uint64_t>(value))) {
         return;
     }
     std::memcpy(ptr, &stored, sizeof(T));
@@ -607,72 +712,17 @@ void Memory::RefreshWritableFastPathsForExecutableRanges() {
     RefreshFastPathTables();
 }
 
+// Every view of guest_memory_map.h's table, one region per bank copy: MEM1's four copies in each of its cached,
+// uncached and physical views (its mirrors, as Dolphin decodes them), MEM2's three views, the locked cache.
 Memory::Config Memory::Config::WiiDefaults() {
-    // Physical / cached / uncached views of MEM1 and MEM2, then the locked cache.
     Config config;
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM1_PHYS",
-        .baseAddress = Memory::kMem1PhysicalBase,
-        .sizeBytes = Memory::kMem1Size,
-    });
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM1",
-        .baseAddress = Memory::kMem1CachedBase,
-        .sizeBytes = Memory::kMem1Size,
-    });
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM1_UNCACHED",
-        .baseAddress = Memory::kMem1UncachedBase,
-        .sizeBytes = Memory::kMem1Size,
-    });
-
-    // MEM1's mirrors, as Dolphin has them: an effective address in 0x80000000-0x87FFFFFF (or
-    // 0xC0000000-0xC7FFFFFF) reads MEM1 at its low 25 bits (Dolphin's MMU masks a physical address
-    // below 0x08000000 with its 32 MiB RAM mask). Brawl reads one: leaving a stage select with no
-    // port that pressed (P+ online's automatic A), it indexes a table at 0x806B91C8 by a pad
-    // status read from port -1, 0x805BA480 * 8, i.e. 0x8348B5C8 = MEM1 0x0148B5C8 on Dolphin,
-    // and the value read decides a branch. Views of the same backing, so nothing new to snapshot.
-    for (uint32_t mirror = 0x02000000u; mirror < 0x08000000u; mirror += 0x02000000u) {
+    GuestMemoryMap::ForEachCopy([&](const GuestMemoryMap::View& view, uint32_t index, uint32_t start, uint32_t size) {
         config.regions.push_back(RegionConfig{
-            .name = "MEM1_MIRROR",
-            .baseAddress = Memory::kMem1CachedBase + mirror,
-            .sizeBytes = Memory::kMem1Size,
+            .name = index == 0 ? std::string(view.name) : std::string(view.name) + "_MIRROR" + std::to_string(index),
+            .baseAddress = start,
+            .sizeBytes = size,
         });
-        config.regions.push_back(RegionConfig{
-            .name = "MEM1_UNCACHED_MIRROR",
-            .baseAddress = Memory::kMem1UncachedBase + mirror,
-            .sizeBytes = Memory::kMem1Size,
-        });
-    }
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM2_PHYS",
-        .baseAddress = Memory::kMem2PhysicalBase,
-        .sizeBytes = Memory::kMem2Size,
     });
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM2",
-        .baseAddress = Memory::kMem2CachedBase,
-        .sizeBytes = Memory::kMem2Size,
-    });
-
-    config.regions.push_back(RegionConfig{
-        .name = "MEM2_UNCACHED",
-        .baseAddress = Memory::kMem2UncachedBase,
-        .sizeBytes = Memory::kMem2Size,
-    });
-
-    // Preserve the guest extent independently of the host fast-access tables.
-    config.regions.push_back(RegionConfig{
-        .name = "LOCKED_CACHE",
-        .baseAddress = Memory::kLockedCacheBase,
-        .sizeBytes = Memory::kLockedCacheSize,
-    });
-
     return config;
 }
 
@@ -711,16 +761,14 @@ void Memory::Init(const Config& config) {
     // unbacked, so a resolved read range's access past the window's end faults (memory_access.h, kLeanRangePolicyOffset).
     static uint8_t* const window = [] {
         constexpr uint64_t kReserved = MemoryInline::kLeanWindowSize + MemoryInline::kLeanGuardSize;
+        uint8_t* const reserved = LeanWindow::Reserve(kReserved);
 #if defined(_WIN32)
-        void* reserved = VirtualAlloc(nullptr, kReserved, MEM_RESERVE, PAGE_NOACCESS);
-#elif defined(__SWITCH__)
-        void* reserved = HorizonLeanWindowReserve(kReserved);
-#else
-        void* reserved = mmap(nullptr, kReserved, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (reserved == MAP_FAILED) reserved = nullptr;
+        if (reserved == nullptr)
+            throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window (it needs Windows 10 1803 "
+                                     "or newer: VirtualAlloc2, MapViewOfFile3)");
 #endif
         if (reserved == nullptr) throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window");
-        return static_cast<uint8_t*>(reserved);
+        return reserved;
     }();
     MemoryInline::SetLeanBase(window);
     BackLeanWindow(MemoryInline::kLeanPolicyOffset, MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift);
@@ -735,6 +783,8 @@ void Memory::Init(const Config& config) {
     static_assert(MemoryInline::kLeanDirtyOffset + BrawlDirtyMemory::kLeanDirtyBlocks + 1 <= MemoryInline::kLeanPolicyOffset);
     BrawlDirtyMemory::leanBlocks = window + MemoryInline::kLeanDirtyOffset;
     BrawlDirtyMemory::flatBase = reinterpret_cast<uintptr_t>(window);
+    g_leanBankCopies = LeanBankLayout(config.regions);
+    MapLeanBanks(g_leanBankCopies, window);
 #else
     // Cached, uncached and physical guest aliases share one allocation per RAM
     // bank. Other configured regions own their storage independently.
@@ -773,20 +823,8 @@ void Memory::Init(const Config& config) {
             throw std::runtime_error("Flat guest mapping is missing region '" + regionConfig.name + "'");
         }
 #elif MKW_LEAN_MEMORY
-        {
-            const uint64_t windowOffset = regionConfig.baseAddress & MemoryInline::kLeanMask;
-            if (windowOffset + regionConfig.sizeBytes > MemoryInline::kLeanWindowSize)
-                throw std::runtime_error("lean memory: region '" + regionConfig.name + "' does not fit the window");
-            instance.storagePtr = MemoryInline::LeanBaseAtInit() + windowOffset;
-            if (regionConfig.sizeBytes != 0) {
-                // The region and its dirty marks; a mark stores two bytes (BrawlDirtyMemory::LeanMarkBlockPair).
-                const uint64_t firstMark = windowOffset >> 6;
-                const uint64_t lastMark = (windowOffset + regionConfig.sizeBytes - 1) >> 6;
-                BackLeanWindow(windowOffset, regionConfig.sizeBytes);
-                BackLeanWindow(MemoryInline::kLeanDirtyOffset + firstMark, lastMark - firstMark + 2);
-            }
-            std::memset(instance.storagePtr, 0, regionConfig.sizeBytes);
-        }
+        // Backed by MapLeanBanks above.
+        instance.storagePtr = MemoryInline::LeanBaseAtInit() + (regionConfig.baseAddress & MemoryInline::kLeanMask);
 #else
         instance.storage = stores.at(key(regionConfig.baseAddress)).bytes;
         instance.storagePtr = instance.storage->empty() ? nullptr :

@@ -82,7 +82,7 @@ bool NoteTrackedHostRange(const void* hostPtr, size_t size) noexcept {
 }
 
 void InstallAuroraHooks() {
-    g_aliases[0] = ResolveAlias(Memory::kMem1CachedBase, Memory::kMem1Size);
+    g_aliases[0] = ResolveAlias(Memory::kMem1CachedBase, Memory::kMem1BankSize);
     g_aliases[1] = ResolveAlias(Memory::kMem2CachedBase, Memory::kMem2Size);
     if (g_aliases[0].hostBase == nullptr || g_aliases[1].hostBase == nullptr) {
         // Without both banks a host pointer cannot be classified, so leaving the
