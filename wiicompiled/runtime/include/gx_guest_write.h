@@ -158,7 +158,8 @@ inline uint64_t GenerationForRange(uint32_t addr, uint32_t nbytes) noexcept {
 
 // The same counters at 4 KiB, for a consumer whose ranges share 64 KiB granules with memory rewritten every frame: the
 // deferred native draw's display-list mirror (gx_dl.cpp GX_HLE_ApplyListVertexState), whose model shape lists sit
-// next to the material lists animation rewrites and flushes each frame. Bumped by the same notifications.
+// next to the material lists animation rewrites and flushes each frame, and the display-list scan cache
+// (gx_dl.cpp ProbeDlScanCache). Bumped by the same notifications.
 inline constexpr uint32_t kFineGranuleShift = 12; // 4 KiB per granule
 inline constexpr size_t kFineGranuleCount = static_cast<size_t>(kTrackedSpan >> kFineGranuleShift);
 inline std::array<std::atomic<uint32_t>, kFineGranuleCount> g_fineGenerations{};

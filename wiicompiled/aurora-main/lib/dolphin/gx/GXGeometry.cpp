@@ -3,6 +3,8 @@
 #include "dolphin/gd/GDGeometry.h"
 #include "../../gx/fifo.hpp"
 
+#include <cstring>
+
 static inline void SETVCDATTR(GXAttr attr, GXAttrType type) {
   switch (attr) {
   case GX_VA_PNMTXIDX:
@@ -189,7 +191,7 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
   } else {
     SET_REG_FIELD(0, __gx->vcdLo, 2, 11, 0);
   }
-  if (aurora::gx::fifo::in_display_list() || auroraStateChanged || __gx->vcdLo != oldVcdLo ||
+  if (aurora::gx::fifo::detail::sInDisplayList || auroraStateChanged || __gx->vcdLo != oldVcdLo ||
       __gx->vcdHi != oldVcdHi || __gx->hasNrms != oldHasNrms || __gx->hasBiNrms != oldHasBiNrms ||
       __gx->nrmType != oldNrmType) {
     __gx->dirtyState |= 8;
@@ -226,7 +228,7 @@ void GXSetVtxDescv(GXVtxDescList* list) {
   } else {
     SET_REG_FIELD(0, __gx->vcdLo, 2, 11, 0);
   }
-  if (aurora::gx::fifo::in_display_list() || auroraStateChanged || __gx->vcdLo != oldVcdLo ||
+  if (aurora::gx::fifo::detail::sInDisplayList || auroraStateChanged || __gx->vcdLo != oldVcdLo ||
       __gx->vcdHi != oldVcdHi || __gx->hasNrms != oldHasNrms || __gx->hasBiNrms != oldHasBiNrms ||
       __gx->nrmType != oldNrmType) {
     __gx->dirtyState |= 8;
@@ -254,7 +256,7 @@ void GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType typ
   const u32 oldVc = *vc;
   const bool auroraStateChanged = AuroraVtxAttrFmtDiffers(vtxfmt, attr, cnt, type, frac);
   SETVAT(va, vb, vc, attr, cnt, type, frac);
-  if (aurora::gx::fifo::in_display_list() || auroraStateChanged || *va != oldVa || *vb != oldVb ||
+  if (aurora::gx::fifo::detail::sInDisplayList || auroraStateChanged || *va != oldVa || *vb != oldVb ||
       *vc != oldVc) {
     __gx->dirtyState |= 0x10;
     __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
@@ -280,7 +282,7 @@ void GXSetVtxAttrFmtv(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list) {
     ++list;
   }
 
-  if (aurora::gx::fifo::in_display_list() || auroraStateChanged || *va != oldVa || *vb != oldVb ||
+  if (aurora::gx::fifo::detail::sInDisplayList || auroraStateChanged || *va != oldVa || *vb != oldVb ||
       *vc != oldVc) {
     __gx->dirtyState |= 0x10;
     __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
@@ -296,14 +298,33 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
 
   assert((cpIdx & ~0xF) == 0);
 
-  // Write array base
-  GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
-  GX_WRITE_U64(reinterpret_cast<u64>(data));
-  GX_WRITE_U32(size);
-  GX_WRITE_U8(le ? 1 : 0);
+  if (aurora::gx::fifo::detail::sInDisplayList) {
+    // Write array base
+    GX_WRITE_AURORA(GX_LOAD_AURORA_ARRAYBASE | cpIdx);
+    GX_WRITE_U64(reinterpret_cast<u64>(data));
+    GX_WRITE_U32(size);
+    GX_WRITE_U8(le ? 1 : 0);
 
-  // Write array stride
-  GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
+    // Write array stride
+    GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
+    return;
+  }
+  // The same 22 bytes in one FIFO write: each GX_WRITE_* above reloads the FIFO's thread-local cursor right after the
+  // previous one stored it, and a Brawl match sets ~2,000 arrays a frame (runtime gx_dl.cpp, gx_stream_common.h).
+  u8 packet[22];
+  packet[0] = GX_LOAD_AURORA;
+  const u16 cmd = bswap(static_cast<u16>(GX_LOAD_AURORA_ARRAYBASE | cpIdx));
+  const u64 base = bswap(static_cast<u64>(reinterpret_cast<uintptr_t>(data)));
+  const u32 bytes = bswap(static_cast<u32>(size));
+  std::memcpy(packet + 1, &cmd, sizeof(cmd));
+  std::memcpy(packet + 3, &base, sizeof(base));
+  std::memcpy(packet + 11, &bytes, sizeof(bytes));
+  packet[15] = le ? 1 : 0;
+  packet[16] = GX_LOAD_CP_REG;
+  packet[17] = static_cast<u8>(CP_REG_ARRAYSTRIDE_ID | cpIdx);
+  const u32 strideWord = bswap(static_cast<u32>(stride));
+  std::memcpy(packet + 18, &strideWord, sizeof(strideWord));
+  GX_WRITE_DATA(packet, sizeof(packet));
 }
 
 void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32 mtx, GXBool normalize, u32 postMtx) {
