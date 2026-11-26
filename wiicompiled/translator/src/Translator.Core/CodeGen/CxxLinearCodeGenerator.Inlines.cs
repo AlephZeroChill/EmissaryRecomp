@@ -28,7 +28,11 @@ public sealed partial class CxxLinearCodeGenerator
 
         // Get destination if any
         var hasDest = !string.IsNullOrWhiteSpace(call.Destination);
-        var dest = hasDest ? ToDestination(call.Destination!, types) : null;
+        // A whole-CR destination is the eight field locals (CrWholeExpression): rendering it would count all eight as
+        // written, so the CR cases below name the fields they write instead and nothing may use this text.
+        var dest = !hasDest ? null
+            : IsWholeCrDestination(call.Destination!) ? "PPC_WHOLE_CR_DESTINATION_IS_NOT_AN_EXPRESSION"
+            : ToDestination(call.Destination!, types);
 
         void EmitPairedResult(string expression)
         {
@@ -193,25 +197,48 @@ public sealed partial class CxxLinearCodeGenerator
             case "PPC_FCMP":
                 if (_activeResidency is null || !TryGetConstArg(0, out var fcmpField))
                     return false;
-                sb.AppendLine($"{pad}SetCRFloatResident({_activeResidency.Cr(written: true)}, {fcmpField & 7}, {WrapForScalar(1)}, {WrapForScalar(2)});");
+                sb.AppendLine($"{pad}{CrFieldExpression((int)(fcmpField & 7), written: true)} = PpcCrvCompareFloat({WrapForScalar(1)}, {WrapForScalar(2)});");
                 return true;
 
+            // The CR bit and field operations, on the fields they name (isa/ppc_isa_crv.h) when the instruction's
+            // operands are constants (always, as lifted), else on the packed word.
             case "PPC_CRSETBIT":
-                if (!hasDest)
+                if (!hasDest || !IsWholeCrDestination(call.Destination))
                     return false;
-                sb.AppendLine($"{pad}{dest} = PpcCrSetBitResident({dest}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}));");
+                if (TryGetConstArg(0, out var setBit))
+                {
+                    var crTarget = CrFieldExpression((int)((setBit & 31) >> 2), written: true);
+                    sb.AppendLine($"{pad}{crTarget} = PpcCrvWithBit({crTarget}, {setBit & 3}u, (static_cast<uint32_t>({GetArg(1)}) & 1u) != 0);");
+                    return true;
+                }
+                sb.AppendLine($"{pad}{CrWholeExpression(written: true)} = PpcCrSetBitResident({CrWholeExpression(written: false)}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}));");
                 return true;
 
             case "PPC_CRLOGICAL":
-                if (!hasDest)
+                if (!hasDest || !IsWholeCrDestination(call.Destination))
                     return false;
-                sb.AppendLine($"{pad}{dest} = PpcCrLogicalResident({dest}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}), static_cast<uint32_t>({GetArg(2)}), static_cast<uint32_t>({GetArg(3)}));");
+                if (TryGetConstArg(0, out var logicOp) && TryGetConstArg(1, out var logicBt) &&
+                    TryGetConstArg(2, out var logicBa) && TryGetConstArg(3, out var logicBb))
+                {
+                    var a = $"PpcCrvBit({CrFieldExpression((int)((logicBa & 31) >> 2), written: false)}, {logicBa & 3}u)";
+                    var b = $"PpcCrvBit({CrFieldExpression((int)((logicBb & 31) >> 2), written: false)}, {logicBb & 3}u)";
+                    var crTarget = CrFieldExpression((int)((logicBt & 31) >> 2), written: true);
+                    sb.AppendLine($"{pad}{crTarget} = PpcCrvWithBit({crTarget}, {logicBt & 3}u, PpcCrvLogic({logicOp & 7}u, {a}, {b}));");
+                    return true;
+                }
+                sb.AppendLine($"{pad}{CrWholeExpression(written: true)} = PpcCrLogicalResident({CrWholeExpression(written: false)}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}), static_cast<uint32_t>({GetArg(2)}), static_cast<uint32_t>({GetArg(3)}));");
                 return true;
 
             case "PPC_MCRF":
-                if (!hasDest)
+                if (!hasDest || !IsWholeCrDestination(call.Destination))
                     return false;
-                sb.AppendLine($"{pad}{dest} = PpcMcrfResident({dest}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}));");
+                if (TryGetConstArg(0, out var mcrfDst) && TryGetConstArg(1, out var mcrfSrc))
+                {
+                    var source = CrFieldExpression((int)(mcrfSrc & 7), written: false);
+                    sb.AppendLine($"{pad}{CrFieldExpression((int)(mcrfDst & 7), written: true)} = {source};");
+                    return true;
+                }
+                sb.AppendLine($"{pad}{CrWholeExpression(written: true)} = PpcMcrfResident({CrWholeExpression(written: false)}, static_cast<uint32_t>({GetArg(0)}), static_cast<uint32_t>({GetArg(1)}));");
                 return true;
 
             case "PPC_CNTLZW":
@@ -302,13 +329,12 @@ public sealed partial class CxxLinearCodeGenerator
                     var laneHelper = lane == 0 ? "PpcGetPs0Inline" : "PpcGetPs1Inline";
                     var left = WrapForPaired(1);
                     var right = WrapForPaired(2);
-                    var crDestination = hasDest
-                        ? dest
-                        : _activeResidency?.Cr(written: true);
-                    if (crDestination is null)
+                    // The field is the instruction's crfD, a constant; a destination, if any, is the whole CR.
+                    if ((hasDest && !IsWholeCrDestination(call.Destination)) || !TryGetConstArg(0, out var psCmpField) ||
+                        (!hasDest && _activeResidency is null))
                         return false;
-                    sb.AppendLine($"{pad}SetCRFloatResident({crDestination}, static_cast<uint32_t>({GetArg(0)}) & 7u, " +
-                                  $"{laneHelper}({left}), {laneHelper}({right}));");
+                    sb.AppendLine($"{pad}{CrFieldExpression((int)(psCmpField & 7), written: true)} = " +
+                                  $"PpcCrvCompareFloat({laneHelper}({left}), {laneHelper}({right}));");
                     return true;
                 }
 

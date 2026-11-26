@@ -495,7 +495,7 @@ bool SameContext(const CpuContext& a, const CpuContext& b, char* what, size_t wh
         if (a.fpr[f].raw != b.fpr[f].raw)
             add("f%u %016llX/%016llX ", f, static_cast<unsigned long long>(a.fpr[f].raw),
                 static_cast<unsigned long long>(b.fpr[f].raw));
-    if (a.cr != b.cr) add("cr %08X/%08X ", a.cr, b.cr);
+    if (PpcGetCr(&a) != PpcGetCr(&b)) add("cr %08X/%08X ", PpcGetCr(&a), PpcGetCr(&b));
     if (a.lr != b.lr) add("lr %08X/%08X ", a.lr, b.lr);
     if (a.ctr != b.ctr) add("ctr %08X/%08X ", a.ctr, b.ctr);
     if (a.xer != b.xer) add("xer %08X/%08X ", a.xer, b.xer);
@@ -1082,7 +1082,7 @@ void WriteQs(CpuContext* ctx, const QsResult& r, uint32_t out, uint32_t R0, uint
     ctx->gpr[4] = r.final.r4;
     ctx->fpr[1].d = static_cast<double>(kEps2);
     ctx->fpr[2].d = static_cast<double>(r.final.f2);
-    ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (r.det0 << 28);
+    ctx->crv[0] = PpcCrvEncode(r.det0 & 0xFu);
     ctx->xer |= 0x20000000u;
 }
 
@@ -1838,7 +1838,7 @@ template <bool kProbe = false>
     ctx->gpr[0] = c.r0;
     ctx->gpr[c.entryGpr] = entry;
     ctx->gpr[12] = target;
-    ctx->cr = (ctx->cr & 0x0FFFFFFFu) | c.cr0 | (MKW_CR_SO_BIT(ctx->xer) << 28);
+    ctx->crv[0] = PpcCrvEncode((c.cr0 >> 28) | MKW_CR_SO_BIT(ctx->xer));
     ctx->ctr = target;
     if constexpr (kProbe) return true;
 #if MKW_INDIRECT_IC

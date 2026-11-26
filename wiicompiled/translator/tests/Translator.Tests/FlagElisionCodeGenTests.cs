@@ -98,7 +98,7 @@ public class FlagElisionCodeGenTests
 
         Assert.Contains($"if ({expected})", code, StringComparison.Ordinal);
         // The two exit blocks still write CR0, so exactly two compares survive.
-        Assert.Equal(2, CountOccurrences(code, "SetCRResident("));
+        Assert.Equal(2, CountOccurrences(code, "PpcCrvCompare("));
     }
 
     [Fact]
@@ -135,7 +135,7 @@ public class FlagElisionCodeGenTests
         Assert.Contains(
             "if ((static_cast<int32_t>(r3) == static_cast<int32_t>(7)))",
             code, StringComparison.Ordinal);
-        Assert.Equal(2, CountOccurrences(code, "SetCRResident("));
+        Assert.Equal(2, CountOccurrences(code, "PpcCrvCompare("));
     }
 
     [Theory]
@@ -161,7 +161,7 @@ public class FlagElisionCodeGenTests
         var code = Emit(function);
 
         Assert.Contains(expected, code, StringComparison.Ordinal);
-        Assert.DoesNotContain("SetCRFloatResident(", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("PpcCrvCompareFloat(", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -186,7 +186,7 @@ public class FlagElisionCodeGenTests
         var code = Emit(function);
 
         Assert.DoesNotContain("static_cast<int32_t>(r3) == static_cast<int32_t>(0)", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -195,8 +195,8 @@ public class FlagElisionCodeGenTests
         // bso reads the XER.SO copy, which a direct comparison cannot rebuild.
         var code = Emit(CompareThenBranch("so_consumer", "bso", isUnsigned: false, IrValue.Imm(0)));
 
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
-        Assert.Equal(3, CountOccurrences(code, "SetCRResident("));
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Equal(3, CountOccurrences(code, "PpcCrvCompare("));
     }
 
     [Fact]
@@ -219,7 +219,7 @@ public class FlagElisionCodeGenTests
 
         var code = Emit(function);
 
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -241,7 +241,7 @@ public class FlagElisionCodeGenTests
 
         var code = Emit(function);
 
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
         Assert.DoesNotContain("if ((static_cast<int32_t>(r3) == static_cast<int32_t>(0)))", code, StringComparison.Ordinal);
     }
 
@@ -264,7 +264,7 @@ public class FlagElisionCodeGenTests
             function,
             guestAbiContracts: new Dictionary<uint, GuestAbiContract> { [0x80002000u] = Contract() });
 
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -290,7 +290,7 @@ public class FlagElisionCodeGenTests
         var code = Emit(function);
 
         Assert.DoesNotContain("static_cast<int32_t>(r3) == static_cast<int32_t>(0)", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -316,7 +316,7 @@ public class FlagElisionCodeGenTests
             guestAbiContracts: new Dictionary<uint, GuestAbiContract> { [0x80002000u] = Contract() },
             lrContinuationCallTargets: new HashSet<uint> { 0x80002000u });
 
-        Assert.Equal(3, CountOccurrences(code, "SetCRResident("));
+        Assert.Equal(3, CountOccurrences(code, "PpcCrvCompare("));
         Assert.Contains("ctx->lr = 2147487760;", code, StringComparison.Ordinal);
     }
 
@@ -352,12 +352,12 @@ public class FlagElisionCodeGenTests
             [0x80002000u] = Contract(crRead: 0x01)
         };
         Assert.Contains(
-            "SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)",
+            "crv0 = PpcCrvCompare(static_cast<int32_t>(r3)",
             Emit(function, guestAbiContracts: readerContracts), StringComparison.Ordinal);
 
         // ...and so does an unknown callee.
         Assert.Contains(
-            "SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)",
+            "crv0 = PpcCrvCompare(static_cast<int32_t>(r3)",
             Emit(function), StringComparison.Ordinal);
     }
 
@@ -380,9 +380,9 @@ public class FlagElisionCodeGenTests
 
         var code = Emit(function);
 
-        Assert.DoesNotContain("SetCRResident(cr, xer, 0, static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0, static_cast<int32_t>(r5)", code, StringComparison.Ordinal);
-        Assert.Equal(1, CountOccurrences(code, "SetCRResident("));
+        Assert.DoesNotContain("crv0 = PpcCrvCompare(static_cast<int32_t>(r3)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(static_cast<int32_t>(r5)", code, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(code, "PpcCrvCompare("));
     }
 
     [Fact]
@@ -401,7 +401,7 @@ public class FlagElisionCodeGenTests
 
         var code = Emit(function);
 
-        Assert.Contains("SetCRResident(cr, xer, 3,", code, StringComparison.Ordinal);
+        Assert.Contains("crv3 = PpcCrvCompare(", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -417,7 +417,7 @@ public class FlagElisionCodeGenTests
             })
         });
 
-        Assert.Equal(1, CountOccurrences(Emit(function), "SetCRResident("));
+        Assert.Equal(1, CountOccurrences(Emit(function), "PpcCrvCompare("));
     }
 
     [Fact]
@@ -435,8 +435,9 @@ public class FlagElisionCodeGenTests
         var code = Emit(function);
 
         Assert.Contains("uint32_t xer = ctx->xer;", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0,", code, StringComparison.Ordinal);
-        Assert.DoesNotContain("SetCRResident(cr, ctx->xer", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(", code, StringComparison.Ordinal);
+        Assert.Contains(", xer);", code, StringComparison.Ordinal);
+        Assert.DoesNotContain(", ctx->xer);", code, StringComparison.Ordinal);
     }
 
     [Fact]

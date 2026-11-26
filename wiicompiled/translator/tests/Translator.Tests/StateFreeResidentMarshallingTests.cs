@@ -132,8 +132,8 @@ public class StateFreeResidentMarshallingTests
 
         var code = Emit(function, contract);
 
-        Assert.Contains("callee_native(r3, cr, xer)", code, StringComparison.Ordinal);
-        Assert.Contains("    cr = static_cast<uint32_t>(state_free_result_80002000_", code, StringComparison.Ordinal);
+        Assert.Contains("callee_native(r3, PpcCrvPack(crv0, crv1, crv2, crv3, crv4, crv5, crv6, crv7), xer)", code, StringComparison.Ordinal);
+        Assert.Contains("    PpcCrView(crv0, crv1, crv2, crv3, crv4, crv5, crv6, crv7) = static_cast<uint32_t>(state_free_result_80002000_", code, StringComparison.Ordinal);
         // XER is published for the interrupt-handler invariant, never reloaded.
         Assert.DoesNotContain("    xer = ctx->xer;\n    r3", code, StringComparison.Ordinal);
     }

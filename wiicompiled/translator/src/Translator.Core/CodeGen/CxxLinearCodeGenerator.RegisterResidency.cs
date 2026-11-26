@@ -19,10 +19,11 @@ public sealed partial class CxxLinearCodeGenerator
         private readonly SortedSet<int> _fprs = new();
         private readonly SortedSet<int> _writtenGprs = new();
         private readonly SortedSet<int> _writtenFprs = new();
-        private bool _cr;
+        // CR fields held in locals (bit f: crv<f>, isa/ppc_isa_crv.h), and the ones written.
+        private byte _crFields;
         private bool _ctr;
         private bool _xer;
-        private bool _writesCr;
+        private byte _writtenCrFields;
         private bool _writesCtr;
         private bool _writesXer;
 
@@ -47,9 +48,10 @@ public sealed partial class CxxLinearCodeGenerator
         /// </summary>
         public UInt128? PossiblyStoredByFlushes => _flushPlan?.StoredUnion;
 
-        private const int CrKey = 64;
         private const int CtrKey = 65;
         private const int XerKey = 66;
+        private const int CrFieldKeyBase = 67;  // 67..74: CR fields 0..7, each synced on its own
+        private static int CrFieldKey(int field) => CrFieldKeyBase + field;
 
         private RegisterResidency(bool recording) => _recording = recording;
 
@@ -62,20 +64,20 @@ public sealed partial class CxxLinearCodeGenerator
             snapshot._fprs.UnionWith(_fprs);
             snapshot._writtenGprs.UnionWith(_writtenGprs);
             snapshot._writtenFprs.UnionWith(_writtenFprs);
-            snapshot._cr = _cr;
+            snapshot._crFields = _crFields;
             snapshot._ctr = _ctr;
             snapshot._xer = _xer;
-            snapshot._writesCr = _writesCr;
+            snapshot._writtenCrFields = _writtenCrFields;
             snapshot._writesCtr = _writesCtr;
             snapshot._writesXer = _writesXer;
             return snapshot;
         }
 
-        public bool IsEmpty => _gprs.Count == 0 && _fprs.Count == 0 && !_cr && !_ctr && !_xer;
+        public bool IsEmpty => _gprs.Count == 0 && _fprs.Count == 0 && _crFields == 0 && !_ctr && !_xer;
 
         public static string GprLocal(int index) => GprRegisterName(index);
         public static string FprLocal(int index) => FprRegisterName(index);
-        public const string CrLocal = "cr";
+        public static string CrFieldLocal(int field) => $"crv{field}";
         public const string CtrLocal = "ctr";
         public const string XerLocal = "xer";
 
@@ -85,7 +87,8 @@ public sealed partial class CxxLinearCodeGenerator
             {
                 foreach (var gpr in _gprs) yield return GprLocal(gpr);
                 foreach (var fpr in _fprs) yield return FprLocal(fpr);
-                if (_cr) yield return CrLocal;
+                for (var field = 0; field < 8; ++field)
+                    if ((_crFields & (1 << field)) != 0) yield return CrFieldLocal(field);
                 if (_ctr) yield return CtrLocal;
                 if (_xer) yield return XerLocal;
             }
@@ -114,21 +117,38 @@ public sealed partial class CxxLinearCodeGenerator
             return FprLocal(index);
         }
 
-        public string Cr(bool written)
+        /// <summary>One CR field's local (an <c>int64_t</c> field value, isa/ppc_isa_crv.h).</summary>
+        public string CrField(int field, bool written)
         {
+            field &= 7;
+            var bit = (byte)(1 << field);
             if (_recording)
             {
-                _cr = true;
-                _writesCr |= written;
-                if (written) RecordWrite(CrKey);
+                _crFields |= bit;
+                if (written)
+                {
+                    _writtenCrFields |= bit;
+                    RecordWrite(CrFieldKey(field));
+                }
             }
-            else if (!_cr || (written && !_writesCr))
+            else if ((_crFields & bit) == 0 || (written && (_writtenCrFields & bit) == 0))
             {
                 throw new InvalidOperationException(
-                    "Register residency did not localize cr for this function body.");
+                    $"Register residency did not localize cr{field} for this function body.");
             }
 
-            return CrLocal;
+            return CrFieldLocal(field);
+        }
+
+        /// <summary>
+        /// The whole CR: read, the packed word of the eight field locals; written, a <c>PpcCrView</c> of them that
+        /// takes a packed word.
+        /// </summary>
+        public string CrWhole(bool written)
+        {
+            var fields = new string[8];
+            for (var field = 0; field < 8; ++field) fields[field] = CrField(field, written);
+            return $"{(written ? "PpcCrView" : "PpcCrvPack")}({string.Join(", ", fields)})";
         }
 
         public string Ctr(bool written)
@@ -197,9 +217,16 @@ public sealed partial class CxxLinearCodeGenerator
                 sb.Append("    uint32_t ").Append(GprLocal(gpr)).Append(" = ctx->gpr[").Append(gpr).AppendLine("];");
             foreach (var fpr in _fprs)
                 sb.Append("    PPC_FPR ").Append(FprLocal(fpr)).Append(" = ctx->fpr[").Append(fpr).AppendLine("];");
-            if (_cr) sb.AppendLine($"    uint32_t {CrLocal} = ctx->cr;");
+            AppendCrFieldEntryLoads(sb);
             if (_ctr) sb.AppendLine($"    uint32_t {CtrLocal} = ctx->ctr;");
             if (_xer) sb.AppendLine($"    uint32_t {XerLocal} = ctx->xer;");
+        }
+
+        private void AppendCrFieldEntryLoads(StringBuilder sb)
+        {
+            for (var field = 0; field < 8; ++field)
+                if ((_crFields & (1 << field)) != 0)
+                    sb.AppendLine($"    int64_t {CrFieldLocal(field)} = ctx->crv[{field}];");
         }
 
         /// <summary>
@@ -237,7 +264,7 @@ public sealed partial class CxxLinearCodeGenerator
                 else if ((GuestEabi.NonvolatileFprMask & (1u << fpr)) != 0) sb.AppendLine("{};");
                 else sb.Append(" = ctx->fpr[").Append(fpr).AppendLine("];");
             }
-            if (_cr) sb.AppendLine($"    uint32_t {CrLocal} = ctx->cr;");
+            AppendCrFieldEntryLoads(sb);
             if (_ctr) sb.AppendLine($"    uint32_t {CtrLocal} = ctx->ctr;");
             if (_xer) sb.AppendLine($"    uint32_t {XerLocal} = ctx->xer;");
         }
@@ -293,13 +320,9 @@ public sealed partial class CxxLinearCodeGenerator
             foreach (var fpr in _writtenFprs)
                 if (sync.FlushesFpr(fpr) && IsDirty(dirty, 32 + fpr))
                     sb.Append(pad).Append("ctx->fpr[").Append(fpr).Append("] = ").Append(FprLocal(fpr)).AppendLine(";");
-            if (_writesCr && sync.FlushesCr && IsDirty(dirty, CrKey))
-            {
-                if (sync.FlushCrBits == uint.MaxValue) sb.Append(pad).AppendLine($"ctx->cr = {CrLocal};");
-                else
-                    sb.Append(pad).AppendLine(
-                        $"ctx->cr = (ctx->cr & 0x{~sync.FlushCrBits:X8}u) | ({CrLocal} & 0x{sync.FlushCrBits:X8}u);");
-            }
+            for (var field = 0; field < 8; ++field)
+                if ((_writtenCrFields & (1 << field)) != 0 && sync.FlushesCrField(field) && IsDirty(dirty, CrFieldKey(field)))
+                    sb.Append(pad).AppendLine($"ctx->crv[{field}] = {CrFieldLocal(field)};");
             if (_writesCtr && sync.FlushesCtr && IsDirty(dirty, CtrKey)) sb.Append(pad).AppendLine($"ctx->ctr = {CtrLocal};");
             if (_writesXer && sync.FlushesXer && IsDirty(dirty, XerKey)) sb.Append(pad).AppendLine($"ctx->xer = {XerLocal};");
         }
@@ -308,17 +331,23 @@ public sealed partial class CxxLinearCodeGenerator
 
         private static UInt128 FlushMask(ResidencyBoundarySync sync) =>
             (UInt128)sync.FlushGprMask | ((UInt128)sync.FlushFprMask << 32) |
-            // A partial CR flush (FlushCrBits) leaves the local different from CpuContext: not clean.
-            (sync.FlushesCr && sync.FlushCrBits == uint.MaxValue ? UInt128.One << CrKey : UInt128.Zero) |
+            CrFieldKeys(sync.FlushedCrFields) |
             (sync.FlushesCtr ? UInt128.One << CtrKey : UInt128.Zero) |
             (sync.FlushesXer ? UInt128.One << XerKey : UInt128.Zero);
 
         private static UInt128 ReloadMask(ResidencyBoundarySync sync) =>
             (UInt128)sync.ReloadGprMask | ((UInt128)sync.ReloadFprMask << 32) |
-            // A merged CR reload leaves the local different from CpuContext: not clean.
-            (sync.ReloadsCr && sync.ReloadKeepCrBits == 0 ? UInt128.One << CrKey : UInt128.Zero) |
+            CrFieldKeys(sync.ReloadedCrFields) |
             (sync.ReloadsCtr ? UInt128.One << CtrKey : UInt128.Zero) |
             (sync.ReloadsXer ? UInt128.One << XerKey : UInt128.Zero);
+
+        private static UInt128 CrFieldKeys(byte fields)
+        {
+            var keys = UInt128.Zero;
+            for (var field = 0; field < 8; ++field)
+                if ((fields & (1 << field)) != 0) keys |= UInt128.One << CrFieldKey(field);
+            return keys;
+        }
 
         /// <summary>Starts one emission of the body: flushes are numbered from zero again.</summary>
         public void BeginEmission()
@@ -373,7 +402,7 @@ public sealed partial class CxxLinearCodeGenerator
             var mask = UInt128.Zero;
             foreach (var gpr in _writtenGprs) mask |= UInt128.One << gpr;
             foreach (var fpr in _writtenFprs) mask |= UInt128.One << (32 + fpr);
-            if (_writesCr) mask |= UInt128.One << CrKey;
+            mask |= CrFieldKeys(_writtenCrFields);
             if (_writesCtr) mask |= UInt128.One << CtrKey;
             if (_writesXer) mask |= UInt128.One << XerKey;
             return mask;
@@ -501,13 +530,10 @@ public sealed partial class CxxLinearCodeGenerator
             foreach (var fpr in _fprs)
                 if (sync.ReloadsFpr(fpr))
                     sb.Append(pad).Append(FprLocal(fpr)).Append(" = ctx->fpr[").Append(fpr).AppendLine("];");
-            if (_cr && sync.ReloadsCr && sync.ReloadKeepCrBits != 0)
-            {
-                // MKW_EABI_REGS: the callee preserves these CR fields in this local; CpuContext's copy may be stale.
-                sb.Append(pad).AppendLine(
-                    $"{CrLocal} = ({CrLocal} & 0x{sync.ReloadKeepCrBits:X8}u) | (ctx->cr & 0x{~sync.ReloadKeepCrBits:X8}u);");
-            }
-            else if (_cr && sync.ReloadsCr) sb.Append(pad).AppendLine($"{CrLocal} = ctx->cr;");
+            // MKW_EABI_REGS: ReloadKeepCrBits' fields the callee preserves in these locals; CpuContext's copy may be stale.
+            for (var field = 0; field < 8; ++field)
+                if ((_crFields & (1 << field)) != 0 && sync.ReloadsCrField(field))
+                    sb.Append(pad).AppendLine($"{CrFieldLocal(field)} = ctx->crv[{field}];");
             if (_ctr && sync.ReloadsCtr) sb.Append(pad).AppendLine($"{CtrLocal} = ctx->ctr;");
             if (_xer && sync.ReloadsXer) sb.Append(pad).AppendLine($"{XerLocal} = ctx->xer;");
         }
@@ -530,8 +556,28 @@ public sealed partial class CxxLinearCodeGenerator
         bool FlushesXer = false,
         bool ReloadsXer = false,
         uint ReloadKeepCrBits = 0,
-        uint FlushCrBits = uint.MaxValue)
+        uint FlushCrBits = uint.MaxValue,
+        byte FlushCrFieldMask = 0xFF,
+        byte ReloadCrFieldMask = 0xFF)
     {
+        /// <summary>
+        /// The CR fields this boundary publishes and reloads. CpuContext keeps CR per field (isa/ppc_isa_crv.h), so a
+        /// call stores only the fields its callee can read or write, not the whole register.
+        /// </summary>
+        public byte FlushedCrFields => FlushesCr ? (byte)(FlushCrFieldMask & FieldsOfBits(FlushCrBits)) : (byte)0;
+        public byte ReloadedCrFields => ReloadsCr ? (byte)(ReloadCrFieldMask & ~FieldsOfBits(ReloadKeepCrBits)) : (byte)0;
+        public bool FlushesCrField(int field) => (FlushedCrFields & (1 << field)) != 0;
+        public bool ReloadsCrField(int field) => (ReloadedCrFields & (1 << field)) != 0;
+
+        /// <summary>The fields with any bit in a packed-CR mask (cr0 in the top nibble).</summary>
+        private static byte FieldsOfBits(uint bits)
+        {
+            byte fields = 0;
+            for (var field = 0; field < 8; ++field)
+                if (((bits >> ((7 - field) * 4)) & 0xFu) != 0) fields |= (byte)(1 << field);
+            return fields;
+        }
+
         /// <summary>
         /// MKW_EABI_REGS + MKW_EABI_CR_PARTIAL=1 (GuestEabi.PartialCrFlush; otherwise every bit): the CR bits an EABI-conformant callee (or an indirect target, assumed conformant) reads: cr1
         /// only, the varargs FP-argument flag (GuestEabi.Mask keeps no other CR input). A flush with these bits publishes
@@ -682,7 +728,9 @@ public sealed partial class CxxLinearCodeGenerator
             ReloadsCr: effect.CrWriteMask != 0,
             ReloadsCtr: effect.WritesCtr,
             FlushesXer: effect.ReadsXer || effect.WritesXer,
-            ReloadsXer: effect.WritesXer);
+            ReloadsXer: effect.WritesXer,
+            FlushCrFieldMask: (byte)(effect.CrReadMask | effect.CrWriteMask),
+            ReloadCrFieldMask: effect.CrWriteMask);
 
         /// <summary>
         /// r1 flushes unconditionally: typed native stubs derive their contract from a host signature and can't see the body re-enter guest code via HLE interrupt delivery, whose callback chains build frames from <c>ctx-&gt;gpr[1]</c>.
@@ -697,8 +745,7 @@ public sealed partial class CxxLinearCodeGenerator
                 FlushGprMask: contract.GprReadBeforeWriteMask | contract.GprPossibleWriteMask |
                               StackPointerFlushMask,
                 FlushFprMask: contract.FprReadBeforeWriteMask | contract.FprPossibleWriteMask,
-                // The contract tracks CR per field while the local is the whole
-                // packed register, so any intersecting field forces the sync.
+                // CR per field, as the contract tracks it: the fields the callee may read or write.
                 FlushesCr: (contract.CrReadBeforeWriteMask | contract.CrPossibleWriteMask) != 0,
                 FlushesCtr: contract.ReadsCtrBeforeWrite || contract.MayWriteCtr,
                 ReloadGprMask: contract.GprPossibleWriteMask,
@@ -710,7 +757,9 @@ public sealed partial class CxxLinearCodeGenerator
                 FlushesXer: true,
                 ReloadsXer: contract.MayWriteXer,
                 // MKW_EABI_REGS: a conformant callee's CR input is cr1 at most (GuestEabi.Mask).
-                FlushCrBits: contract.EabiConformant ? EabiVarargCrBits : uint.MaxValue);
+                FlushCrBits: contract.EabiConformant ? EabiVarargCrBits : uint.MaxValue,
+                FlushCrFieldMask: (byte)(contract.CrReadBeforeWriteMask | contract.CrPossibleWriteMask),
+                ReloadCrFieldMask: contract.CrPossibleWriteMask);
         }
     }
 

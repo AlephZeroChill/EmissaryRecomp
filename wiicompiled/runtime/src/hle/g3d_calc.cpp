@@ -466,8 +466,8 @@ bool SameAbiState(const CpuContext& a, const CpuContext& b, char* what, size_t w
                                  static_cast<unsigned long long>(b.fpr[f].raw)),
                    false;
     if (a.lr != b.lr) return std::snprintf(what, whatSize, "lr %08X/%08X", a.lr, b.lr), false;
-    if ((a.cr & 0x00FFF000u) != (b.cr & 0x00FFF000u))
-        return std::snprintf(what, whatSize, "cr2-4 %08X/%08X", a.cr, b.cr), false;
+    if ((PpcGetCr(&a) & 0x00FFF000u) != (PpcGetCr(&b) & 0x00FFF000u))
+        return std::snprintf(what, whatSize, "cr2-4 %08X/%08X", PpcGetCr(&a), PpcGetCr(&b)), false;
     return true;
 }
 
@@ -1235,7 +1235,9 @@ bool CalcViewLCFull(CpuContext* ctx) {
     if (ctx->gqr[0] != 0 || !LeanReady() || !CalleeUnpatched(kGuardGetResNode) || !CalleeUnpatched(kGuardToMtx33) ||
         !CalleeUnpatched(kGuardCopy) || !PlainRange(kLcBase, 0x4000u))
         return false;
-    const uint32_t r1 = ctx->gpr[1], lr = ctx->lr, entryCr = ctx->cr, xer = ctx->xer;
+    const uint32_t r1 = ctx->gpr[1], lr = ctx->lr, xer = ctx->xer;
+    int64_t entryCrv[8];
+    std::memcpy(entryCrv, ctx->crv, sizeof(entryCrv));
     const uint32_t viewPos = ctx->gpr[3], viewNrm = ctx->gpr[4], model = ctx->gpr[5], attrib = ctx->gpr[6];
     const uint32_t count = ctx->gpr[7], viewMtx = ctx->gpr[8], mdlRef = ctx->gpr[9], viewTex = ctx->gpr[10];
     const uint32_t sp = r1 - 208u;
@@ -1340,9 +1342,8 @@ bool CalcViewLCFull(CpuContext* ctx) {
                 ctx->gpr[6] = viewMtx;
                 ctx->gpr[7] = sp + 24u;
                 ctx->gpr[8] = base + i;
-                uint32_t cr = entryCr;
-                SetCRResident(cr, xer, 0, static_cast<int32_t>(attr & 0xFFu), static_cast<int32_t>(0));
-                ctx->cr = cr;
+                std::memcpy(ctx->crv, entryCrv, sizeof(entryCrv));
+                ctx->crv[0] = PpcCrvCompare(static_cast<int32_t>(attr & 0xFFu), static_cast<int32_t>(0), xer);
                 ctx->ctr = fn;
                 ctx->lr = 0x801A3F50u;
                 InvokeIndirectCpu(fn, ctx);
@@ -1428,9 +1429,8 @@ bool CalcViewLCFull(CpuContext* ctx) {
                     ++invTranspose;
                     ctx->gpr[3] = nrm;
                     ctx->gpr[4] = view;
-                    uint32_t cr = entryCr;
-                    SetCRResident(cr, xer, 0, static_cast<int32_t>(viewTex), static_cast<int32_t>(0));
-                    ctx->cr = cr;
+                    std::memcpy(ctx->crv, entryCrv, sizeof(entryCrv));
+                    ctx->crv[0] = PpcCrvCompare(static_cast<int32_t>(viewTex), static_cast<int32_t>(0), xer);
                     Call(ctx, func_801627CC, 0x801A4124u);  // MTX34InvTranspose(&curN[i], &curV[i])
                 }
             }
@@ -1551,9 +1551,7 @@ bool CameraMtxNative(CpuContext* ctx) {
     const uint32_t cam = GuestLoad32(handle);
     if (cam == 0) return true;
     if ((GuestLoad32(cam + 0x70u) & 8u) == 0) {
-        uint32_t cr = ctx->cr;
-        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(0), static_cast<int32_t>(0));  // rlwinm. of flags & 8
-        ctx->cr = cr;
+        ctx->crv[0] = PpcCrvCompare(static_cast<int32_t>(0), static_cast<int32_t>(0), ctx->xer);  // rlwinm. of flags & 8
         ctx->gpr[1] = sp;
         ctx->lr = 0x801A7DF8u;
         if (func_801A81D4_eabi != nullptr)  // UpdateCameraMtx (r3: the handle), the entry the original calls
@@ -1842,7 +1840,7 @@ bool MemcpyNative(CpuContext* ctx) {
     ctx->gpr[5] = 0;
     ctx->gpr[6] = backward ? dst : dst + n - 1u;
     ctx->xer |= 0x20000000u;
-    SetCRResident(ctx->cr, ctx->xer, 0, int32_t{0}, int32_t{0});
+    ctx->crv[0] = PpcCrvCompare(int32_t{0}, int32_t{0}, ctx->xer);
     return true;
 }
 

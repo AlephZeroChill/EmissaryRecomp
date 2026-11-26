@@ -325,7 +325,7 @@ extern "C" uint32_t PPC_Stwcx(uint32_t addr, uint32_t value)
     {
         const uint32_t so = (cpu->xer >> 31) & 1u;
         const uint32_t cr0 = (success ? 0x2u : 0u) | so;
-        cpu->cr = (cpu->cr & 0x0FFFFFFFu) | (cr0 << 28);
+        cpu->crv[0] = PpcCrvEncode(cr0);
     }
     return success ? 1u : 0u;
 }
@@ -373,10 +373,9 @@ extern "C" uint32_t PPC_Mcrxr(uint32_t crField)
 
     const uint32_t field = crField & 7u;
     const uint32_t value = (cpu->xer >> 28) & 0xFu;
-    const uint32_t shift = (7u - field) * 4u;
-    cpu->cr = (cpu->cr & ~(0xFu << shift)) | (value << shift);
+    cpu->crv[field] = PpcCrvEncode(value);
     cpu->xer &= ~0xF0000000u;
-    return cpu->cr;
+    return PpcGetCr(cpu);
 }
 
 extern "C" uint32_t PPC_ReadSpr(uint32_t spr)
@@ -521,8 +520,9 @@ extern "C" uint32_t PPC_CrSetBit(uint32_t bitIndex, uint32_t value)
         return 0;
     }
 
-    cpu->cr = PpcCrSetBitResident(cpu->cr, bitIndex, value);
-    return cpu->cr;
+    const uint32_t bit = bitIndex & 31u;
+    cpu->crv[bit >> 2] = PpcCrvWithBit(cpu->crv[bit >> 2], bit & 3u, (value & 1u) != 0);
+    return PpcGetCr(cpu);
 }
 
 extern "C" uint32_t PPC_CrLogical(uint32_t op, uint32_t bt, uint32_t ba, uint32_t bb)
@@ -533,8 +533,13 @@ extern "C" uint32_t PPC_CrLogical(uint32_t op, uint32_t bt, uint32_t ba, uint32_
         return 0;
     }
 
-    cpu->cr = PpcCrLogicalResident(cpu->cr, op, bt, ba, bb);
-    return cpu->cr;
+    bt &= 31u;
+    ba &= 31u;
+    bb &= 31u;
+    cpu->crv[bt >> 2] = PpcCrvWithBit(cpu->crv[bt >> 2], bt & 3u,
+                                      PpcCrvLogic(op, PpcCrvBit(cpu->crv[ba >> 2], ba & 3u),
+                                                  PpcCrvBit(cpu->crv[bb >> 2], bb & 3u)));
+    return PpcGetCr(cpu);
 }
 
 extern "C" uint32_t PPC_Mcrf(uint32_t dstField, uint32_t srcField)
@@ -545,8 +550,8 @@ extern "C" uint32_t PPC_Mcrf(uint32_t dstField, uint32_t srcField)
         return 0;
     }
 
-    cpu->cr = PpcMcrfResident(cpu->cr, dstField, srcField);
-    return cpu->cr;
+    cpu->crv[dstField & 7u] = cpu->crv[srcField & 7u];
+    return PpcGetCr(cpu);
 }
 
 extern "C" double PPC_PsAdd(double lhs, double rhs)

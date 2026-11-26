@@ -611,17 +611,16 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     var leftExpr = ToExpression(setCr.Left, types);
                     var rightExpr = ToExpression(setCr.Right, types);
-                    // The resident helpers take the CR by reference and XER by
-                    // value. Both are localized, so the summary-overflow copy
-                    // reads a host register instead of reloading CpuContext
-                    // after every potentially aliasing guest store.
+                    // The field's value (isa/ppc_isa_crv.h): an integer compare is the operands' difference, so a
+                    // compare whose field a call or a return publishes is a subtraction and, at that boundary, one
+                    // store. XER is localized too, so the summary-overflow copy reads a host register instead of
+                    // reloading CpuContext after every potentially aliasing guest store.
+                    var crField = CrFieldExpression(setCr.FieldIndex & 7, written: true);
                     if (IsFloatValue(setCr.Left, types) || IsFloatValue(setCr.Right, types))
                     {
                         leftExpr = ToScalarFloatExpression(setCr.Left, types, localPaired);
                         rightExpr = ToScalarFloatExpression(setCr.Right, types, localPaired);
-                        sb.AppendLine(_activeResidency is null
-                            ? $"{pad}SetCRFloat(ctx, {setCr.FieldIndex}, {leftExpr}, {rightExpr});"
-                            : $"{pad}SetCRFloatResident({_activeResidency.Cr(written: true)}, {setCr.FieldIndex}, {leftExpr}, {rightExpr});");
+                        sb.AppendLine($"{pad}{crField} = PpcCrvCompareFloat({leftExpr}, {rightExpr});");
                     }
                     else
                     {
@@ -631,9 +630,8 @@ public sealed partial class CxxLinearCodeGenerator
                         var rightCast = setCr.IsUnsigned
                             ? $"static_cast<uint32_t>({rightExpr})"
                             : $"static_cast<int32_t>({rightExpr})";
-                        sb.AppendLine(_activeResidency is null
-                            ? $"{pad}SetCR(ctx, {setCr.FieldIndex}, {leftCast}, {rightCast});"
-                            : $"{pad}SetCRResident({_activeResidency.Cr(written: true)}, {_activeResidency.Xer(written: false)}, {setCr.FieldIndex}, {leftCast}, {rightCast});");
+                        var xer = _activeResidency is null ? "ctx->xer" : _activeResidency.Xer(written: false);
+                        sb.AppendLine($"{pad}{crField} = PpcCrvCompare({leftCast}, {rightCast}, {xer});");
                     }
                 }
                 break;

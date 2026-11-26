@@ -22,21 +22,21 @@ extern "C" volatile unsigned long long g_hzPerf[48] = {};
 // Nothing reads CpuContext by offset; these asserts just canary accidental field reordering
 // (the order is a cache-locality choice explained at the struct definition).
 static_assert(offsetof(CpuContext, gpr) == 0);
-static_assert(offsetof(CpuContext, cr) == 128);
-static_assert(offsetof(CpuContext, lr) == 132);
-static_assert(offsetof(CpuContext, ctr) == 136);
-static_assert(offsetof(CpuContext, xer) == 140);
-static_assert(offsetof(CpuContext, fpscr) == 144);
-static_assert(offsetof(CpuContext, pc) == 148);
-static_assert(offsetof(CpuContext, fpr) == 152);
-static_assert(offsetof(CpuContext, gqr) == 408);
-static_assert(offsetof(CpuContext, hid0) == 440);
-static_assert(offsetof(CpuContext, hid1) == 444);
-static_assert(offsetof(CpuContext, hid2) == 448);
-static_assert(offsetof(CpuContext, srr0) == 452);
-static_assert(offsetof(CpuContext, srr1) == 456);
-static_assert(offsetof(CpuContext, msr) == 460);
-static_assert(sizeof(CpuContext) == 464);
+static_assert(offsetof(CpuContext, crv) == 128);
+static_assert(offsetof(CpuContext, lr) == 192);
+static_assert(offsetof(CpuContext, ctr) == 196);
+static_assert(offsetof(CpuContext, xer) == 200);
+static_assert(offsetof(CpuContext, fpscr) == 204);
+static_assert(offsetof(CpuContext, pc) == 208);
+static_assert(offsetof(CpuContext, fpr) == 216);
+static_assert(offsetof(CpuContext, gqr) == 472);
+static_assert(offsetof(CpuContext, hid0) == 504);
+static_assert(offsetof(CpuContext, hid1) == 508);
+static_assert(offsetof(CpuContext, hid2) == 512);
+static_assert(offsetof(CpuContext, srr0) == 516);
+static_assert(offsetof(CpuContext, srr1) == 520);
+static_assert(offsetof(CpuContext, msr) == 524);
+static_assert(sizeof(CpuContext) == 528);
 
 namespace {
 std::vector<TranslatedFunctionInfo>& Registry() {

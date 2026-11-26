@@ -188,7 +188,7 @@ void RestoreRegs(const void* key) {
 void DumpGuestCpu() {
     const CpuContext* c = t_ctx ? t_ctx : g_currentCpuContext;
     if (!c) { std::fputs("[brawl-online] no guest CPU on this thread\n", stderr); return; }
-    std::fprintf(stderr, "[brawl-online] guest pc %08x lr %08x ctr %08x cr %08x\n", c->pc, c->lr, c->ctr, c->cr);
+    std::fprintf(stderr, "[brawl-online] guest pc %08x lr %08x ctr %08x cr %08x\n", c->pc, c->lr, c->ctr, PpcGetCr(c));
     for (int i = 0; i < 32; i += 8)
         std::fprintf(stderr, "[brawl-online]  r%-2d %08x %08x %08x %08x %08x %08x %08x %08x\n", i, c->gpr[i], c->gpr[i + 1],
                      c->gpr[i + 2], c->gpr[i + 3], c->gpr[i + 4], c->gpr[i + 5], c->gpr[i + 6], c->gpr[i + 7]);

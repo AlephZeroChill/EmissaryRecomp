@@ -199,7 +199,7 @@ inline bool AlreadyCopied(uint32_t dest, uint32_t source, uint32_t size) {
 void RunHandler(CpuContext* ctx) {
     uint32_t r[32];
     std::memcpy(r, ctx->gpr, sizeof(r));
-    uint32_t cr = ctx->cr, xer = ctx->xer, ctr = ctx->ctr;
+    uint32_t cr = PpcGetCr(ctx), xer = ctx->xer, ctr = ctx->ctr;
     PPC_FPR f2 = ctx->fpr[2], f3 = ctx->fpr[3];
     Prefetcher prefetch;
 
@@ -219,7 +219,7 @@ void RunHandler(CpuContext* ctx) {
     };
     const auto writeBack = [&] {
         std::memcpy(ctx->gpr, r, sizeof(r));
-        ctx->cr = cr;
+        PpcSetCr(ctx, cr);
         ctx->xer = xer;
         ctx->ctr = ctr;
         ctx->fpr[2] = f2;
@@ -227,7 +227,7 @@ void RunHandler(CpuContext* ctx) {
     };
     const auto readBack = [&] {
         std::memcpy(r, ctx->gpr, sizeof(r));
-        cr = ctx->cr;
+        cr = PpcGetCr(ctx);
         xer = ctx->xer;
         ctr = ctx->ctr;
         f2 = ctx->fpr[2];

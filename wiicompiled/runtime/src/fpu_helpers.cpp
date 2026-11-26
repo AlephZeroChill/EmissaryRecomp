@@ -115,10 +115,10 @@ extern "C" uint32_t PPC_Mcrfs(uint32_t dstField, uint32_t srcField)
     const uint32_t dst = dstField & 7u;
     const uint32_t src = srcField & 7u;
     const uint32_t value = (cpu->fpscr >> ((7u - src) * 4u)) & 0xFu;
-    cpu->cr = (cpu->cr & ~(0xFu << ((7u - dst) * 4u))) | (value << ((7u - dst) * 4u));
+    cpu->crv[dst] = PpcCrvEncode(value);
     cpu->fpscr &= ~((0xFu << ((7u - src) * 4u)) & (kFpscrFx | kFpscrAnyX));
     FpscrUpdated(cpu);
-    return cpu->cr;
+    return PpcGetCr(cpu);
 }
 
 extern "C" double PPC_Mffs() {

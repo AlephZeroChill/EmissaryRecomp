@@ -930,7 +930,7 @@ public class CodeGenTests
 
         Assert.Contains("InvokeDirectCpu<0x80001234u>(ctx);", code, StringComparison.Ordinal);
         Assert.Contains("f31.d = f1.d;", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRFloatResident(cr, 0, f31.d, f4.d);", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompareFloat(f31.d, f4.d);", code, StringComparison.Ordinal);
         Assert.DoesNotContain("PPC_PsToScalarInline(f31.d)", code, StringComparison.Ordinal);
     }
 
@@ -975,7 +975,7 @@ public class CodeGenTests
         Assert.True(callIndex >= 0, code);
         Assert.True(normalizeIndex > callIndex, code);
         Assert.True(assignIndex > normalizeIndex, code);
-        Assert.Contains("SetCRFloatResident(cr, 0, f31.d, f4.d);", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompareFloat(f31.d, f4.d);", code, StringComparison.Ordinal);
         Assert.DoesNotContain("PPC_PsToScalarInline(f31.d)", code, StringComparison.Ordinal);
     }
 

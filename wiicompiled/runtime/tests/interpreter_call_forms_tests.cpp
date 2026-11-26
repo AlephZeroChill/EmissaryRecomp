@@ -136,7 +136,7 @@ static void TestCompactedJumpSources() {
             ctx.lr = 0x80006000;
             ctx.gpr[3] = input;
             ctx.gpr[6] = operand;
-            ctx.cr = 0x5a123456;
+            PpcSetCr(&ctx, 0x5a123456);
             ctx.xer = 0x80000000;
             PpcInterpreter::Run(&ctx, start);
             const uint32_t result = input + increment;
@@ -146,7 +146,7 @@ static void TestCompactedJumpSources() {
             const uint32_t carry = operand == 0xffffffffu ? 0x20000000u : 0u;
             assert(ctx.xer == (0x80000000u | carry));
             const uint32_t nibble = (result < 3 ? 8u : result > 3 ? 4u : 2u) | 1u;
-            assert(ctx.cr == (0x0a123456u | (nibble << 28)));
+            assert(PpcGetCr(&ctx) == (0x0a123456u | (nibble << 28)));
             assert(ctx.lr == 0x80006000);
         }
     };
@@ -206,7 +206,7 @@ static void TestSequencePairs() {
         for (auto& r : initial.gpr) r = data + 0x80 + (random() & 0x3c);
         for (auto& f : initial.fpr) f.raw = (uint64_t(random()) << 32) | random();
         for (auto& q : initial.gqr) q = random();
-        initial.cr = random(); initial.xer = random(); initial.ctr = random();
+        PpcSetCr(&initial, random()); initial.xer = random(); initial.ctr = random();
         initial.fpscr = sample & 4; initial.lr = initial.gpr[30] = 0x80006000;
         initial.hid0 = random(); initial.hid1 = random(); initial.hid2 = random();
         initial.srr0 = random(); initial.srr1 = random(); initial.msr = random();
@@ -261,7 +261,7 @@ static void TestSequencePairs() {
             for(auto r:ctx.gpr) hash(r);
             for(auto f:ctx.fpr) hash(f.raw);
             for(auto q:ctx.gqr) hash(q);
-            for(auto r:{ctx.cr,ctx.xer,ctx.lr,ctx.ctr,ctx.fpscr,ctx.hid0,ctx.hid1,ctx.hid2,ctx.srr0,ctx.srr1,ctx.msr}) hash(r);
+            for(auto r:{PpcGetCr(&ctx),ctx.xer,ctx.lr,ctx.ctr,ctx.fpscr,ctx.hid0,ctx.hid1,ctx.hid2,ctx.srr0,ctx.srr1,ctx.msr}) hash(r);
             // pc is an internal cursor and differs between cached/classic execution.
             for(unsigned i=0;i<0x200;++i) hash(Memory::Read8(data+i));
 #if MKW_LEAN_MEMORY
