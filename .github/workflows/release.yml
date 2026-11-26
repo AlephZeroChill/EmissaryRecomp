@@ -1,5 +1,6 @@
-# EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines and the Linux
-# program, built on GitHub's own runners; the downloads EmissaryRecomp-<tag>-Windows.zip / -Linux.tar.gz,
+# EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines, the Linux program
+# and the macOS one (Apple silicon), built on GitHub's own runners; the downloads EmissaryRecomp-<tag>-Windows.zip /
+# -Linux.tar.gz / -macOS.tar.gz,
 # manifest.json and SHA256SUMS, published as the GitHub release <tag>. A tag with a suffix (v0.7.0-rc.1) is a
 # prerelease; a release is published without becoming /releases/latest (what launchers install) until a maintainer
 # makes it so (gh release edit <tag> --latest).
@@ -56,6 +57,8 @@ jobs:
           - name: windows-v2
             os: windows-2025
             old-cpu: true
+          - name: macos
+            os: macos-15  # Apple silicon (arm64), what the macOS build is for
     runs-on: ${{ matrix.os }}
     timeout-minutes: 355
     defaults:
@@ -86,6 +89,8 @@ jobs:
           EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
           GAME_REPO: ${{ vars.EMISSARY_GAME_REPO }}
         run: |
+          # GnuPG decrypts it (and the build caches); GitHub's macOS image may not have it.
+          if [[ $RUNNER_OS == macOS ]] && ! command -v gpg >/dev/null; then brew install gnupg; fi
           ssh_dir="$RUNNER_TEMP/game-ssh"
           mkdir -p "$ssh_dir"
           printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key" && chmod 600 "$ssh_dir/key"
@@ -131,12 +136,18 @@ jobs:
           sudo bash tools/linux-build-deps.sh
           EMISSARY_RELEASE_IN_PLACE=1 EMISSARY_RELEASE_WORK="$PWD/build/ci" \
             bash tools/release-linux.sh "$PWD" "$EMISSARY_GAME" "$PWD/out/linux-native" 4 "$TAG" "$GITHUB_SHA"
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v ninja >/dev/null || brew install ninja
+          EMISSARY_RELEASE_IN_PLACE=1 EMISSARY_RELEASE_WORK="$PWD/build/ci"             bash tools/release-macos.sh "$PWD" "$EMISSARY_GAME" "$PWD/out/macos-native" 3 "$TAG" "$GITHUB_SHA"
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $old = @(if ('${{ matrix.old-cpu }}' -eq 'true') { '-OldCpu' })
-          & ./tools/build-brawl.ps1 -NoPlay -BrawlOnline lock -ReleaseVersion $env:TAG -Game $env:EMISSARY_GAME -Jobs 4 @old
+          # A switch's value, not a splatted '-OldCpu' (an array splat passes it as a positional string).
+          $old = '${{ matrix.old-cpu }}' -eq 'true'
+          & ./tools/build-brawl.ps1 -NoPlay -BrawlOnline lock -ReleaseVersion $env:TAG -Game $env:EMISSARY_GAME -Jobs 4 -OldCpu:$old
           if ($LASTEXITCODE -ne 0) { throw "build-brawl.ps1 failed ($LASTEXITCODE)" }
 
       - name: Remove the game's code
@@ -167,6 +178,13 @@ jobs:
         with:
           name: linux
           path: out/linux-native/
+          retention-days: 3
+      - name: Keep the program (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/macos-native/
           retention-days: 3
       - name: Keep the program (Windows)
         if: matrix.name == 'windows'
@@ -217,13 +235,17 @@ jobs:
         with:
           name: linux
           path: dist/release/linux-native
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: dist/release/macos-native
       - name: Package (and publish)
         env:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ inputs.prerelease }}
           PUBLISH: ${{ github.ref_type == 'tag' || inputs.publish }}
         run: |
-          release=(tools/release.py --skip-build --out dist/release)
+          release=(tools/release.py --skip-build --platforms windows,linux,macos --out dist/release)
           if [[ $GITHUB_REF_TYPE == tag ]]; then release+=(--tag "$GITHUB_REF_NAME")
           elif [[ -n $PRERELEASE ]]; then release+=(--prerelease "$PRERELEASE"); fi
           [[ $PUBLISH != true ]] || release+=(--publish)
