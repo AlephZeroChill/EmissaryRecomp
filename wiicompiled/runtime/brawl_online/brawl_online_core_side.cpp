@@ -33,6 +33,8 @@
 #include "Core/Core.h"
 #include "Core/Rollback/GameplayOnlineBackend.h"
 #include "Core/Rollback/InputSuggest.h"
+#include "Core/Rollback/InputTrace.h"
+#include "Core/Rollback/PresentStats.h"
 #include "Core/Rollback/ReplayPlayback.h"
 #include "Core/System.h"
 
@@ -439,5 +441,14 @@ void CoreSuggestSample(int chan, const Pad& pad, int64_t start_ns, int64_t end_n
     Gprb::Suggest::Sample(chan, ToStatus(pad), at(start_ns), at(end_ns));
 }
 void CorePadThreadUpdated() { Gprb::PadsOnPadThreadUpdated(Core::System::GetInstance()); }
+void CoreTracePresent(int64_t copy_ns, int64_t done_ns) {
+    auto& tag = Rollback::PresentStats::g_displayed_tag;
+    if (tag.pass_frame < 0 || !Rollback::InputTrace::Enabled()) return;
+    const auto at = [](int64_t ns) { return Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(ns))); };
+    Rollback::InputTrace::Write(fmt::format("P {} {} {} {} {} {}", tag.pass_frame, tag.picture_frame,
+                                            tag.picture_confirmed, tag.after_resim ? 1 : 0,
+                                            Rollback::InputTrace::Us(at(copy_ns)), Rollback::InputTrace::Us(at(done_ns))));
+    tag.pass_frame = -1;
+}
 
 }  // namespace BrawlOnlineBridge

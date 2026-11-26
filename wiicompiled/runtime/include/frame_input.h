@@ -31,6 +31,9 @@ using Frame = std::array<Remote, 4>;
 bool Active();
 // Latches the channels for the frame that starts at this retrace.
 void Latch(uint32_t retraceCount);
+// The GameCube ports read again now, as a look (no harness poll, no Wii Remotes), into the latched frame: at the game's
+// loop top in a match, so the frame's input is the controller as the frame starts, not as it was at the retrace.
+void Relatch();
 const Remote& Get(uint32_t chan);
 
 // The local controllers as one frame (what Latch uses without a network source). Neutral while an

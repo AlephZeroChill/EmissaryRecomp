@@ -301,6 +301,8 @@ void SetPresentPacing(bool on, LeadFn lead) noexcept {
     g_lead = lead;
 }
 
+bool MatchPacing() noexcept { return g_presentPacing && !g_resimulating && !g_loadWait; }
+
 PacingStats Stats() noexcept { return g_stats; }
 
 Clock::time_point NowTimePoint() noexcept {

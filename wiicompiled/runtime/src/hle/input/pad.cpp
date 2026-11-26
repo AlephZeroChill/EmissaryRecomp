@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
 #include <aurora/aurora.h>
 #include <dolphin/pad.h>
@@ -216,6 +217,14 @@ void ApplyPadScript(PADStatus& port1);
 // read after a rollback): the ports as ReadLocalPads would make them now, changing nothing (aurora's PADPeek, no Wii
 // Remote scan, no script step), after SDL has read its controllers (the event pump does that once a frame). False
 // while a test script drives the pads (its steps count the game's reads). The game's thread.
+// SDL's keyboard, mouse and controller state as of now: SDL updates it only when events are pumped (once a frame,
+// after the present, in aurora's frame loop), so a read just before the next frame would see the keys as they were
+// at the last present, about 12 ms earlier. The events stay queued for aurora's next poll. The game's thread.
+void PAD_HLE_PumpHostEvents()
+{
+    SDL_PumpEvents();
+}
+
 bool PAD_HLE_PeekLocalPads(FrameInput::GcPad* pads)
 {
     if (WiiRemoteInput::ScriptActive() || std::getenv("BRAWL_PAD_SCRIPT") != nullptr) return false;

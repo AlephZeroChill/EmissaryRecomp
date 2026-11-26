@@ -9,6 +9,7 @@
 // hle/input/pad.cpp: the local GameCube ports as the game would read them now (Peek: changing nothing).
 void PAD_HLE_SampleLocalPads(FrameInput::GcPad* pads);
 bool PAD_HLE_PeekLocalPads(FrameInput::GcPad* pads);
+void PAD_HLE_PumpHostEvents();
 
 namespace FrameInput {
 namespace {
@@ -82,6 +83,15 @@ void Latch(uint32_t retraceCount) {
         // Brawl Online's core takes these reads as Dolphin's SI reads (in a rollback's re-run: the ones before it).
         BrawlOnlineCore::HostPadsRead(&g_frame);
     }
+}
+
+void Relatch() {
+    if (g_source != nullptr) return;
+    PAD_HLE_PumpHostEvents();  // the keyboard as it is now, not at the last present
+    GcPad pads[4]{};
+    if (!PeekLocal(pads)) return;
+    for (uint32_t chan = 0; chan < g_frame.size(); ++chan) g_frame[chan].pad = pads[chan];
+    BrawlOnlineCore::HostPadsRead(&g_frame);
 }
 
 const Remote& Get(uint32_t chan) {

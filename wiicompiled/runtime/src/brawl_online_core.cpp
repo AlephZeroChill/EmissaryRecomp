@@ -458,6 +458,14 @@ void Shutdown() {
 
 void RunLoop(CpuContext* ctx, Pass pass) {
     CtxScope scope(ctx);
+    // In a match, the controllers again for the frame that starts here: the retrace latched them about 3 ms ago (the
+    // game's other threads run between it and the loop top), and Dolphin's loop top takes its newest SI poll, about
+    // 1 ms old. BRAWL_LOOPTOP_READ=0: the retrace's read, as before (docs/design/brawl-online-core.md §10.6).
+    static const bool loopTopRead = [] {
+        const char* env = std::getenv("BRAWL_LOOPTOP_READ");
+        return env == nullptr || env[0] != '0';
+    }();
+    if (loopTopRead && DetClock::MatchPacing()) FrameInput::Relatch();
     for (;;) {
         uint32_t call = 0;
         switch (B::CoreLoopTop(&call)) {
@@ -582,6 +590,13 @@ void HostPadsRead(void* frame) {
     for (int i = 0; i < 4; ++i)
         f[size_t(i)].pad = {p[i].connected, p[i].button, p[i].stickX, p[i].stickY, p[i].substickX, p[i].substickY,
                             p[i].triggerL, p[i].triggerR};
+}
+void TracePresent(std::chrono::steady_clock::time_point copy, std::chrono::steady_clock::time_point done) {
+    if (!Enabled()) return;
+    const auto ns = [](std::chrono::steady_clock::time_point t) {
+        return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+    };
+    B::CoreTracePresent(ns(copy), ns(done));
 }
 bool SampleForSuggestions() {
     if (!Enabled()) return false;

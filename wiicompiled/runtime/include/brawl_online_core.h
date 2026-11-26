@@ -3,6 +3,7 @@
 // BRAWL_ONLINE_CORE names the user folder (Dolphin's layout: Config/Dolphin.ini, Online/...); it
 // replaces BrawlRollback's prototype loop and BrawlOnline's IPC.
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -49,6 +50,8 @@ void HarnessPeekPads(void* gc_pads);
 // takes each GameCube port's read as Dolphin's SI reads (the instant it stands for, the host decode), and in a
 // rollback's re-run hands back the reads latched before it.
 void HostPadsRead(void* frame);
+// A presented frame's copy (steady clock): the input trace's P line (brawl_online_bridge.h's CoreTracePresent).
+void TracePresent(std::chrono::steady_clock::time_point copy, std::chrono::steady_clock::time_point done);
 // Input suggestions (the core's Gprb::Suggest): while the game's thread waits for the next field (det_clock.h's wait
 // hook), a look at the local player's controller about once a millisecond, which the core sends the other players
 // when it changes what the next frame's input would be. False when none is wanted (then the wait is not sliced).

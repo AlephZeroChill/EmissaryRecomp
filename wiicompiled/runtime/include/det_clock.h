@@ -68,6 +68,8 @@ std::chrono::nanoseconds TakeMaxBehind() noexcept;
 // will take, 0 when none comes), so the rollback runs in the wait instead of after it (Dolphin's paced sleep lead).
 using LeadFn = std::chrono::nanoseconds (*)();
 void SetPresentPacing(bool on, LeadFn lead) noexcept;
+// A running match's frame pacing is on (SetPresentPacing) and this is not a rollback's re-run or a load wait.
+bool MatchPacing() noexcept;
 // Something to do while the pacing waits (Brawl Online's input suggestions look at the controllers): a wait asks
 // the hook first, and while it returns true sleeps in slices of about a millisecond, asking it before each.
 // nullptr: none. Guest thread.

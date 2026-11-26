@@ -113,6 +113,9 @@ int CoreSuggestChannel();
 int64_t CoreSuggestPeriodNs();
 void CoreSuggestSample(int chan, const Pad& pad, int64_t start_ns, int64_t end_ns);
 void CorePadThreadUpdated();                 // the pad thread's loop, after P+'s code (0x8002BA84)
+// A presented frame (its copy from `copy_ns` to `done_ns`, steady clock): the input trace's P line for the picture the
+// core tagged at the pass's loop top (PPR_GPRB_INPUT_TRACE; Dolphin's PresentStats writes it there).
+void CoreTracePresent(int64_t copy_ns, int64_t done_ns);
 
 // Brawl Online's test harness (BRAWL_ONLINE_HARNESS_PORT, brawl_online_harness.cpp): every poll of the
 // local controllers, its pads (pad_set, pad_script) replace them.

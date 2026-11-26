@@ -4,6 +4,7 @@
 #include "hle/gecko.h"
 #include "save_states.h"
 #include "frame_input.h"
+#include "brawl_online_core.h"
 #include "det_hash.h"
 #include "timebase_contract.h"
 #include "det_clock.h"
@@ -1099,6 +1100,8 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
 
     const Clock::time_point endFrameStart = Clock::now();
     aurora_end_frame();
+    // The input trace's P line: the picture the core tagged for this pass (PPR_GPRB_INPUT_TRACE).
+    if (DetClock::Enabled() && presentedXfb) BrawlOnlineCore::TracePresent(presentStart, Clock::now());
     if (presentedXfb) {  // Aurora's draw commands this frame (unmerged) and the primitives merged into them
         if (const AuroraStats* stats = aurora_get_stats()) {
             s_frameUnmergedDraws += stats->drawCallCount;
