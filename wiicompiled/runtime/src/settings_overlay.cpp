@@ -1310,15 +1310,17 @@ void DrawFrameGraph() {
 }
 
 void DrawFpsOverlay() {
+    // Tests: BRAWL_LOG_PRESENT=1 logs the displayed and motion frame rates and the worst frame every 2 s.
+    static const bool logPresent = std::getenv("BRAWL_LOG_PRESENT") != nullptr;
+    // Taken only for a reader: it copies and sorts the last second's present intervals (~0.02 ms a presented frame
+    // on the game thread, unthrottled).
     AuroraPresentTiming presentTiming{};
-    aurora_get_present_timing(&presentTiming);
+    if (logPresent || g_showFps) aurora_get_present_timing(&presentTiming);
     {
         const float dt = ImGui::GetIO().DeltaTime;
         g_frameTimes[g_frameTimeNext] = dt > 0.0f && dt < 1.0f ? dt * 1000.0f : 0.0f;
         g_frameTimeNext = (g_frameTimeNext + 1) % kFrameTimeCount;
     }
-    // Tests: BRAWL_LOG_PRESENT=1 logs the displayed and motion frame rates and the worst frame every 2 s.
-    static const bool logPresent = std::getenv("BRAWL_LOG_PRESENT") != nullptr;
     if (logPresent) {
         static double windowStart = ImGui::GetTime(), worst = 0;
         static int frames = 0;

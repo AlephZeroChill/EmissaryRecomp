@@ -77,10 +77,14 @@ struct Batch {
     compiled.clear();
   }
 };
+namespace detail {
+bool g_enabled = false;
+AURORA_TLS_CONSTINIT thread_local bool t_onGx = false;
+} // namespace detail
 namespace {
 
-bool g_enabled = false;
-thread_local bool t_onGx = false;
+using detail::g_enabled;
+using detail::t_onGx;
 std::thread g_thread;
 
 // The hand-off: batches go from the producer to the GX thread through a single-producer single-consumer ring, and

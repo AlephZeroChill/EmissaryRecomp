@@ -17,8 +17,25 @@ namespace aurora::gx::worker {
 bool enabled() noexcept;
 // The calling thread is the GX thread.
 bool on_gx_thread() noexcept;
+
+#ifndef AURORA_TLS_CONSTINIT
+#if defined(__clang__)
+#define AURORA_TLS_CONSTINIT [[clang::require_constant_initialization]]
+#elif defined(__GNUC__) && __GNUC__ >= 10
+#define AURORA_TLS_CONSTINIT __constinit
+#else
+#define AURORA_TLS_CONSTINIT
+#endif
+#endif
+namespace detail {
+// What enabled() and on_gx_thread() return, for producer() inline: it guards most GX entry points (every display list,
+// drain and ordered call), thousands of times a frame.
+extern bool g_enabled;
+AURORA_TLS_CONSTINIT extern thread_local bool t_onGx;
+} // namespace detail
+
 // True when the caller must hand work to the GX thread instead of decoding inline: async and not on the GX thread.
-inline bool producer() noexcept { return enabled() && !on_gx_thread(); }
+inline bool producer() noexcept { return detail::g_enabled && !detail::t_onGx; }
 void flush() noexcept;
 
 void start();
