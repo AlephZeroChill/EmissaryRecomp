@@ -168,15 +168,13 @@ public sealed partial class CxxLinearCodeGenerator
             var crField = baseName[2] - '0';
             if (crField is >= 0 and <= 7)
             {
-                var shift = (7 - crField) * 4;
-                var crExpr = residency is null ? "ctx->cr" : residency.Cr(written: false);
-                return $"(({crExpr} >> {shift}) & 0xF)";
+                return $"PpcCrvNibble({CrFieldExpression(crField, written: false)})";
             }
         }
 
         if (SpanEqualsIgnoreCase(baseName, "lr")) return "ctx->lr";
         if (SpanEqualsIgnoreCase(baseName, "ctr")) return residency is null ? "ctx->ctr" : residency.Ctr(written: written);
-        if (SpanEqualsIgnoreCase(baseName, "cr")) return residency is null ? "ctx->cr" : residency.Cr(written: written);
+        if (SpanEqualsIgnoreCase(baseName, "cr")) return CrWholeExpression(written);
         if (SpanEqualsIgnoreCase(baseName, "xer")) return residency is null ? "ctx->xer" : residency.Xer(written: written);
         if (SpanEqualsIgnoreCase(baseName, "srr0")) return "ctx->srr0";
         if (SpanEqualsIgnoreCase(baseName, "srr1")) return "ctx->srr1";
@@ -193,6 +191,39 @@ public sealed partial class CxxLinearCodeGenerator
 
         return written ? name : "0";
     }
+
+    /// <summary>
+    /// One CR field (an <c>int64_t</c> field value, isa/ppc_isa_crv.h): its resident local, or CpuContext's. Every
+    /// emitted CR access goes through this or <see cref="CrWholeExpression"/>, so the text forms are exactly
+    /// <c>crvN</c> and <c>ctx-&gt;crv[N]</c> (the leaf register cache rewrites the latter).
+    /// </summary>
+    private static string CrFieldExpression(int field, bool written) =>
+        _activeResidency is null ? $"ctx->crv[{field & 7}]" : _activeResidency.CrField(field, written);
+
+    /// <summary>The whole CR: read, its packed word; written, a <c>PpcCrView</c> that takes one.</summary>
+    private static string CrWholeExpression(bool written)
+    {
+        if (_activeResidency is not null) return _activeResidency.CrWhole(written);
+        var fields = "ctx->crv[0], ctx->crv[1], ctx->crv[2], ctx->crv[3], ctx->crv[4], ctx->crv[5], ctx->crv[6], ctx->crv[7]";
+        return $"{(written ? "PpcCrView" : "PpcCrvPack")}({fields})";
+    }
+
+    /// <summary>The IR's whole condition register (mtcrf, mcrf, crxor, ... and helpers that return it) as a destination.</summary>
+    private static bool IsWholeCrDestination(string destination) =>
+        GetRegisterBaseName(destination).Equals("cr", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>A branch test of one CR bit (mask 8 LT, 4 GT, 2 EQ, 1 SO) of a field value.</summary>
+    private static string CrFieldBitTest(string field, int mask, bool set) => mask switch
+    {
+        8 => set ? $"PpcCrvLt({field})" : $"!PpcCrvLt({field})",
+        4 => set ? $"({field} > 0)" : $"({field} <= 0)",
+        2 => set ? $"(static_cast<uint32_t>({field}) == 0u)" : $"(static_cast<uint32_t>({field}) != 0u)",
+        _ => set ? $"PpcCrvSo({field})" : $"!PpcCrvSo({field})",
+    };
+
+    private static readonly System.Text.RegularExpressions.Regex GetCrBitTextRegex = new(
+        @"GetCRBit\(\s*ctx\s*,\s*(?<field>\d+)\s*,\s*(?<bit>\d+)\s*\)",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     private static string ToDestination(string name, RepresentationEnvironment types)
     {
@@ -228,15 +259,10 @@ public sealed partial class CxxLinearCodeGenerator
             conditionBase[2] is >= '0' and <= '7')
         {
             var field = conditionBase[2] - '0';
-            var fieldShift = (7 - field) * 4;
             var (mask, set) = CrFieldConditionTest(condition);
             if (mask != 0)
             {
-                var shiftedMask = mask << fieldShift;
-                var crExpr = _activeResidency is null
-                    ? "ctx->cr"
-                    : _activeResidency.Cr(written: false);
-                return $"(({crExpr} & 0x{shiftedMask:X8}u) {(set ? "!=" : "==")} 0)";
+                return $"({CrFieldBitTest(CrFieldExpression(field, written: false), mask, set)})";
             }
         }
 
@@ -264,24 +290,32 @@ public sealed partial class CxxLinearCodeGenerator
     /// </summary>
     private static string ResidentRawCondition(string conditionText)
     {
-        var residency = _activeResidency;
-        if (residency is null || string.IsNullOrEmpty(conditionText))
+        if (string.IsNullOrEmpty(conditionText))
         {
             return conditionText;
         }
 
+        // GetCRBit(ctx, F, B) becomes a read of field F (its local, or CpuContext's) in every body, so the leaf
+        // register cache sees CR only as ctx->crv[N].
         var rewritten = conditionText;
+        if (rewritten.Contains("GetCRBit(", StringComparison.Ordinal))
+        {
+            rewritten = GetCrBitTextRegex.Replace(rewritten, match =>
+                $"PpcCrvBit({CrFieldExpression(int.Parse(match.Groups["field"].Value) & 7, written: false)}, " +
+                $"{int.Parse(match.Groups["bit"].Value) & 3}u)");
+            if (rewritten.Contains("GetCRBit(", StringComparison.Ordinal))
+                throw new InvalidOperationException($"Unparsed CR bit test in branch condition: {conditionText}");
+        }
+
+        var residency = _activeResidency;
+        if (residency is null)
+        {
+            return rewritten;
+        }
+
         if (rewritten.Contains("ctx->ctr", StringComparison.Ordinal))
         {
             rewritten = rewritten.Replace("ctx->ctr", residency.Ctr(written: false), StringComparison.Ordinal);
-        }
-
-        if (rewritten.Contains("GetCRBit(ctx,", StringComparison.Ordinal))
-        {
-            rewritten = rewritten.Replace(
-                "GetCRBit(ctx,",
-                $"GetCRBitResident({residency.Cr(written: false)},",
-                StringComparison.Ordinal);
         }
 
         return rewritten;

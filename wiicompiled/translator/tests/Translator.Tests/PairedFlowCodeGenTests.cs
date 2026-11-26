@@ -84,7 +84,7 @@ public sealed class PairedFlowCodeGenTests
             0x80006004, new SsaTransformer().Convert(function), signature, types);
 
         Assert.Contains(
-            "SetCRFloatResident(cr, 0, PPC_PsToScalarInline(f2.d), PPC_PsToScalarInline(f5.d));",
+            "crv0 = PpcCrvCompareFloat(PPC_PsToScalarInline(f2.d), PPC_PsToScalarInline(f5.d));",
             code, StringComparison.Ordinal);
     }
 
@@ -109,7 +109,7 @@ public sealed class PairedFlowCodeGenTests
         var code = new CxxLinearCodeGenerator().Emit(
             0x80006004, new SsaTransformer().Convert(function), signature, types);
 
-        Assert.Contains("SetCRFloatResident(cr, 3, f1.d, f2.d);", code, StringComparison.Ordinal);
+        Assert.Contains("crv3 = PpcCrvCompareFloat(f1.d, f2.d);", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -149,7 +149,7 @@ public sealed class PairedFlowCodeGenTests
         // A raw "PPC_Fcmp" IrCall isn't normal decoder output, but residency treats it as a
         // safety-net form of fcmpo/fcmpu and fuses it into the resident CR write like IrSetCrField,
         // using the operands directly instead of PPC_PsToScalarInline (CxxLinearCodeGenerator.Inlines.cs "PPC_FCMP").
-        Assert.Contains("SetCRFloatResident(cr, 0, f31.d, f1.d);", code, StringComparison.Ordinal);
-        Assert.DoesNotContain("SetCRFloatResident(cr, 0, PPC_PsToScalarInline(f31.d)", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompareFloat(f31.d, f1.d);", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("crv0 = PpcCrvCompareFloat(PPC_PsToScalarInline(f31.d)", code, StringComparison.Ordinal);
     }
 }

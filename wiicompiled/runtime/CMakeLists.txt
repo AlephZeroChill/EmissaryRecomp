@@ -503,6 +503,11 @@ target_include_directories(mkw_cr_logical_tests PRIVATE "${CMAKE_CURRENT_LIST_DI
 target_compile_features(mkw_cr_logical_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_cr_logical_tests COMMAND mkw_cr_logical_tests)
 
+add_executable(mkw_cr_field_tests EXCLUDE_FROM_ALL "${CMAKE_CURRENT_LIST_DIR}/tests/cr_field_tests.cpp")
+target_include_directories(mkw_cr_field_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_cr_field_tests PRIVATE cxx_std_20)
+add_test(NAME mkw_cr_field_tests COMMAND mkw_cr_field_tests)
+
 option(MKW_BUILD_SNAPSHOT_TESTS "Build snapshot reference-image tests" OFF)
 if(MKW_BUILD_SNAPSHOT_TESTS)
     add_executable(mkw_snapshot_store_tests tests/snapshot_store_tests.cpp)

@@ -818,13 +818,18 @@ public sealed partial class CxxLinearCodeGenerator
         }
     }
 
+    private static readonly System.Text.RegularExpressions.Regex LeafCrFieldRegex = new(
+        @"ctx->crv\[([0-7])\]", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex LeafCrFieldWriteRegex = new(
+        @"ctx->crv\[[0-7]\] =(?!=)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     private static string ApplyLeafRegisterCache(
         string code,
         string cxxName,
         LeafRegisterCache registers,
         LeafRegisterCacheInitializers initializers)
     {
-        var cacheCr = false;
+        byte cacheCrFields = 0;
         var cacheXer = false;
         var cacheCtr = false;
         var writeCr = false;
@@ -832,25 +837,25 @@ public sealed partial class CxxLinearCodeGenerator
         var writeCtr = false;
         if (registers.CacheSpecialRegisters)
         {
-            // GetCRBit(ctx, field, bit) is raw C++ text, not a register operand, so it must be
-            // listed explicitly: a body that only reads CR through it still needs cached_cr to
-            // exist, and one that also writes CR must not leave that read on stale ctx->cr.
-            cacheCr = code.Contains("cached_cr", StringComparison.Ordinal) ||
-                      code.Contains("ctx->cr", StringComparison.Ordinal) ||
-                      code.Contains("SetCR(ctx,", StringComparison.Ordinal) ||
-                      code.Contains("SetCRFloat(ctx,", StringComparison.Ordinal) ||
-                      code.Contains("GetCRBit(ctx,", StringComparison.Ordinal);
+            // CR is per field in CpuContext (isa/ppc_isa_crv.h), and the emitter writes every access to it as
+            // ctx->crv[N] (CrFieldExpression, branch conditions' GetCRBit included), so the fields to cache are
+            // the ones named. Any write (a field assignment, or a whole-CR PpcCrView) writes all of them back,
+            // as the packed word was: an unmodified field stores the value it was loaded with.
+            foreach (System.Text.RegularExpressions.Match match in LeafCrFieldRegex.Matches(code))
+                cacheCrFields |= (byte)(1 << (match.Groups[1].Value[0] - '0'));
+            if (code.Contains("SetCR(ctx,", StringComparison.Ordinal) ||
+                code.Contains("SetCRFloat(ctx,", StringComparison.Ordinal) ||
+                code.Contains("GetCRBit(ctx,", StringComparison.Ordinal) ||
+                code.Contains("ctx->cr ", StringComparison.Ordinal) ||
+                code.Contains("ctx->cr)", StringComparison.Ordinal) ||
+                code.Contains("ctx->cr;", StringComparison.Ordinal))
+                throw new InvalidOperationException($"{cxxName}: CR access in the packed form CpuContext no longer has");
             cacheXer = code.Contains("cached_xer", StringComparison.Ordinal) ||
-                       code.Contains("ctx->xer", StringComparison.Ordinal) ||
-                       code.Contains("SetCR(ctx,", StringComparison.Ordinal);
+                       code.Contains("ctx->xer", StringComparison.Ordinal);
             cacheCtr = code.Contains("cached_ctr", StringComparison.Ordinal) ||
                        code.Contains("ctx->ctr", StringComparison.Ordinal);
-            writeCr = code.Contains("SetCR(ctx,", StringComparison.Ordinal) ||
-                      code.Contains("SetCRFloat(ctx,", StringComparison.Ordinal) ||
-                      code.Contains("ctx->cr =", StringComparison.Ordinal) ||
-                      code.Contains("ctx->cr |=", StringComparison.Ordinal) ||
-                      code.Contains("ctx->cr &=", StringComparison.Ordinal) ||
-                      code.Contains("ctx->cr ^=", StringComparison.Ordinal);
+            writeCr = cacheCrFields != 0 &&
+                      (LeafCrFieldWriteRegex.IsMatch(code) || code.Contains("PpcCrView(", StringComparison.Ordinal));
             writeXer = code.Contains("ctx->xer =", StringComparison.Ordinal) ||
                        code.Contains("ctx->xer |=", StringComparison.Ordinal) ||
                        code.Contains("ctx->xer &=", StringComparison.Ordinal) ||
@@ -861,14 +866,8 @@ public sealed partial class CxxLinearCodeGenerator
                        code.Contains("ctx->ctr |=", StringComparison.Ordinal) ||
                        code.Contains("ctx->ctr &=", StringComparison.Ordinal) ||
                        code.Contains("ctx->ctr ^=", StringComparison.Ordinal);
-            if (cacheCr && cacheXer)
-                code = code.Replace("SetCR(ctx,", "SetCRResident(cached_cr, cached_xer,", StringComparison.Ordinal);
-            if (cacheCr)
-            {
-                code = code.Replace("SetCRFloat(ctx,", "SetCRFloatResident(cached_cr,", StringComparison.Ordinal);
-                code = code.Replace("GetCRBit(ctx,", "GetCRBitResident(cached_cr,", StringComparison.Ordinal);
-                code = code.Replace("ctx->cr", "cached_cr", StringComparison.Ordinal);
-            }
+            if (cacheCrFields != 0)
+                code = LeafCrFieldRegex.Replace(code, static match => $"cached_crv{match.Groups[1].Value}");
             if (cacheXer)
                 code = code.Replace("ctx->xer", "cached_xer", StringComparison.Ordinal);
             if (cacheCtr)
@@ -885,6 +884,7 @@ public sealed partial class CxxLinearCodeGenerator
         }
 
         registers = PruneUnusedRegisterCache(code, registers);
+        var cacheCr = cacheCrFields != 0;
         if (registers.IsEmpty && !cacheCr && !cacheXer && !cacheCtr)
         {
             return code;
@@ -892,13 +892,17 @@ public sealed partial class CxxLinearCodeGenerator
 
         var declarationsBuilder = new StringBuilder(
             BuildLeafRegisterCacheDeclarations(registers, initializers));
-        if (cacheCr) declarationsBuilder.AppendLine("    uint32_t cached_cr = ctx->cr;");
+        for (var field = 0; field < 8; ++field)
+            if ((cacheCrFields & (1 << field)) != 0)
+                declarationsBuilder.AppendLine($"    int64_t cached_crv{field} = ctx->crv[{field}];");
         if (cacheXer) declarationsBuilder.AppendLine("    uint32_t cached_xer = ctx->xer;");
         if (cacheCtr) declarationsBuilder.AppendLine("    uint32_t cached_ctr = ctx->ctr;");
         if (cacheCr || cacheXer || cacheCtr) declarationsBuilder.AppendLine();
         var declarations = declarationsBuilder.ToString();
         var returnFlushBuilder = new StringBuilder(BuildLeafRegisterCacheFlush(registers));
-        if (writeCr) returnFlushBuilder.AppendLine("    ctx->cr = cached_cr;");
+        for (var field = 0; field < 8; ++field)
+            if (writeCr && (cacheCrFields & (1 << field)) != 0)
+                returnFlushBuilder.AppendLine($"    ctx->crv[{field}] = cached_crv{field};");
         if (writeXer) returnFlushBuilder.AppendLine("    ctx->xer = cached_xer;");
         if (writeCtr) returnFlushBuilder.AppendLine("    ctx->ctr = cached_ctr;");
         var returnFlush = returnFlushBuilder.ToString();

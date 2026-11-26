@@ -1,10 +1,12 @@
 #pragma once
+#include "ppc_isa_crv.h"
 #include "ppc_isa_fpenv.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string_view>
 
@@ -29,8 +31,11 @@ struct CpuContext {
     // Standard GPRs
     uint32_t gpr[32];
 
+    // Condition Register: one value per field, cr0 first (isa/ppc_isa_crv.h). The packed word:
+    // PpcGetCr / PpcSetCr.
+    int64_t  crv[8];
+
     // Special Purpose Registers defined by standard PPC
-    uint32_t cr;        // Condition Register
     uint32_t lr;        // Link Register
     uint32_t ctr;       // Count Register
     uint32_t xer;       // Integer Exception Register
@@ -52,6 +57,20 @@ struct CpuContext {
     uint32_t srr1;      // Save/Restore Register 1
     uint32_t msr;       // Machine State Register
 };
+
+// The packed 32-bit CR (mfcr's value, cr0 in the top nibble), and setting all eight fields from one.
+inline uint32_t PpcGetCr(const CpuContext* cpu) noexcept { return PpcCrvPack(cpu->crv); }
+inline void PpcSetCr(CpuContext* cpu, uint32_t cr) noexcept { PpcCrvUnpack(cr, cpu->crv); }
+
+// Two contexts with the same registers. A CR field has many values for one 4-bit value (a compare's is the
+// operands' difference), so the fields compare by what they read as, never bytewise.
+inline bool PpcSameCpuContext(const CpuContext& a, const CpuContext& b) noexcept {
+    for (uint32_t i = 0; i < 8; ++i)
+        if (PpcCrvNibble(a.crv[i]) != PpcCrvNibble(b.crv[i])) return false;
+    CpuContext x = a, y = b;
+    for (uint32_t i = 0; i < 8; ++i) x.crv[i] = y.crv[i] = 0;
+    return std::memcmp(&x, &y, sizeof(CpuContext)) == 0;
+}
 
 inline thread_local CpuContext* g_currentCpuContext = nullptr;
 
@@ -142,51 +161,20 @@ void MarkFatalErrorReported();
 #define MKW_LEAN_FLAGS 0  // isa/ppc_isa_cr.h: compares leave SO clear (translated code never sets XER[SO])
 #endif
 
-// Helper to set CR bits (Signed)
+// A compare into a CR field (signed, unsigned), SO from XER[SO].
 inline void SetCR(CpuContext* cpu, int field, int32_t a, int32_t b) {
-    uint32_t crField = 0;
-    if (a < b) crField |= 0x8; // LT
-    if (a > b) crField |= 0x4; // GT
-    if (a == b) crField |= 0x2; // EQ
-    if (!MKW_LEAN_FLAGS) crField |= (cpu->xer >> 31) & 1u; // SO
-    
-    int shift = (7 - field) * 4;
-    uint32_t mask = 0xF << shift;
-    cpu->cr = (cpu->cr & ~mask) | (crField << shift);
+    cpu->crv[field & 7] = PpcCrvCompare(a, b, cpu->xer);
 }
-
-// Helper to set CR bits (Unsigned)
 inline void SetCR(CpuContext* cpu, int field, uint32_t a, uint32_t b) {
-    uint32_t crField = 0;
-    if (a < b) crField |= 0x8; // LT
-    if (a > b) crField |= 0x4; // GT
-    if (a == b) crField |= 0x2; // EQ
-    if (!MKW_LEAN_FLAGS) crField |= (cpu->xer >> 31) & 1u; // SO
-    
-    int shift = (7 - field) * 4;
-    uint32_t mask = 0xF << shift;
-    cpu->cr = (cpu->cr & ~mask) | (crField << shift);
+    cpu->crv[field & 7] = PpcCrvCompare(a, b, cpu->xer);
 }
 
-// Helper to set CR bits (Floating-point)
+// A floating-point compare into a CR field: unordered (a NaN) sets SO alone.
 inline void SetCRFloat(CpuContext* cpu, int field, double a, double b) {
-    uint32_t crField = 0;
-    if (std::isnan(a) || std::isnan(b)) {
-        // Unordered: LT/GT/EQ clear, SO set.
-        crField = 0x1;
-    } else {
-        if (a < b) crField |= 0x8; // LT
-        if (a > b) crField |= 0x4; // GT
-        if (a == b) crField |= 0x2; // EQ
-    }
-
-    int shift = (7 - field) * 4;
-    uint32_t mask = 0xF << shift;
-    cpu->cr = (cpu->cr & ~mask) | (crField << shift);
+    cpu->crv[field & 7] = PpcCrvCompareFloat(a, b);
 }
 
-// Helper to get CR bit
+// One CR bit (bit: 0 LT, 1 GT, 2 EQ, 3 SO).
 inline bool GetCRBit(CpuContext* cpu, int field, int bit) {
-    int shift = (7 - field) * 4 + (3 - bit);
-    return (cpu->cr >> shift) & 1;
+    return PpcCrvBit(cpu->crv[field & 7], static_cast<uint32_t>(bit));
 }

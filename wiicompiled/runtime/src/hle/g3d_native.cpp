@@ -1916,7 +1916,9 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     // registers.
     uint32_t gpr[13];
     std::memcpy(gpr, ctx->gpr, sizeof(gpr));
-    const uint32_t cr = ctx->cr, xer = ctx->xer, ctr = ctx->ctr, lr = ctx->lr;
+    const uint32_t xer = ctx->xer, ctr = ctx->ctr, lr = ctx->lr;
+    int64_t crv[8];
+    std::memcpy(crv, ctx->crv, sizeof(crv));
     Snapshot before, afterNative, afterGuest;
     before.Take();
     s_rec.clear();
@@ -1931,7 +1933,7 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     afterNative.Take();
     before.Restore();
     std::memcpy(ctx->gpr, gpr, sizeof(gpr));
-    ctx->cr = cr;
+    std::memcpy(ctx->crv, crv, sizeof(crv));
     ctx->xer = xer;
     ctx->ctr = ctr;
     ctx->lr = lr;

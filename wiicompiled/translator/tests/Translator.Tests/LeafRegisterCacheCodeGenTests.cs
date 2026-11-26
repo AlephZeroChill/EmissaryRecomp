@@ -56,11 +56,11 @@ public class LeafRegisterCacheCodeGenTests
 
         var code = Emit(function, types, 0x8000622Au);
 
-        Assert.Contains("uint32_t cr = ctx->cr;", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0,", code, StringComparison.Ordinal);
-        Assert.Contains("GetCRBitResident(cr, 0, 0)", code, StringComparison.Ordinal);
+        Assert.Contains("int64_t crv0 = ctx->crv[0];", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(", code, StringComparison.Ordinal);
+        Assert.Contains("PpcCrvBit(crv0, 0u)", code, StringComparison.Ordinal);
         Assert.DoesNotContain("GetCRBit(ctx,", code, StringComparison.Ordinal);
-        Assert.Contains("    ctx->cr = cr;", code, StringComparison.Ordinal);
+        Assert.Contains("    ctx->crv[0] = crv0;", code, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -92,9 +92,9 @@ public class LeafRegisterCacheCodeGenTests
 
         var code = Emit(function, types, 0x8000622Cu);
 
-        Assert.Contains("uint32_t cr = ctx->cr;", code, StringComparison.Ordinal);
-        Assert.Contains("GetCRBitResident(cr, 1, 2)", code, StringComparison.Ordinal);
+        Assert.Contains("int64_t crv1 = ctx->crv[1];", code, StringComparison.Ordinal);
+        Assert.Contains("PpcCrvBit(crv1, 2u)", code, StringComparison.Ordinal);
         Assert.DoesNotContain("GetCRBit(ctx,", code, StringComparison.Ordinal);
-        Assert.DoesNotContain("ctx->cr = cr;", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("ctx->crv[1] = crv1;", code, StringComparison.Ordinal);
     }
 }

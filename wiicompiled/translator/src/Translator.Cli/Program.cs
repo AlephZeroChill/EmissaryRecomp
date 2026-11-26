@@ -245,7 +245,9 @@ int RunTranslateRecursive(string[] argsTail)
         }
     }
     // Mod support (guest code guards) needs every call to enter through func_<addr>, never a state-free variant.
-    var disableStateFreeAbi = HasFlag(argsTail, "--no-state-free-abi");
+    // Always off now: CpuContext keeps CR per field (isa/ppc_isa_crv.h), and the state-free ABI's explicit-state
+    // signature still passes the packed word (native_cr). Every build passed --no-state-free-abi already.
+    var disableStateFreeAbi = true || HasFlag(argsTail, "--no-state-free-abi");
     // Translations of functions as a mod's fixed code patches leave them (CodeVariants.cs), after the base emission.
     var codeVariantSpecPath = OptionValue(argsTail, "--code-variants");
     var codeVariantOutDir = OptionValue(argsTail, "--code-variants-out") ??

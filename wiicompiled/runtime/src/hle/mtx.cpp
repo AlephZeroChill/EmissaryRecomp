@@ -596,8 +596,7 @@ inline void MarkStores(uint8_t* dirty, uint32_t canonical, uint32_t last)
     f7 = PairMadd(f2, f12, f7);
     f8 = PairMsub(f0, f3, f8);
     f7 = PairMadd(f4, f11, f7);
-    uint32_t cr = ctx->cr;
-    SetCRFloatResident(cr, 0, PpcGetPs0Inline(f7), PpcGetPs0Inline(f6));  // fcmpu cr0, f7, f6
+    const int64_t cr0 = PpcCrvCompareFloat(PpcGetPs0Inline(f7), PpcGetPs0Inline(f6));  // fcmpu cr0, f7, f6
     const bool singular = (cr & 0x20000000u) != 0;
     double stored0 = 0.0, stored1 = 0.0;
     if (!singular) {
@@ -641,7 +640,7 @@ inline void MarkStores(uint8_t* dirty, uint32_t canonical, uint32_t last)
         MarkStores(dirty, dst, 44);
     }
     ctx->gpr[3] = singular ? 0u : 1u;
-    ctx->cr = cr;
+    ctx->crv[0] = cr0;
     const double out[14] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13};
     for (int i = 0; i < 14; ++i) ctx->fpr[i].d = out[i];
     return true;
@@ -1082,7 +1081,8 @@ bool SameRegisters(const CpuContext& in, const CpuContext& original, const CpuCo
             return false;
     }
     if (native.lr != original.lr) return false;
-    if (((native.cr ^ original.cr) & (0x00FFF000u | (original.cr ^ in.cr))) != 0) return false;
+    if (((PpcGetCr(&native) ^ PpcGetCr(&original)) & (0x00FFF000u | (PpcGetCr(&original) ^ PpcGetCr(&in)))) != 0)
+        return false;
     if (native.ctr != original.ctr && original.ctr != in.ctr) return false;
     if (native.xer != original.xer && original.xer != in.xer) return false;
     if (native.fpscr != original.fpscr && original.fpscr != in.fpscr) return false;

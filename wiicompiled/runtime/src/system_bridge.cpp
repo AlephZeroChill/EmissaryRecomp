@@ -552,7 +552,7 @@ void SystemBridge::DumpCpuState(std::ostream& os, const CpuContext* cpu) {
     os << "[runtime] PC=0x" << Hex32(cpu->pc)
        << " LR=0x" << Hex32(cpu->lr)
        << " CTR=0x" << Hex32(cpu->ctr)
-       << " CR=0x" << Hex32(cpu->cr)
+       << " CR=0x" << Hex32(PpcGetCr(cpu))
        << " XER=0x" << Hex32(cpu->xer) << std::endl;
     os << "[runtime] SRR0=0x" << Hex32(cpu->srr0)
        << " SRR1=0x" << Hex32(cpu->srr1) << std::endl;

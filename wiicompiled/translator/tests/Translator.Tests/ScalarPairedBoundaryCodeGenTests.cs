@@ -148,7 +148,7 @@ public class ScalarPairedBoundaryCodeGenTests
 
         Assert.True(call >= 0, code);
         Assert.Contains(
-            "SetCRFloatResident(cr, 0, f1.d, f14.d);",
+            "crv0 = PpcCrvCompareFloat(f1.d, f14.d);",
             code[call..],
             StringComparison.Ordinal);
         Assert.Contains(
@@ -168,7 +168,7 @@ public class ScalarPairedBoundaryCodeGenTests
 
         Assert.True(call >= 0, code);
         Assert.Contains(
-            "SetCRFloatResident(cr, 0, f1.d, f14.d);",
+            "crv0 = PpcCrvCompareFloat(f1.d, f14.d);",
             code[call..],
             StringComparison.Ordinal);
         Assert.Contains(

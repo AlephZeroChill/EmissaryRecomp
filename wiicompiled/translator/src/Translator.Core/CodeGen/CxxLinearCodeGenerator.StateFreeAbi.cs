@@ -334,7 +334,7 @@ public sealed partial class CxxLinearCodeGenerator
             if (((contract.FprReadBeforeWriteMask | contract.FprPossibleWriteMask) & (1u << fpr)) != 0)
                 arguments.Add(residency is null ? $"ctx->fpr[{fpr}]" : residency.FprStorage(fpr, written: false));
         if (contract.CrReadBeforeWriteMask != 0 || contract.CrPossibleWriteMask != 0)
-            arguments.Add(residency is null ? "ctx->cr" : residency.Cr(written: false));
+            arguments.Add(CrWholeExpression(written: false));
         if (contract.ReadsXerBeforeWrite || contract.MayWriteXer) arguments.Add(residency is null ? "ctx->xer" : residency.Xer(written: false));
         if (contract.ReadsCtrBeforeWrite || contract.MayWriteCtr) arguments.Add(residency is null ? "ctx->ctr" : residency.Ctr(written: false));
         // LR, FPSCR, the GQRs and the HID registers are never localized, so they
@@ -382,7 +382,7 @@ public sealed partial class CxxLinearCodeGenerator
                 sb.AppendLine($"{pad}{residency?.FprStorage(fpr, written: true) ?? $"ctx->fpr[{fpr}]"}.raw = static_cast<uint64_t>({value});");
             }
         if (contract.CrPossibleWriteMask != 0)
-            sb.AppendLine($"{pad}{residency?.Cr(written: true) ?? "ctx->cr"} = static_cast<uint32_t>({Value("cr")});");
+            sb.AppendLine($"{pad}{CrWholeExpression(written: true)} = static_cast<uint32_t>({Value("cr")});");
         if (contract.MayWriteXer)
             sb.AppendLine($"{pad}{residency?.Xer(written: true) ?? "ctx->xer"} = static_cast<uint32_t>({Value("xer")});");
         if (contract.MayWriteCtr)

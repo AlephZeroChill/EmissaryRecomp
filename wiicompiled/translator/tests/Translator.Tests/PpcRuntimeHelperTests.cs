@@ -46,7 +46,7 @@ public class PpcRuntimeHelperTests
                 constexpr uint32_t entry = 0x80003000;
                 Memory::Write32(entry + 4, 0x4E800020);
                 for (bool interpreted : {false, true}) for (const auto& t : cases) {
-                    CpuContext cpu{}; cpu.fpscr = t.before; cpu.cr = 0x12345678;
+                    CpuContext cpu{}; cpu.fpscr = t.before; PpcSetCr(&cpu, 0x12345678);
                     cpu.lr = 0x80004000; cpu.gpr[1] = 0x80008000; cpu.fpr[2].raw = t.value;
                     CpuContextScope scope(&cpu);
                     if (interpreted) {
@@ -69,9 +69,9 @@ public class PpcRuntimeHelperTests
                         case Cr: PPC_Mcrfs(3, t.arg); break;
                         }
                     }
-                    if (cpu.fpscr != t.after || cpu.cr != t.cr) {
+                    if (cpu.fpscr != t.after || PpcGetCr(&cpu) != t.cr) {
                         std::cerr << interpreted << ':' << t.op << " FPSCR " << std::hex << cpu.fpscr
-                                  << " expected " << t.after << " CR " << cpu.cr << " expected " << t.cr;
+                                  << " expected " << t.after << " CR " << PpcGetCr(&cpu) << " expected " << t.cr;
                         std::abort();
                     }
                 }

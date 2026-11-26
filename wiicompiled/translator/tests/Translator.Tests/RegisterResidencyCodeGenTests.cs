@@ -187,12 +187,12 @@ public class RegisterResidencyCodeGenTests
 
         var code = Emit(function);
 
-        Assert.Contains("uint32_t cr = ctx->cr;", code, StringComparison.Ordinal);
+        Assert.Contains("int64_t crv0 = ctx->crv[0];", code, StringComparison.Ordinal);
         Assert.Contains("uint32_t ctr = ctx->ctr;", code, StringComparison.Ordinal);
         Assert.Contains("uint32_t xer = ctx->xer;", code, StringComparison.Ordinal);
-        Assert.Contains("SetCRResident(cr, xer, 0,", code, StringComparison.Ordinal);
+        Assert.Contains("crv0 = PpcCrvCompare(", code, StringComparison.Ordinal);
         Assert.Contains("if ((ctr != 0))", code, StringComparison.Ordinal);
-        Assert.Contains("    ctx->cr = cr;", code, StringComparison.Ordinal);
+        Assert.Contains("    ctx->crv[0] = crv0;", code, StringComparison.Ordinal);
         Assert.Contains("    ctx->ctr = ctr;", code, StringComparison.Ordinal);
         Assert.DoesNotContain("SetCR(ctx,", code, StringComparison.Ordinal);
     }
@@ -219,7 +219,7 @@ public class RegisterResidencyCodeGenTests
         var code = Emit(function);
 
         Assert.Contains("(((ctr != 0)) ^ false)", code, StringComparison.Ordinal);
-        Assert.Contains("GetCRBitResident(cr, 0, 2)", code, StringComparison.Ordinal);
+        Assert.Contains("PpcCrvBit(crv0, 2u)", code, StringComparison.Ordinal);
         Assert.DoesNotContain("ctx->ctr !=", code, StringComparison.Ordinal);
         Assert.DoesNotContain("GetCRBit(ctx,", code, StringComparison.Ordinal);
     }
@@ -337,11 +337,11 @@ public class RegisterResidencyCodeGenTests
     }
 
     [Fact]
-    public void BoundaryNarrowingSyncsConditionAndCountRegistersOnAnyIntersectingField()
+    public void BoundaryNarrowingSyncsOnlyTheConditionRegisterFieldsTheCalleeTouches()
     {
-        // The contract describes CR per field while the local is the packed
-        // register, so a single intersecting field forces the whole sync. CTR is
-        // synced whenever the contract cannot prove the callee leaves it alone.
+        // CR is per field in CpuContext and in the locals, so a call publishes a field only when the callee
+        // may read or write it, and reloads it only when the callee may write it. CTR is synced whenever the
+        // contract cannot prove the callee leaves it alone.
         var function = new IrFunction("narrowed_special", "entry", new[]
         {
             new IrBasicBlock("entry", new IrInstruction[]
@@ -360,18 +360,30 @@ public class RegisterResidencyCodeGenTests
                 guestAbiContracts: new Dictionary<uint, GuestAbiContract> { [0x80002000u] = contract }),
             "narrowed_special");
 
-        var touched = BodyFor(NarrowContract(crRead: 1 << 5, crWrite: 1 << 1, writesCtr: true));
-        Assert.Contains("ctx->cr = cr;", touched, StringComparison.Ordinal);
-        Assert.Contains("    cr = ctx->cr;", touched, StringComparison.Ordinal);
+        var touched = BodyFor(NarrowContract(crRead: 1 << 2, crWrite: 1 << 2, writesCtr: true));
+        Assert.Contains("ctx->crv[2] = crv2;", touched, StringComparison.Ordinal);
+        Assert.Contains("    crv2 = ctx->crv[2];", touched, StringComparison.Ordinal);
         Assert.Contains("ctx->ctr = ctr;", touched, StringComparison.Ordinal);
         Assert.Contains("    ctr = ctx->ctr;", touched, StringComparison.Ordinal);
+
+        // Other fields (cr1, cr5) leave cr2 in its local across the call.
+        var otherFields = BodyFor(NarrowContract(crRead: 1 << 5, crWrite: 1 << 1));
+        var otherCall = otherFields.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
+        Assert.DoesNotContain("ctx->crv[2] = crv2;", otherFields[..otherCall], StringComparison.Ordinal);
+        Assert.DoesNotContain("    crv2 = ctx->crv[2];", otherFields[otherCall..], StringComparison.Ordinal);
+
+        // Read only: published, not reloaded.
+        var readOnly = BodyFor(NarrowContract(crRead: 1 << 2));
+        var readCall = readOnly.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
+        Assert.Contains("ctx->crv[2] = crv2;", readOnly[..readCall], StringComparison.Ordinal);
+        Assert.DoesNotContain("    crv2 = ctx->crv[2];", readOnly[readCall..], StringComparison.Ordinal);
 
         var untouched = BodyFor(NarrowContract(gprWrite: 1u << 3));
         var call = untouched.IndexOf("InvokeDirectCpu<0x80002000u>(ctx);", StringComparison.Ordinal);
         // The exit flush still publishes CR/CTR; only the call boundary drops it.
-        Assert.DoesNotContain("ctx->cr = cr;", untouched[..call], StringComparison.Ordinal);
+        Assert.DoesNotContain("ctx->crv[2] = crv2;", untouched[..call], StringComparison.Ordinal);
         Assert.DoesNotContain("ctx->ctr = ctr;", untouched[..call], StringComparison.Ordinal);
-        Assert.DoesNotContain("    cr = ctx->cr;", untouched[call..], StringComparison.Ordinal);
+        Assert.DoesNotContain("    crv2 = ctx->crv[2];", untouched[call..], StringComparison.Ordinal);
         Assert.DoesNotContain("    ctr = ctx->ctr;", untouched[call..], StringComparison.Ordinal);
     }
 

@@ -260,10 +260,10 @@ void SetPaired(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.form[r] 
 // --- integer helpers -------------------------------------------------------------------------------------------
 
 void SetCr0(CpuContext* c, uint32_t value) {
-    SetCRResident(c->cr, c->xer, 0, static_cast<int32_t>(value), 0);
+    c->crv[0] = PpcCrvCompare(static_cast<int32_t>(value), int32_t{0}, c->xer);
 }
 void SetCr1FromFpscr(CpuContext* c) {
-    c->cr = (c->cr & ~0x0F000000u) | ((c->fpscr >> 4) & 0x0F000000u);
+    c->crv[1] = PpcCrvEncode(c->fpscr >> 28);
 }
 void SetCa(CpuContext* c, bool carry) { c->xer = carry ? (c->xer | kXerCa) : (c->xer & ~kXerCa); }
 bool Ca(const CpuContext* c) { return (c->xer & kXerCa) != 0; }
@@ -329,7 +329,7 @@ bool BranchTaken(CpuContext* c, uint32_t bo, uint32_t bi) {
         --c->ctr;
     }
     const bool ctrOk = (bo & 0x04u) != 0 || ((c->ctr != 0) != ((bo & 0x02u) != 0));
-    const bool condOk = (bo & 0x10u) != 0 || ((((c->cr >> (31u - bi)) & 1u) != 0) == ((bo & 0x08u) != 0));
+    const bool condOk = (bo & 0x10u) != 0 || (PpcCrvBit(c->crv[(bi >> 2) & 7u], bi & 3u) == ((bo & 0x08u) != 0));
     return ctrOk && condOk;
 }
 
@@ -503,7 +503,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
             const bool lane1 = xo10 >= 64;
             const double x = lane1 ? PpcGetPs1Inline(pa) : PpcGetPs0Inline(pa);
             const double y = lane1 ? PpcGetPs1Inline(pb) : PpcGetPs0Inline(pb);
-            SetCRFloatResident(c->cr, static_cast<int>(d >> 2), x, y);
+            c->crv[(static_cast<int>(d >> 2)) & 7] = PpcCrvCompareFloat(x, y);
             break;
         }
         case 40: SetPaired(f, d, PPC_PsNegInline(Paired(f, b))); break;
@@ -551,9 +551,9 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
         SetCa(c, carry);
         break;
     }
-    case 10: SetCRResident(c->cr, c->xer, static_cast<int>(RD(w) >> 2), c->gpr[RA(w)], Uimm(w)); break;  // cmpli
+    case 10: c->crv[(static_cast<int>(RD(w) >> 2)) & 7] = PpcCrvCompare(c->gpr[RA(w)], Uimm(w), c->xer); break;  // cmpli
     case 11:  // cmpi
-        SetCRResident(c->cr, c->xer, static_cast<int>(RD(w) >> 2), static_cast<int32_t>(c->gpr[RA(w)]), Simm(w));
+        c->crv[(static_cast<int>(RD(w) >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(c->gpr[RA(w)]), Simm(w), c->xer);
         break;
     case 12: case 13: {  // addic, addic.
         bool carry, ov;
@@ -598,7 +598,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
     case 19: {
         const uint32_t xo = Bits(w, 1, 10);
         switch (xo) {
-        case 0: c->cr = PpcMcrfResident(c->cr, RD(w) >> 2, RA(w) >> 2); break;  // mcrf
+        case 0: c->crv[(RD(w) >> 2) & 7u] = c->crv[(RA(w) >> 2) & 7u]; break;  // mcrf
         case 16: {  // bclr
             const uint32_t target = c->lr & ~3u;
             if (BranchTaken(c, RD(w), RA(w))) {
@@ -612,10 +612,15 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
             break;
         }
         case 33: case 129: case 193: case 225: case 257: case 289: case 417: case 449:  // crnor..cror
-            c->cr = PpcCrLogicalResident(c->cr, xo == 33 ? 0 : xo == 129 ? 1 : xo == 193 ? 2 : xo == 225 ? 3 :
-                                                xo == 257 ? 4 : xo == 289 ? 5 : xo == 417 ? 6 : 7,
-                                         RD(w), RA(w), RB(w));
+        {
+            const uint32_t op = xo == 33 ? 0 : xo == 129 ? 1 : xo == 193 ? 2 : xo == 225 ? 3 :
+                                xo == 257 ? 4 : xo == 289 ? 5 : xo == 417 ? 6 : 7;
+            const uint32_t bt = RD(w), ba = RA(w), bb = RB(w);
+            c->crv[bt >> 2] = PpcCrvWithBit(c->crv[bt >> 2], bt & 3u,
+                                            PpcCrvLogic(op, PpcCrvBit(c->crv[ba >> 2], ba & 3u),
+                                                        PpcCrvBit(c->crv[bb >> 2], bb & 3u)));
             break;
+        }
         case 50: next = c->srr0; c->msr = c->srr1; break;  // rfi
         case 150: break;  // isync
         case 528: {  // bcctr
@@ -703,10 +708,10 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
             break;
         }
         switch (xo) {
-        case 0: SetCRResident(c->cr, c->xer, static_cast<int>(d >> 2), static_cast<int32_t>(c->gpr[a]), static_cast<int32_t>(c->gpr[b])); break;
-        case 32: SetCRResident(c->cr, c->xer, static_cast<int>(d >> 2), c->gpr[a], c->gpr[b]); break;
+        case 0: c->crv[(static_cast<int>(d >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(c->gpr[a]), static_cast<int32_t>(c->gpr[b]), c->xer); break;
+        case 32: c->crv[(static_cast<int>(d >> 2)) & 7] = PpcCrvCompare(c->gpr[a], c->gpr[b], c->xer); break;
         case 4: break;  // tw
-        case 19: c->gpr[d] = c->cr; break;  // mfcr
+        case 19: c->gpr[d] = PpcGetCr(c); break;  // mfcr
         case 20: case 23: c->gpr[d] = MemoryInline::FlatRead32(EaX(c, w)); break;  // lwarx, lwzx
         case 24: result = PPC_Slw(c->gpr[d], c->gpr[b]); writeA = true; break;
         case 26: result = PPC_CntlzwInline(c->gpr[d]); writeA = true; break;
@@ -720,15 +725,14 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
         case 124: result = ~(c->gpr[d] | c->gpr[b]); writeA = true; break;
         case 144: {  // mtcrf
             const uint32_t crm = Bits(w, 12, 8);
-            uint32_t m = 0;
-            for (int k = 0; k < 8; ++k) if (crm & (0x80u >> k)) m |= 0xF0000000u >> (k * 4);
-            c->cr = (c->cr & ~m) | (c->gpr[d] & m);
+            for (uint32_t k = 0; k < 8; ++k)
+                if (crm & (0x80u >> k)) c->crv[k] = PpcCrvEncode((c->gpr[d] >> (28u - k * 4u)) & 0xFu);
             break;
         }
         case 146: c->msr = c->gpr[d]; break;
         case 150:  // stwcx.: always succeeds (one core, no reservations lost)
             MemoryInline::FlatWrite32(EaX(c, w), c->gpr[d]);
-            c->cr = (c->cr & 0x0FFFFFFFu) | 0x20000000u | ((c->xer & kXerSo) ? 0x10000000u : 0u);
+            c->crv[0] = PpcCrvEncode(0x2u | ((c->xer & kXerSo) ? 0x1u : 0u));
             break;
         case 151: MemoryInline::FlatWrite32(EaX(c, w), c->gpr[d]); break;
         case 183: { const uint32_t ea = EaX(c, w); MemoryInline::FlatWrite32(ea, c->gpr[d]); c->gpr[a] = ea; break; }
@@ -750,8 +754,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
         case 467: WriteSpr(c, (b << 5) | a, c->gpr[d]); break;
         case 476: result = ~(c->gpr[d] & c->gpr[b]); writeA = true; break;
         case 512: {  // mcrxr
-            const uint32_t shift = (7u - (d >> 2)) * 4u;
-            c->cr = (c->cr & ~(0xFu << shift)) | ((c->xer >> 28) << shift);
+            c->crv[(d >> 2) & 7u] = PpcCrvEncode(c->xer >> 28);
             c->xer &= 0x0FFFFFFFu;
             break;
         }
@@ -898,7 +901,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
             break;
         }
         switch (Bits(w, 1, 10)) {
-        case 0: case 32: SetCRFloatResident(c->cr, static_cast<int>(d >> 2), Scalar(f, a), Scalar(f, b)); break;
+        case 0: case 32: c->crv[(static_cast<int>(d >> 2)) & 7] = PpcCrvCompareFloat(Scalar(f, a), Scalar(f, b)); break;
         case 12: SetScalar(f, d, PpcForceSingleValueInline(Scalar(f, b))); break;  // frsp
         case 14: SetScalar(f, d, PPC_Fctiw(Scalar(f, b))); break;
         case 15: SetScalar(f, d, PPC_Fctiwz(Scalar(f, b))); break;
@@ -906,7 +909,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
         case 38: PPC_Mtfsb1(d); break;   // mtfsb1
         case 70: PPC_Mtfsb0(d); break; // mtfsb0
         case 40: SetScalar(f, d, -Scalar(f, b)); break;  // fneg
-        case 64: c->cr = PPC_Mcrfs(d >> 2, a >> 2); break;
+        case 64: PPC_Mcrfs(d >> 2, a >> 2); break;  // writes the field itself
         case 72:  // fmr: copies whichever form the source holds
             c->fpr[d] = c->fpr[b];
             f.form[d] = f.form[b];
@@ -1999,13 +2002,13 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
         if (BranchTaken(c, o.d, o.a)) { at.next = o.imm; return Act::Exit; }
         return Act::Next;
     case K::CmpwiBc:
-        SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), static_cast<int32_t>(r[o.a]), static_cast<int32_t>(o.imm));
+        c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(r[o.a]), static_cast<int32_t>(o.imm), c->xer);
         return FusedBc(c, at);
-    case K::CmplwiBc: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), r[o.a], o.imm); return FusedBc(c, at);
+    case K::CmplwiBc: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(r[o.a], o.imm, c->xer); return FusedBc(c, at);
     case K::CmpwBc:
-        SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), static_cast<int32_t>(r[o.a]), static_cast<int32_t>(r[o.b]));
+        c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(r[o.a]), static_cast<int32_t>(r[o.b]), c->xer);
         return FusedBc(c, at);
-    case K::CmplwBc: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), r[o.a], r[o.b]); return FusedBc(c, at);
+    case K::CmplwBc: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(r[o.a], r[o.b], c->xer); return FusedBc(c, at);
     case K::RlwinmRcBc: r[o.a] = PpcRotl32Inline(r[o.d], o.b) & o.imm; SetCr0(c, r[o.a]); return FusedBc(c, at);
     case K::Jmp: return Act::Next;  // the next op is the target's
     case K::End: at.next = o.imm; return Act::Exit;
@@ -2069,10 +2072,10 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
     case K::Rlwinm: r[o.a] = PpcRotl32Inline(r[o.d], o.b) & o.imm; break;
     case K::RlwinmRc: r[o.a] = PpcRotl32Inline(r[o.d], o.b) & o.imm; SetCr0(c, r[o.a]); break;
     case K::Rlwimi: r[o.a] = (PpcRotl32Inline(r[o.d], o.b) & o.imm) | (r[o.a] & ~o.imm); break;
-    case K::Cmpwi: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), static_cast<int32_t>(r[o.a]), static_cast<int32_t>(o.imm)); break;
-    case K::Cmplwi: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), r[o.a], o.imm); break;
-    case K::Cmpw: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), static_cast<int32_t>(r[o.a]), static_cast<int32_t>(r[o.b])); break;
-    case K::Cmplw: SetCRResident(c->cr, c->xer, static_cast<int>(o.d >> 2), r[o.a], r[o.b]); break;
+    case K::Cmpwi: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(r[o.a]), static_cast<int32_t>(o.imm), c->xer); break;
+    case K::Cmplwi: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(r[o.a], o.imm, c->xer); break;
+    case K::Cmpw: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(static_cast<int32_t>(r[o.a]), static_cast<int32_t>(r[o.b]), c->xer); break;
+    case K::Cmplw: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompare(r[o.a], r[o.b], c->xer); break;
     case K::Add: r[o.d] = r[o.a] + r[o.b]; break;
     case K::Subf: r[o.d] = r[o.b] - r[o.a]; break;
     case K::Neg: r[o.d] = 0u - r[o.a]; break;
@@ -2099,7 +2102,7 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
     case K::Mtlr: c->lr = r[o.d]; break;
     case K::Mfctr: r[o.d] = c->ctr; break;
     case K::Mtctr: c->ctr = r[o.d]; break;
-    case K::Mfcr: r[o.d] = c->cr; break;
+    case K::Mfcr: r[o.d] = PpcGetCr(c); break;
     case K::AndRc: r[o.a] = r[o.d] & r[o.b]; SetCr0(c, r[o.a]); break;
     case K::Subfic: {
         bool carry, ov;
@@ -2164,7 +2167,7 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
     case K::Fabs: SetScalar(f, o.d, std::fabs(Scalar(f, o.b))); break;
     case K::Fmr: c->fpr[o.d] = c->fpr[o.b]; f.form[o.d] = f.form[o.b]; break;
     case K::Frsp: SetScalar(f, o.d, PpcForceSingleValueInline(Scalar(f, o.b))); break;
-    case K::Fcmpu: SetCRFloatResident(c->cr, static_cast<int>(o.d >> 2), Scalar(f, o.a), Scalar(f, o.b)); break;
+    case K::Fcmpu: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompareFloat(Scalar(f, o.a), Scalar(f, o.b)); break;
     case K::PsAdd: SetPaired(f, o.d, PPC_PsAddInline(Paired(f, o.a), Paired(f, o.b))); break;
     case K::PsSub: SetPaired(f, o.d, PPC_PsSubInline(Paired(f, o.a), Paired(f, o.b))); break;
     case K::PsMul: SetPaired(f, o.d, PPC_PsMulInline(Paired(f, o.a), Paired(f, o.imm))); break;
@@ -2207,7 +2210,7 @@ void VerifyOp(Frame& f, const Op& o, uint32_t pc, uint32_t w) {
     (void)Exec(g, pc, w, next, 0);
     RunPlain(f, o, pc);
     const CpuContext& c = *f.ctx;
-    bool same = std::memcmp(c.gpr, shadow.gpr, sizeof(c.gpr)) == 0 && c.cr == shadow.cr && c.lr == shadow.lr &&
+    bool same = std::memcmp(c.gpr, shadow.gpr, sizeof(c.gpr)) == 0 && PpcGetCr(&c) == PpcGetCr(&shadow) && c.lr == shadow.lr &&
                 c.ctr == shadow.ctr && c.xer == shadow.xer && std::memcmp(f.form, g.form, sizeof(g.form)) == 0;
     for (int r = 0; same && r < 32; ++r) same = c.fpr[r].raw == shadow.fpr[r].raw;
     if (!same) {

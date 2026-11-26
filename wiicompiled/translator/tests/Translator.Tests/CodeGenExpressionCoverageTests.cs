@@ -71,8 +71,8 @@ public class CodeGenExpressionCoverageTests
     {
         var types = new RepresentationEnvironment();
 
-        Assert.Equal("ctx->cr", InvokePrivate<string>("RegisterToCtxExpression", "cr", false));
-        Assert.Equal("((ctx->cr >> 0) & 0xF)", InvokePrivate<string>("RegisterToCtxExpression", "cr7", false));
+        Assert.Equal("PpcCrvPack(ctx->crv[0], ctx->crv[1], ctx->crv[2], ctx->crv[3], ctx->crv[4], ctx->crv[5], ctx->crv[6], ctx->crv[7])", InvokePrivate<string>("RegisterToCtxExpression", "cr", false));
+        Assert.Equal("PpcCrvNibble(ctx->crv[7])", InvokePrivate<string>("RegisterToCtxExpression", "cr7", false));
         Assert.Equal("ctx->srr0", InvokePrivate<string>("RegisterToCtxExpression", "srr0", false));
         Assert.Equal("ctx->srr1", InvokePrivate<string>("RegisterToCtxExpression", "srr1", false));
         Assert.Equal("ctx->hid0", InvokePrivate<string>("RegisterToCtxExpression", "hid0", false));
@@ -81,7 +81,7 @@ public class CodeGenExpressionCoverageTests
         Assert.Equal("ctx->gqr[3]", InvokePrivate<string>("RegisterToCtxExpression", "gqr3", false));
         Assert.Equal("0", InvokePrivate<string>("RegisterToCtxExpression", "gqr9", false));
 
-        Assert.Equal("ctx->cr", InvokePrivate<string>("RegisterToCtxExpression", "cr", true));
+        Assert.Equal("PpcCrView(ctx->crv[0], ctx->crv[1], ctx->crv[2], ctx->crv[3], ctx->crv[4], ctx->crv[5], ctx->crv[6], ctx->crv[7])", InvokePrivate<string>("RegisterToCtxExpression", "cr", true));
         Assert.Equal("cr6", InvokePrivate<string>("RegisterToCtxExpression", "cr6", true));
         Assert.Equal("ctx->hid2", InvokePrivate<string>("RegisterToCtxExpression", "hid2", true));
         Assert.Equal("ctx->gqr[5]", InvokePrivate<string>("RegisterToCtxExpression", "gqr5", true));
@@ -92,8 +92,8 @@ public class CodeGenExpressionCoverageTests
 
         Assert.Equal("(ctx->ctr != 0)", InvokePrivate<string>("ToCondition", "bdnz", "ctr", types));
         Assert.Equal("(ctx->ctr == 0)", InvokePrivate<string>("ToCondition", "bdz", "ctr", types));
-        Assert.Equal("((ctx->cr & 0x00000001u) != 0)", InvokePrivate<string>("ToCondition", "bso", "cr7", types));
-        Assert.Equal("((ctx->cr & 0x00000001u) == 0)", InvokePrivate<string>("ToCondition", "bns", "cr7", types));
+        Assert.Equal("(PpcCrvSo(ctx->crv[7]))", InvokePrivate<string>("ToCondition", "bso", "cr7", types));
+        Assert.Equal("(!PpcCrvSo(ctx->crv[7]))", InvokePrivate<string>("ToCondition", "bns", "cr7", types));
         Assert.Equal("flag_local", InvokePrivate<string>("ToCondition", "custom", "flag_local", types));
 
         Assert.Equal("ctx->gpr[4]", InvokePrivate<string>("Address", new IrAddress("r4", 0), types));

@@ -1863,9 +1863,7 @@ void RunAsync(CpuContext* ctx, const Plan& p, const Span& frame, const Span& eff
     double f[7];
     ParamRegisters(p, job.samples, f);
     for (const uint32_t r : {0u, 1u, 3u, 4u, 5u, 6u}) ctx->fpr[r].d = f[r];
-    uint32_t cr = ctx->cr;
-    SetCRResident(cr, ctx->xer, 0, kSamples, kSamples);  // the loop's final cmplwi r31, 96
-    ctx->cr = cr;
+    ctx->crv[0] = PpcCrvCompare(kSamples, kSamples, ctx->xer);  // the loop's final cmplwi r31, 96
     ctx->ctr = 0;
 
     Async::Hold(footprint, footprintCount);  // pending from here
@@ -1927,9 +1925,7 @@ bool Run(CpuContext* ctx) {
         MemoryInline::FlatWrite32(fx + kActive, active & ~2u);
         ctx->gpr[0] = ctx->lr;
         ctx->gpr[11] = r1;
-        uint32_t cr = ctx->cr;
-        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(active), static_cast<int32_t>(0));
-        ctx->cr = cr;
+        ctx->crv[0] = PpcCrvCompare(static_cast<int32_t>(active), static_cast<int32_t>(0), ctx->xer);
         return true;
     }
 
@@ -2065,9 +2061,7 @@ bool Run(CpuContext* ctx) {
     ctx->gpr[11] = r1;
     ctx->gpr[12] = in[0] + kBufferBytes - 4;
     for (uint32_t r = 0; r < 14; ++r) ctx->fpr[r].d = p.f[r];
-    uint32_t cr = ctx->cr;
-    SetCRResident(cr, ctx->xer, 0, kSamples, kSamples);  // the loop's final cmplwi r31, 96
-    ctx->cr = cr;
+    ctx->crv[0] = PpcCrvCompare(kSamples, kSamples, ctx->xer);  // the loop's final cmplwi r31, 96
     ctx->ctr = 0;
     return true;
 }
@@ -2240,9 +2234,7 @@ bool Run(CpuContext* ctx) {
         StorePrologue(ctx, r1);
         MemoryInline::FlatWrite32(fx + kActive, active & ~2u);
         ctx->gpr[0] = active & ~2u;
-        uint32_t cr = ctx->cr;
-        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(active), static_cast<int32_t>(0));
-        ctx->cr = cr;
+        ctx->crv[0] = PpcCrvCompare(static_cast<int32_t>(active), static_cast<int32_t>(0), ctx->xer);
         return true;
     }
 
@@ -2357,9 +2349,7 @@ bool Run(CpuContext* ctx) {
     ctx->gpr[10] = inc2;
     ctx->gpr[11] = 0;
     ctx->gpr[12] = written2;
-    uint32_t cr = ctx->cr;
-    SetCRResident(cr, ctx->xer, 0, inc2, length[2]);  // the last cmplw of the third position
-    ctx->cr = cr;
+    ctx->crv[0] = PpcCrvCompare(inc2, length[2], ctx->xer);  // the last cmplw of the third position
     // srawi's carry from the last output product.
     const bool carry = (product2 & 0x80000000u) != 0 && (product2 & 0x7Fu) != 0;
     ctx->xer = (ctx->xer & 0xDFFFFFFFu) | (static_cast<uint32_t>(carry) << 29);
@@ -2872,7 +2862,7 @@ void LogContextMismatch(const char* name, const CpuContext& want, const CpuConte
             RT_LOGF(RT_TAG_AUDIO, "axfx MISMATCH %s: f%u original %016" PRIX64 " native %016" PRIX64 "\n", name, r,
                     want.fpr[r].raw, got.fpr[r].raw);
     const struct { const char* field; uint32_t a, b; } spr[] = {
-        {"cr", want.cr, got.cr}, {"lr", want.lr, got.lr}, {"ctr", want.ctr, got.ctr}, {"xer", want.xer, got.xer},
+        {"cr", PpcGetCr(&want), PpcGetCr(&got)}, {"lr", want.lr, got.lr}, {"ctr", want.ctr, got.ctr}, {"xer", want.xer, got.xer},
         {"fpscr", want.fpscr, got.fpscr}, {"pc", want.pc, got.pc}, {"msr", want.msr, got.msr}};
     for (const auto& s : spr)
         if (s.a != s.b) RT_LOGF(RT_TAG_AUDIO, "axfx MISMATCH %s: %s original %08X native %08X\n", name, s.field, s.a, s.b);
@@ -2883,7 +2873,7 @@ void LogContextMismatch(const char* name, const CpuContext& want, const CpuConte
 // read, where the natives leave P+'s whole register file: there r1, r2, r13-r31, f14-f31, LR, CR fields 2-4, the GQRs
 // and the special registers past them always, and any other register where the original changed it.
 bool SameRegisters(const CpuContext& in, const CpuContext& original, const CpuContext& native) {
-    if (func_801D7AE4_eabi == nullptr) return std::memcmp(&native, &original, sizeof(CpuContext)) == 0;
+    if (func_801D7AE4_eabi == nullptr) return PpcSameCpuContext(native, original);
     for (uint32_t r = 0; r < 32; ++r) {
         const bool kept = r == 1 || r == 2 || r >= 13;
         if (native.gpr[r] != original.gpr[r] && (kept || original.gpr[r] != in.gpr[r])) return false;
@@ -2891,7 +2881,8 @@ bool SameRegisters(const CpuContext& in, const CpuContext& original, const CpuCo
     for (uint32_t f = 0; f < 32; ++f)
         if (native.fpr[f].raw != original.fpr[f].raw && (f >= 14 || original.fpr[f].raw != in.fpr[f].raw)) return false;
     if (native.lr != original.lr) return false;
-    if (((native.cr ^ original.cr) & (0x00FFF000u | (original.cr ^ in.cr))) != 0) return false;
+    if (((PpcGetCr(&native) ^ PpcGetCr(&original)) & (0x00FFF000u | (PpcGetCr(&original) ^ PpcGetCr(&in)))) != 0)
+        return false;
     if (native.ctr != original.ctr && original.ctr != in.ctr) return false;
     if (native.xer != original.xer && original.xer != in.xer) return false;
     if (native.fpscr != original.fpscr && original.fpscr != in.fpscr) return false;

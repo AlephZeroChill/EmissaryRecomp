@@ -114,7 +114,7 @@ extern "C" [[noreturn]] void OS__LoadContext_HLE(CpuContext* ctx)
         }
 
         // ---- Load Special Registers ----
-        cpu->cr  = ::Memory::Read32(guestContextAddr + 0x80u);
+        PpcSetCr(cpu, ::Memory::Read32(guestContextAddr + 0x80u));
         cpu->lr  = ::Memory::Read32(guestContextAddr + 0x84u);
         cpu->ctr = ::Memory::Read32(guestContextAddr + 0x88u);
         cpu->xer = ::Memory::Read32(guestContextAddr + 0x8Cu);
