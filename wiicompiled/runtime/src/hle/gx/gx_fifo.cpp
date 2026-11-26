@@ -489,6 +489,28 @@ bool BuildRawLayout(RawBegin& r, GXVtxFmt fmt) {
     return true;
 }
 
+// A copy of a few bytes (a FIFO store's 1-4, a vertex part's up to 12), inline: memcpy with a variable size is a call
+// to the library's memmove, which was most of the raw path's copying time at one call per store and per part. Exact
+// bounds: two overlapping fixed-size copies cover every length up to 16.
+inline void CopyFew(uint8_t* dst, const uint8_t* src, uint32_t n) {
+    if (n >= 8) {
+        if (n > 16) {
+            std::memcpy(dst, src, n);
+            return;
+        }
+        std::memcpy(dst, src, 8);
+        std::memcpy(dst + n - 8, src + n - 8, 8);
+    } else if (n >= 4) {
+        std::memcpy(dst, src, 4);
+        std::memcpy(dst + n - 4, src + n - 4, 4);
+    } else if (n >= 2) {
+        std::memcpy(dst, src, 2);
+        std::memcpy(dst + n - 2, src + n - 2, 2);
+    } else if (n == 1) {
+        dst[0] = src[0];
+    }
+}
+
 // Big-endian bytes to Aurora's FIFO (check mode: to the comparison buffer).
 inline void RawPut(const RawBegin& r, const uint8_t* p, uint32_t n) {
     if (r.check) {
@@ -508,7 +530,7 @@ bool RawEmitVertex(RawBegin& r) {
         const uint8_t* src = r.vtx + at;
         at += p.guestBytes;
         if (p.kind == kRawDirect || p.kind == kRawMatrix) {
-            std::memcpy(out + n, src, p.guestBytes);
+            CopyFew(out + n, src, p.guestBytes);
             n += p.guestBytes;
             continue;
         }
@@ -563,7 +585,7 @@ void RawFallBack(RawBegin& r, const uint8_t* rest, uint32_t restBytes) {
 void RawBeginBytes(RawBegin& r, const uint8_t* p, uint32_t n) {
     while (n != 0) {
         const uint32_t take = std::min(n, r.vtxBytes - r.have);
-        std::memcpy(r.vtx + r.have, p, take);
+        CopyFew(r.vtx + r.have, p, take);
         r.have += take;
         p += take;
         n -= take;
@@ -680,7 +702,28 @@ extern "C" void GX_HLE_LogRawBeginStats(double frames) {
 // The vertex-state carry (gx_internal.h): FIFO bytes take the state back only at the commands that read or write it -
 // CP register writes, indexed XF loads, display-list calls, and a draw that reads parts this thread has not rewritten
 // since it went pending (GxCarryCanDraw) - not for BP/XF writes or a begun draw's vertex bytes.
+static void HleFifoWriteSlow(u32 val, uint32_t sizeBytes);
+
 void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+#if MKW_HZ_PERF_HOT
+    HleFifoWriteSlow(val, sizeBytes);
+#else
+    // A begin on the raw path (see RawBegin), not in check mode: its stores are gathered there. About half of a
+    // match's FIFO stores (~10k a frame), so they skip the parser's frame below. Only for the begin it was set up for
+    // (GXBegin starts each begin with auroraBeginCalled clear, so a stale raw state is never used); never while a
+    // display list records (the slow path's first test).
+    if (const RawBegin& rb = t_rawBegin;
+        rb.active && !rb.check && g_hleGxState.inBegin && g_hleGxState.auroraBeginCalled && !IsDisplayListActive()) {
+        uint8_t bytes[4];
+        const uint32_t n = StoreBytes(val, sizeBytes, bytes);
+        RawBeginBytes(t_rawBegin, bytes, n);
+        return;
+    }
+    HleFifoWriteSlow(val, sizeBytes);
+#endif
+}
+
+__attribute__((noinline)) static void HleFifoWriteSlow(u32 val, uint32_t sizeBytes) {
     HZ_HOT_PERF_ADD(kHzFifoWrites, 1);
     HZ_HOT_PHASE(kHzFifoTicks);
     const bool recordOnly = IsDisplayListActive();
