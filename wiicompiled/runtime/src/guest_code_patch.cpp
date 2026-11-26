@@ -22,6 +22,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -293,6 +294,21 @@ bool IsEdgePageLocked(uint32_t page) {
                         [&](const auto& range) { return page >= range.first && page + kPage <= range.second; });
 }
 
+// The bytes of `page` a Sync compares, [first, second) from the page's start: the guarded code on it, or the whole page
+// when no guarded range covers it (a code variant's hook bodies) or a code variant has words on it (their words may lie
+// anywhere on the page). Words outside guarded code never mark a function patched, so only variants need the rest.
+std::pair<uint32_t, uint32_t> CompareSpanLocked(uint32_t page) {
+    if (g_variantsEnabled && g_variantsByPage.count(page) != 0) return {0, kPage};
+    uint32_t lo = kPage, hi = 0;
+    for (const auto& [start, end] : g_ranges) {
+        if (end <= page || start >= page + kPage) continue;
+        lo = std::min(lo, start > page ? (start - page) & ~3u : 0u);
+        hi = std::max(hi, end < page + kPage ? ((end - page) + 3u) & ~3u : kPage);
+    }
+    if (lo >= hi) return {0, kPage};
+    return {lo, hi};
+}
+
 // Drain notifications under g_mutex at an ordinary execution boundary. The two
 // summary levels avoid scanning the entire guest address space on every Sync.
 void CollectPendingPagesLocked() {
@@ -482,6 +498,20 @@ void InterpretForHooks(uint32_t address, const char* why) {
             count == 1 ? "" : ": no translated function starts there");
 }
 
+// BRAWL_TRAP_STATS=1 (diagnostic): write notifications per guarded page, the busiest logged every 600 frames (in the
+// flat build each one is a write trap: an exception and a page protection change, and another to guard it again).
+// Project+ keeps a variable in sora_melee's code (0x807824D4, a word its hook jumps over): ~70 traps a frame.
+struct TrapStat {
+    std::atomic<uint32_t> count{0};
+    std::atomic<uint32_t> last{0};  // the last address written there
+    std::atomic<uint32_t> pc{0};    // the guest pc then (an interpreted block's start)
+};
+std::atomic<TrapStat*> g_trapStats{nullptr};  // one per guest page, allocated by Protect when asked for
+bool TrapStats() {
+    static const bool on = std::getenv("BRAWL_TRAP_STATS") != nullptr;
+    return on;
+}
+
 void Protect(uint32_t start, uint32_t end, const char* name) {
     std::call_once(g_variantsOnce, [] {
         InitVariants();
@@ -491,6 +521,9 @@ void Protect(uint32_t start, uint32_t end, const char* name) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (std::find(g_ranges.begin(), g_ranges.end(), std::make_pair(start, end)) != g_ranges.end()) return;
         g_ranges.emplace_back(start, end);
+        // NoteWrite runs in fault recovery and must not allocate: the diagnostic's table is made here, once.
+        if (TrapStats() && g_trapStats.load(std::memory_order_relaxed) == nullptr)
+            g_trapStats.store(new TrapStat[kPageWords * 32], std::memory_order_release);
         SnapshotLocked(start, end);
         for (uint64_t page = start / kPage; page * kPage < end; ++page) {
             g_guardedPages[page / 32].fetch_or(1u << (page % 32), std::memory_order_release);
@@ -507,6 +540,11 @@ bool NoteWrite(uint32_t address) {
     const uint32_t word = page / 32;
     const uint32_t bit = 1u << (page % 32);
     if ((g_guardedPages[word].load(std::memory_order_acquire) & bit) == 0) return false;
+    if (TrapStat* const stats = g_trapStats.load(std::memory_order_acquire)) {
+        stats[page].count.fetch_add(1, std::memory_order_relaxed);
+        stats[page].last.store(address, std::memory_order_relaxed);
+        if (const CpuContext* c = TryGetCpuContext()) stats[page].pc.store(c->pc, std::memory_order_relaxed);
+    }
     g_pendingPages[word].fetch_or(bit, std::memory_order_relaxed);
     g_pendingGroups[word / 32].fetch_or(1u << (word % 32), std::memory_order_release);
     g_pendingRoots[word / 32 / 32].fetch_or(1u << ((word / 32) % 32), std::memory_order_release);
@@ -518,71 +556,124 @@ bool NoteWrite(uint32_t address) {
 
 namespace {
 
-// An edge page's data stores would trap again after every Sync (and Sync follows every patched call): it stays open,
-// compared at each Sync, until the frame's SyncFrame guards it again.
+// An edge page (guarded code and data on one page) whose data stores would trap again after every Sync (and Sync
+// follows every patched call): it stays open, its code compared at each Sync, until the frame's SyncFrame guards it
+// again. Kept apart from the write notifications, so that a Sync with only open edge pages to look at is a compare of
+// their code with what the last Sync saw (no notification scan, no set or allocation): with one open page that was
+// 20% of a P+ match's game thread at ~1,700 patched calls a frame.
+struct OpenEdge {
+    uint32_t page;
+    uint32_t lo, hi;  // CompareSpanLocked
+};
+std::vector<OpenEdge> g_openEdges;          // under g_mutex
+std::atomic<uint32_t> g_openEdgeCount{0};   // g_openEdges.size(), read without the lock
+
+void ForgetOpenEdgeLocked(uint32_t page) {
+    g_openEdges.erase(std::remove_if(g_openEdges.begin(), g_openEdges.end(),
+                                     [&](const OpenEdge& e) { return e.page == page; }),
+                      g_openEdges.end());
+    g_openEdgeCount.store(static_cast<uint32_t>(g_openEdges.size()), std::memory_order_release);
+}
+
+// Compares a written page's code with what the last Sync saw there and handles every changed word.
+void ComparePageLocked(uint32_t page) {
+    Bump(g_stats.pagesCompared);
+    const auto found = g_pristine.find(page);
+    if (found == g_pristine.end() || !Memory::Contains(page, kPage)) return;
+    const uint8_t* now = Memory::GetPointer(page, kPage);
+    const uint8_t* was = found->second->data();
+    auto& seenSlot = g_seen[page];
+    if (!seenSlot) seenSlot = std::make_unique<std::array<uint8_t, kPage>>(*found->second);
+    uint8_t* seen = seenSlot->data();
+    // Only the page's code: an edge page's data (a module's variables after its last code, main.dol's data
+    // after .text) changes all the time, and comparing it made every Sync walk the page word by word.
+    const auto [spanStart, spanEnd] = CompareSpanLocked(page);
+    if (std::memcmp(now + spanStart, seen + spanStart, spanEnd - spanStart) == 0) return;
+    Bump(g_stats.pagesChanged);
+    DirtyVariantsOnPageLocked(page);
+    for (uint32_t offset = spanStart; offset < spanEnd; offset += 4) {
+        if (std::memcmp(now + offset, seen + offset, 4) == 0) continue;
+        std::memcpy(seen + offset, now + offset, 4);
+        if (std::memcmp(now + offset, was + offset, 4) == 0) continue;
+        const uint32_t address = page + offset;
+        if (!IsGuardedLocked(address)) continue;
+        std::memcpy(&g_sites[address], now + offset, 4);
+        // BRAWL_PATCH_LOG: every changed word, once (the pristine copy stays the disc's code).
+        static const bool logWords = std::getenv("BRAWL_PATCH_LOG") != nullptr;
+        if (logWords && g_loggedWords.insert(address).second) {
+            uint32_t before = 0, after = 0;
+            std::memcpy(&before, was + offset, 4);
+            std::memcpy(&after, now + offset, 4);
+            RT_LOGF(RT_TAG_MOD, "[mods] word 0x%08X: %08X -> %08X\n", address, __builtin_bswap32(before),
+                    __builtin_bswap32(after));
+        }
+        const int64_t index = FunctionIndex(address);
+        if (index < 0 || g_mkwGuestCodePatched[index]) continue;
+        g_mkwGuestCodePatched[index] = 1;
+        const uint32_t function = g_mkwGuardedFunctionStarts[index];
+        if (g_reported.insert(function).second) {
+            RT_LOGF(RT_TAG_MOD, "[mods] code at 0x%08X changed: function 0x%08X now runs in the interpreter\n",
+                    address, function);
+        }
+        MarkInliningCallers(static_cast<uint32_t>(index));
+    }
+}
+
 void SyncPages(bool frame) {
-    // Sync follows every patched call: the plain load keeps the usual nothing-pending case off the atomic exchange.
-    if (!g_anyDirty.load(std::memory_order_acquire) || !g_anyDirty.exchange(false, std::memory_order_acq_rel)) return;
-    std::vector<uint32_t> pages;
+    // Sync follows every patched call: the plain loads keep the usual nothing-pending case off the atomic exchange.
+    const bool pending =
+        g_anyDirty.load(std::memory_order_acquire) && g_anyDirty.exchange(false, std::memory_order_acq_rel);
+    if (!pending && g_openEdgeCount.load(std::memory_order_acquire) == 0) return;
+    std::vector<uint32_t> reprotect;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        CollectPendingPagesLocked();
-        if (g_dirty.empty()) return;
-        pages.assign(g_dirty.begin(), g_dirty.end());
-        g_dirty.clear();
-        for (const uint32_t page : pages) {
-            if (!frame && IsEdgePageLocked(page)) g_dirty.insert(page);
-        }
-        // Never clear a notification concurrently published by NoteWrite.
-        if (!g_dirty.empty()) g_anyDirty.store(true, std::memory_order_release);
         HZ_PERF_ADD(kHzSyncWork, 1);
-        HZ_PERF_ADD(kHzPagesCompared, pages.size());
-        Bump(g_stats.pagesCompared, static_cast<uint32_t>(pages.size()));
-        HZ_PERF_SET(kHzEdgeDirty, g_dirty.size());
-        for (const uint32_t page : pages) {
-            const auto found = g_pristine.find(page);
-            if (found == g_pristine.end() || !Memory::Contains(page, kPage)) continue;
-            const uint8_t* now = Memory::GetPointer(page, kPage);
-            const uint8_t* was = found->second->data();
-            auto& seenSlot = g_seen[page];
-            if (!seenSlot) seenSlot = std::make_unique<std::array<uint8_t, kPage>>(*found->second);
-            uint8_t* seen = seenSlot->data();
-            if (std::memcmp(now, seen, kPage) == 0) continue;
-            Bump(g_stats.pagesChanged);
-            DirtyVariantsOnPageLocked(page);
-            for (uint32_t offset = 0; offset < kPage; offset += 4) {
-                if (std::memcmp(now + offset, seen + offset, 4) == 0) continue;
-                std::memcpy(seen + offset, now + offset, 4);
-                if (std::memcmp(now + offset, was + offset, 4) == 0) continue;
-                const uint32_t address = page + offset;
-                if (!IsGuardedLocked(address)) continue;
-                std::memcpy(&g_sites[address], now + offset, 4);
-                // BRAWL_PATCH_LOG: every changed word, once (the pristine copy stays the disc's code).
-                static const bool logWords = std::getenv("BRAWL_PATCH_LOG") != nullptr;
-                if (logWords && g_loggedWords.insert(address).second) {
-                    uint32_t before = 0, after = 0;
-                    std::memcpy(&before, was + offset, 4);
-                    std::memcpy(&after, now + offset, 4);
-                    RT_LOGF(RT_TAG_MOD, "[mods] word 0x%08X: %08X -> %08X\n", address, __builtin_bswap32(before),
-                            __builtin_bswap32(after));
+        // Pages a notification brought (each compared here) and, below, the open edge pages it did not.
+        uint32_t written[8];
+        uint32_t writtenCount = 0;
+        if (pending) {
+            CollectPendingPagesLocked();
+            for (const uint32_t page : g_dirty) {
+                ComparePageLocked(page);
+                if (writtenCount < std::size(written)) written[writtenCount++] = page;
+                // Only where a store to guarded code traps (the flat build's page protection): a build that notices
+                // every store without a trap (lean memory's checked stores) compares an edge page when it is written.
+                if (!frame && GuestFlat::IsActive() && IsEdgePageLocked(page)) {
+                    if (std::none_of(g_openEdges.begin(), g_openEdges.end(),
+                                     [&](const OpenEdge& e) { return e.page == page; })) {
+                        const auto [lo, hi] = CompareSpanLocked(page);
+                        g_openEdges.push_back({page, lo, hi});
+                    }
+                } else {
+                    reprotect.push_back(page);
                 }
-                const int64_t index = FunctionIndex(address);
-                if (index < 0 || g_mkwGuestCodePatched[index]) continue;
-                g_mkwGuestCodePatched[index] = 1;
-                const uint32_t function = g_mkwGuardedFunctionStarts[index];
-                if (g_reported.insert(function).second) {
-                    RT_LOGF(RT_TAG_MOD, "[mods] code at 0x%08X changed: function 0x%08X now runs in the interpreter\n",
-                            address, function);
-                }
-                MarkInliningCallers(static_cast<uint32_t>(index));
+            }
+            HZ_PERF_ADD(kHzPagesCompared, g_dirty.size());
+            g_dirty.clear();
+        }
+        const auto comparedAbove = [&](uint32_t page) {
+            return std::find(written, written + writtenCount, page) != written + writtenCount;
+        };
+        if (frame) {
+            for (const OpenEdge& e : g_openEdges) {
+                if (!comparedAbove(e.page)) ComparePageLocked(e.page);
+                reprotect.push_back(e.page);
+            }
+            g_openEdges.clear();
+        } else {
+            for (const OpenEdge& e : g_openEdges) {
+                if (comparedAbove(e.page)) continue;
+                const auto seen = g_seen.find(e.page);
+                if (seen != g_seen.end() && seen->second && Memory::Contains(e.page, kPage) &&
+                    std::memcmp(Memory::GetPointer(e.page, kPage) + e.lo, seen->second->data() + e.lo, e.hi - e.lo) == 0)
+                    continue;
+                ComparePageLocked(e.page);
             }
         }
-        if (!frame) {
-            pages.erase(std::remove_if(pages.begin(), pages.end(), [](uint32_t page) { return IsEdgePageLocked(page); }),
-                        pages.end());
-        }
+        g_openEdgeCount.store(static_cast<uint32_t>(g_openEdges.size()), std::memory_order_release);
+        HZ_PERF_SET(kHzEdgeDirty, g_openEdges.size());
     }
-    for (const uint32_t page : pages) GuestFlat::ReprotectExecutablePage(page);
+    for (const uint32_t page : reprotect) GuestFlat::ReprotectExecutablePage(page);
 }
 
 } // namespace
@@ -661,6 +752,27 @@ void SyncFrame() {
                      static_cast<unsigned long long>(instructions - lastInstructions));
         lastInstructions = instructions;
     }
+    if (TrapStat* const traps = g_trapStats.load(std::memory_order_acquire)) {
+        static uint32_t frames = 0;
+        if (++frames % 600 == 0) {
+            std::vector<std::pair<uint32_t, uint32_t>> busiest;
+            for (uint32_t page = 0; page < kPageWords * 32; ++page) {
+                const uint32_t n = traps[page].count.exchange(0, std::memory_order_relaxed);
+                if (n) busiest.emplace_back(n, page);
+            }
+            std::sort(busiest.rbegin(), busiest.rend());
+            std::string line;
+            for (size_t i = 0; i < busiest.size() && i < 12; ++i) {
+                char item[64];
+                const TrapStat& t = traps[busiest[i].second];
+                std::snprintf(item, sizeof item, " %08X:%u(last %08X pc %08X)", busiest[i].second * kPage,
+                              busiest[i].first, t.last.load(std::memory_order_relaxed),
+                              t.pc.load(std::memory_order_relaxed));
+                line += item;
+            }
+            RT_LOGF(RT_TAG_MOD, "[mods] trap stats, 600 frames: %zu pages,%s\n", busiest.size(), line.c_str());
+        }
+    }
     HZ_PERF_ADD(kHzFrames, 1);
     HZ_PERF_T0();
     SyncPages(true);
@@ -686,6 +798,7 @@ void ResetPristine(uint32_t start, uint32_t end) {
         RemarkInliningCallersIn(start, end);
         for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
             g_dirty.erase(page);
+            ForgetOpenEdgeLocked(page);
             const uint32_t index = page / kPage;
             g_pendingPages[index / 32].fetch_and(~(1u << (index % 32)), std::memory_order_relaxed);
             DirtyVariantsOnPageLocked(page);  // the relink copied code without the write trap
