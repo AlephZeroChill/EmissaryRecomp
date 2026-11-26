@@ -25,7 +25,6 @@ extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint
 #include "input_bindings.h"
 #include "keybinds.h"
 #include "game_graphics_options.h"
-#include "music_attenuation.h"
 #include "runtime_config.h"
 #include "display_settings.h"
 #include "display_refresh.h"
@@ -112,15 +111,9 @@ bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(2.25f);  // main.cpp's default too
 int g_audioVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::AudioVolume(1.0f) * 100.0f));
-int g_musicVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::MusicVolume(1.0f) * 100.0f));
-int g_soundEffectsVolumePercent =
-    static_cast<int>(std::lround(RuntimeConfigFile::SoundEffectsVolume(1.0f) * 100.0f));
-int g_uiVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::UiVolume(1.0f) * 100.0f));
-int g_voicesVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::VoicesVolume(1.0f) * 100.0f));
 bool g_audioMuted = RuntimeConfigFile::AudioMuted(false);
 int32_t g_muteHotkey = RuntimeConfigFile::MuteHotkey(SDL_SCANCODE_BACKSLASH);
 bool g_audioMixWorker = RuntimeConfigFile::AudioMixWorkerEnabled(true);
-bool g_attenuateMusicWhenMediaPlays = RuntimeConfigFile::AttenuateMusicWhenMediaPlays(false);
 int g_frameInterpolationMode = [] {
     switch (RuntimeConfigFile::FrameInterpolationFps(0)) {
     case 120:
@@ -1076,26 +1069,8 @@ void DrawAudioSettings() {
         AudioBackend::Instance().SetMasterVolume(volume);
         RuntimeConfigFile::SetAudioVolume(volume);
     }
-    if (ImGui::SliderInt("Music", &g_musicVolumePercent, 0, 100, "%d%%")) {
-        const float volume = static_cast<float>(g_musicVolumePercent) / 100.0f;
-        MusicAttenuation::SetMusicVolume(volume);
-        RuntimeConfigFile::SetMusicVolume(volume);
-    }
-    if (ImGui::SliderInt("Sound Effects", &g_soundEffectsVolumePercent, 0, 100, "%d%%")) {
-        const float volume = static_cast<float>(g_soundEffectsVolumePercent) / 100.0f;
-        MusicAttenuation::SetSoundEffectsVolume(volume);
-        RuntimeConfigFile::SetSoundEffectsVolume(volume);
-    }
-    if (ImGui::SliderInt("UI", &g_uiVolumePercent, 0, 100, "%d%%")) {
-        const float volume = static_cast<float>(g_uiVolumePercent) / 100.0f;
-        MusicAttenuation::SetUiVolume(volume);
-        RuntimeConfigFile::SetUiVolume(volume);
-    }
-    if (ImGui::SliderInt("Voices", &g_voicesVolumePercent, 0, 100, "%d%%")) {
-        const float volume = static_cast<float>(g_voicesVolumePercent) / 100.0f;
-        MusicAttenuation::SetVoicesVolume(volume);
-        RuntimeConfigFile::SetVoicesVolume(volume);
-    }
+    // No Music/Sound Effects/UI/Voices sliders or external-media muting: MusicAttenuation finds no sound buses in
+    // Brawl (Mario Kart Wii's), so they did nothing (settings_menu.inc AudioRows).
     const float labelColumn = ImGui::GetCursorPosX() + ImGui::CalcItemWidth();
     if (ImGui::Checkbox("Mute", &g_audioMuted)) {
         AudioBackend::Instance().SetMuted(g_audioMuted);
@@ -1115,34 +1090,6 @@ void DrawAudioSettings() {
         ImGui::SetTooltip(
             "Runs the AX/DSP voice mix off the game thread. Turn this off if you "
             "suspect an audio problem; the mix then runs inline as it used to.");
-    }
-    ImGui::Separator();
-    if (ImGui::Checkbox("Mute game music while external media is playing",
-                        &g_attenuateMusicWhenMediaPlays)) {
-        MusicAttenuation::SetEnabled(g_attenuateMusicWhenMediaPlays);
-        RuntimeConfigFile::SetAttenuateMusicWhenMediaPlays(g_attenuateMusicWhenMediaPlays);
-    }
-#if defined(__APPLE__)
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            "Detects other apps with active audio output on macOS 14.2 or later. "
-            "Apps that keep an output stream running silently may keep game music muted.");
-    }
-#endif
-    if (g_attenuateMusicWhenMediaPlays) {
-        if (MusicAttenuation::IsExternalMediaPlaying()) {
-            ImGui::TextDisabled("External media is playing; game music is muted.");
-        } else if (!MusicAttenuation::IsMediaControlInitializationComplete()) {
-            ImGui::TextDisabled("Checking external audio...");
-        } else if (!MusicAttenuation::IsMediaControlAvailable()) {
-#if defined(__APPLE__)
-            ImGui::TextDisabled("External audio detection unavailable (requires macOS 14.2 or later).");
-#else
-            ImGui::TextDisabled("Media controls are unavailable.");
-#endif
-        } else {
-            ImGui::TextDisabled("No external media is currently playing.");
-        }
     }
 }
 
@@ -2284,11 +2231,9 @@ void InitializeRuntimeSettings() noexcept {
     ApplyConfiguredMappings();
     AudioBackend::Instance().SetMasterVolume(static_cast<float>(g_audioVolumePercent) / 100.0f);
     AudioBackend::Instance().SetMuted(g_audioMuted);
-    MusicAttenuation::SetMusicVolume(static_cast<float>(g_musicVolumePercent) / 100.0f);
-    MusicAttenuation::SetSoundEffectsVolume(static_cast<float>(g_soundEffectsVolumePercent) / 100.0f);
-    MusicAttenuation::SetUiVolume(static_cast<float>(g_uiVolumePercent) / 100.0f);
-    MusicAttenuation::SetVoicesVolume(static_cast<float>(g_voicesVolumePercent) / 100.0f);
-    MusicAttenuation::SetEnabled(g_attenuateMusicWhenMediaPlays);
+    // MusicAttenuation's category volumes and media watcher stay at their defaults (full, off): the menu no longer
+    // offers them and they find no sound buses in Brawl. A saved [audio] attenuate setting would only start its
+    // media-session polling thread for nothing.
     RuntimeGameGraphicsOptions::SetDisabledPostProcessingPaths(g_disabledPostProcessingPaths);
 #if defined(__APPLE__)
     aurora_set_metalfx_spatial(g_metalFxSpatialUpscaling);

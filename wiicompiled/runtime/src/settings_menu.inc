@@ -170,24 +170,16 @@ void VolumeRow(std::vector<MenuRow>& rows, const char* label, int& percent, void
                     }, true, percent});
 }
 
+// Master volume and Mute only. Music, Sound effects, Voices, Menu sounds and "Quiet music while other media plays"
+// came from Mario Kart Wii's recomp (MusicAttenuation): its sound buses were never found in Brawl
+// (ResolveSoundPlayerArray returns 0), so those rows changed nothing (Brawl Online board: "audio settings seem bugged").
 void AudioRows(std::vector<MenuRow>& rows) {
     VolumeRow(rows, "Master volume", g_audioVolumePercent, [](float v) { AudioBackend::Instance().SetMasterVolume(v); },
               RuntimeConfigFile::SetAudioVolume);
-    VolumeRow(rows, "Music", g_musicVolumePercent, MusicAttenuation::SetMusicVolume, RuntimeConfigFile::SetMusicVolume);
-    VolumeRow(rows, "Sound effects", g_soundEffectsVolumePercent, MusicAttenuation::SetSoundEffectsVolume,
-              RuntimeConfigFile::SetSoundEffectsVolume);
-    VolumeRow(rows, "Voices", g_voicesVolumePercent, MusicAttenuation::SetVoicesVolume, RuntimeConfigFile::SetVoicesVolume);
-    VolumeRow(rows, "Menu sounds", g_uiVolumePercent, MusicAttenuation::SetUiVolume, RuntimeConfigFile::SetUiVolume);
     rows.push_back({"Mute", OnOff(g_audioMuted), std::string("Also on the ") + KeyBindingName(g_muteHotkey) + " key.", [](int) {
                         g_audioMuted = !g_audioMuted;
                         AudioBackend::Instance().SetMuted(g_audioMuted);
                         RuntimeConfigFile::SetAudioMuted(g_audioMuted);
-                    }});
-    rows.push_back({"Quiet music while other media plays", OnOff(g_attenuateMusicWhenMediaPlays),
-                    "Mutes the game's music while a video or song plays in another app.", [](int) {
-                        g_attenuateMusicWhenMediaPlays = !g_attenuateMusicWhenMediaPlays;
-                        MusicAttenuation::SetEnabled(g_attenuateMusicWhenMediaPlays);
-                        RuntimeConfigFile::SetAttenuateMusicWhenMediaPlays(g_attenuateMusicWhenMediaPlays);
                     }});
 }
 
