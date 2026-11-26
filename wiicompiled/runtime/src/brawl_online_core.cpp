@@ -52,6 +52,7 @@ extern "C" void objc_msgSend();
 void PAD_HLE_SampleLocalPads(FrameInput::GcPad* pads);
 extern std::atomic_bool g_auroraFrameActive;
 extern "C" void aurora_gx_present_last_display_copy();
+extern "C" void aurora_gx_sync();  // aurora.cpp: wait for Aurora's GX thread
 
 namespace {
 
@@ -154,6 +155,11 @@ void SnapshotSave(int key) {
 void SnapshotRestore(int key) {
     auto& s = s_snap;
     if (!s.store) return;
+    // The restore rewrites guest memory that GX work already handed over may still read: the g3d native draw worker
+    // replays deferred draws from resource display lists, vertex and matrix arrays in guest memory (g3d_native.cpp,
+    // G3D_NATIVE_ASYNC=2), and only a GX sync orders those reads before the memory is reused. Without one, a rollback
+    // every frame (the rollback benchmark's sync test) had the worker walk display lists of garbage length.
+    aurora_gx_sync();
     BrawlDirtyMemory::MarksRestored(s.markSequences.at(key));
     const auto& dirty = s.watch->Capture(s.total, s.store->Jobs());
     auto read = [cursor = size_t{0}](size_t offset, uint8_t* out, size_t n) mutable { s_snap.Transfer<false>(cursor, offset, out, n); };
