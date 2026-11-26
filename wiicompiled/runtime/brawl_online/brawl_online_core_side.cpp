@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "BrawlOnline/Compat.h"
+#include "BrawlOnline/Config/OnlineSettings.h"
 #include "BrawlOnline/Engine.h"
 #include "BrawlOnline/Host.h"
 #include "BrawlOnline/Online/GameAlive.h"
@@ -334,6 +335,16 @@ const Core::CPUThreadGuard& Guard() {
     return guard;
 }
 
+// The launcher's Music setting ([Online] Music in the core's Dolphin.ini) off: P+'s "[P+] Music Off"
+// patch, which Dolphin applies at every retrace (PatchEngine IsEnabledMusicCode, Sys/GameSettings
+// "ID-Project+ Netplay Launcher.ini"): 0 into the music volume float. It is outside the rollback
+// region set and the song streams either way, so only this PC's music goes quiet, in menus and matches.
+void ApplyMusicOff() {
+    constexpr u32 kMusicVolume = 0x90E60F34;
+    if (Config::Get(Config::ONLINE_MUSIC)) return;
+    if (ReadBE32(kMusicVolume) != 0) WriteBE32(kMusicVolume, 0);
+}
+
 }  // namespace
 
 namespace BrawlOnlineBridge {
@@ -383,6 +394,7 @@ Action CoreLoopTop(uint32_t* call_target) {
     auto& system = Core::System::GetInstance();
     s_engine.action = Action::Normal;
     Online::GameAlive::Beat();
+    ApplyMusicOff();
     if (!Gprb::Session::IsRunning()) Gprb::CpuTraceOnLoopTop(system);
     Gprb::PadsOnLoopTop(system);
     Gprb::PadsWatchdog(Guard());
