@@ -26,6 +26,8 @@ struct MenuState {
     // chosen with the keyboard or a controller is brought into view (follow). scroll is the top row shown, in rows.
     float scroll = 0, scrollTarget = 0;
     int scrollTab = -1;
+    bool dragging = false;  // the scroll bar's thumb is held with the mouse
+    float dragOffset = 0;   // from the mouse to the thumb's top, in layout units
     bool follow = false;
     bool mouse = false;       // the mouse was used last: the row under it is the chosen one
     bool escapeHeld = false;  // the Escape that opened the menu is not also Back, until ImGui has seen it go up
@@ -514,26 +516,69 @@ std::vector<MenuRow> TabRows(int tab) {
 }
 
 // ---- drawing ----
+// The rows' left and right edges and their value column. The list's scroll bar sits just right of the rows, inside
+// the layout's 960 width (Sarah's board: the up/down arrows it replaced were at x 478, cut off at a 16:9 window's edge).
+constexpr float kRowX0 = -150, kRowX1 = 432, kValueX = 308;
+constexpr float kScrollBarX = 460, kScrollBarHalfWidth = 4;
+
 void MenuRowDraw(const MK::Canvas& c, const MenuRow& row, float y, bool focused) {
-    const float x0 = -150, x1 = 460;
+    const float x0 = kRowX0, x1 = kRowX1;
     MK::Plate(c, x0, y - 17, x1, y + 17, focused ? 0x2B3350FFu : 0x1C2133FFu, 7.0f, row.enabled ? 1.0f : 0.55f);
     if (focused) c.list->AddRect(c.P(x0 - 4, y + 19), c.P(x1 + 4, y - 19), MK::Col(MK::kOrange, 0.6f + 0.4f * std::sin(c.t * 6.0f)), 0, 0, 2.0f);
     MK::Body(c, row.label, x0 + 18, y, 16, row.enabled ? MK::kSnow : MK::kDim, 0, 300);
-    const float vx = 330;
+    const float vx = kValueX;
     std::string value = row.value;  // Brawl's title font has no parentheses
     value.erase(std::remove_if(value.begin(), value.end(), [](char ch) { return ch == '(' || ch == ')'; }), value.end());
     if (row.bar >= 0) {
         c.list->AddRectFilled(c.P(vx - 100, y + 5), c.P(vx + 60, y - 5), MK::Col(0x0B0D16FFu));
         c.list->AddRectFilled(c.P(vx - 100, y + 5), c.P(vx - 100 + 160.0f * row.bar / 100.0f, y - 5), MK::Col(MK::kOrange));
-        MK::Text(c, *MK::TitleFont(), value, vx + 98, y, 17, MK::kSnow, 0xFFE7B0FFu, 1, 70, true);
+        MK::Text(c, *MK::TitleFont(), value, x1 - 32, y, 17, MK::kSnow, 0xFFE7B0FFu, 1, 70, true);
     } else if (!value.empty()) {
         MK::Text(c, *MK::TitleFont(), value, vx, y, 18, row.value == "ON" ? 0xB8FFB0FFu : MK::kSnow,
                  row.value == "OFF" ? MK::kDim : 0xFFE7B0FFu, 1, 230, true);
     }
     if (focused && row.enabled && row.change && row.bar >= 0) {
         MK::Arrow(c, vx - 115, y, 14, 2, MK::kOrange);
-        MK::Arrow(c, vx + 140, y, 14, 3, MK::kOrange);
+        MK::Arrow(c, x1 + 10, y, 14, 3, MK::kOrange);
     }
+}
+
+// The list's scroll bar: a track the list's height with a thumb as tall as the share of rows shown. The thumb can be
+// dragged, and a click on the track above or below it pages the list. Only drawn when the rows don't all fit.
+void ScrollBarDraw(const MK::Canvas& c, float top, float bottom, int count, float maxScroll, bool capturing) {
+    if (maxScroll <= 0.0f) {
+        g_menu.dragging = false;
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    const float trackH = top - bottom;
+    const float thumbH = std::max(28.0f, trackH * kVisibleRows / static_cast<float>(count));
+    const float thumbTop = top - (trackH - thumbH) * g_menu.scroll / maxScroll;
+    const float x0 = kScrollBarX - kScrollBarHalfWidth, x1 = kScrollBarX + kScrollBarHalfWidth;
+    const float mouseY = (c.view.centerY - io.MousePos.y) / c.view.scale;  // layout units, y up
+    // A wider grab area than the bar itself, so it is easy to hit.
+    const bool overTrack = !capturing && ImGui::IsMouseHoveringRect(c.P(x0 - 8, top), c.P(x1 + 8, bottom), false);
+    const bool overThumb = overTrack && mouseY <= thumbTop && mouseY >= thumbTop - thumbH;
+    if (overTrack && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (overThumb) {
+            g_menu.dragging = true;
+            g_menu.dragOffset = thumbTop - mouseY;
+        } else {
+            g_menu.scrollTarget = std::clamp(g_menu.scrollTarget + (mouseY > thumbTop ? -1.0f : 1.0f) * kVisibleRows, 0.0f, maxScroll);
+        }
+    }
+    if (g_menu.dragging) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || capturing) {
+            g_menu.dragging = false;
+        } else if (trackH > thumbH) {
+            const float t = std::clamp((top - (mouseY + g_menu.dragOffset)) / (trackH - thumbH), 0.0f, 1.0f);
+            g_menu.scroll = g_menu.scrollTarget = t * maxScroll;  // the list follows the hand without easing
+        }
+    }
+    const float r = kScrollBarHalfWidth * c.view.scale;
+    c.list->AddRectFilled(c.P(x0, top), c.P(x1, bottom), MK::Col(0x232A42FFu), r);
+    const bool lit = g_menu.dragging || overThumb;
+    c.list->AddRectFilled(c.P(x0, thumbTop), c.P(x1, thumbTop - thumbH), MK::Col(lit ? 0xFFC86AFFu : MK::kOrange), r);
 }
 
 void DrawOptionsMenu() {
@@ -541,6 +586,7 @@ void DrawOptionsMenu() {
         g_menu.inRows = false;
         g_menu.quitArmed = false;
         g_menu.escapeHeld = false;
+        g_menu.dragging = false;
         return;
     }
     {
@@ -648,12 +694,14 @@ void DrawOptionsMenu() {
         // Rows part-way in or out are cut at the list's edges (the focus outline included).
         constexpr float kListTop = 146 + 21, kListBottom = 146 - (kVisibleRows - 1) * 40.0f - 21;
         const ImVec2 clipLo = c.P(-480, kListTop), clipHi = c.P(480, kListBottom);
-        const bool mouseInList = ImGui::IsMouseHoveringRect(clipLo, clipHi, false);
+        ScrollBarDraw(c, kListTop - 4, kListBottom + 4, count, maxScroll, capturing);
+        // While the scroll bar's thumb is dragged, the rows the mouse passes over are not chosen or clicked.
+        const bool mouseInList = !g_menu.dragging && ImGui::IsMouseHoveringRect(clipLo, clipHi, false);
         c.list->PushClipRect(clipLo, clipHi, true);
         const int firstShown = static_cast<int>(std::floor(g_menu.scroll));
         for (int i = firstShown; i < std::min(count, firstShown + kVisibleRows + 1); ++i) {
             const float y = 146 - (i - g_menu.scroll) * 40.0f;
-            const ImVec2 lo = c.P(-150, y + 17), hi = c.P(460, y - 17);
+            const ImVec2 lo = c.P(kRowX0, y + 17), hi = c.P(kRowX1, y - 17);
             const bool hovered = mouseInList && ImGui::IsMouseHoveringRect(lo, hi);
             if (hovered && g_menu.mouse && !capturing) {
                 g_menu.inRows = true;
@@ -663,14 +711,12 @@ void DrawOptionsMenu() {
             MenuRowDraw(c, rows[static_cast<size_t>(i)], y, focused);
             if (hovered && !capturing && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && rows[static_cast<size_t>(i)].enabled &&
                 rows[static_cast<size_t>(i)].change) {
-                const bool right = io.MousePos.x > c.P(330, 0).x;
+                const bool right = io.MousePos.x > c.P(kValueX, 0).x;
                 rows[static_cast<size_t>(i)].change(rows[static_cast<size_t>(i)].bar >= 0 ? (right ? 1 : -1) : 0);
             }
         }
         c.list->PopClipRect();
         if (g_menu.inRows && count > 0) hint = rows[static_cast<size_t>(g_menu.row)].hint;
-        if (g_menu.scroll > 0.01f) MK::Arrow(c, 478, 146, 12, 0, MK::kOrange);
-        if (g_menu.scroll < maxScroll - 0.01f) MK::Arrow(c, 478, 146 - (kVisibleRows - 1) * 40.0f, 12, 1, MK::kOrange);
 
         // Navigation.
         if (!g_menu.inRows) {
