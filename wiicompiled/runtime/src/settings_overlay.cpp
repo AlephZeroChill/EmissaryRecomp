@@ -278,6 +278,14 @@ void LimitResolutionForIntegratedGpu() {
     RT_LOGF(RT_TAG_CONFIG, "integrated GPU: rendering at 1080p this session (the saved resolution is kept)\n");
 }
 
+// The overlay's small boxes (notices, shaders compiling, FPS) in Noto Sans at `px` pixels, when Brawl Online's build has
+// the menus' fonts: ImGui's own font is a 13-pixel bitmap, blurred when scaled up. False: no font pushed.
+bool PushOverlayFont(float px) {
+    if (!MenuKit::HaveVectorFonts()) return false;
+    ImGui::PushFont(MenuKit::Fonts().body, std::round(px));
+    return true;
+}
+
 void DrawNotice() {
     static const bool modProblemShown = [] {
         if (Gecko::SetupProblem().empty()) return false;
@@ -297,8 +305,11 @@ void DrawNotice() {
     if (ImGui::Begin("Notice", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing)) {
-        ImGui::SetWindowFontScale(std::max(1.0f, viewport->Size.y / 720.0f));
+        const float scale = std::max(1.0f, viewport->Size.y / 720.0f);
+        const bool pushed = PushOverlayFont(15.0f * scale);
+        if (!pushed) ImGui::SetWindowFontScale(scale);
         ImGui::TextUnformatted(g_notice.c_str());
+        if (pushed) ImGui::PopFont();
     }
     ImGui::End();
 }
@@ -1351,6 +1362,7 @@ void DrawFpsOverlay() {
                                          ImGuiWindowFlags_NoNav |
                                          ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("FPS Overlay", nullptr, kFlags)) {
+        const bool pushed = PushOverlayFont(std::max(13.0f, ImGui::GetMainViewport()->Size.y / 1080.0f * 15.0f));
         if (!g_showFps) {
         } else if (presentTiming.sampleCount == 0) {
             ImGui::TextUnformatted("FPS: --");
@@ -1367,6 +1379,7 @@ void DrawFpsOverlay() {
                                    presentTiming.effectiveFramesPerSecond);
             }
         }
+        if (pushed) ImGui::PopFont();
         if (g_frameGraph) {
             DrawFrameGraph();
         }
@@ -1393,8 +1406,10 @@ void DrawShaderCompilationStatus() {
                                         ImGuiWindowFlags_NoNav |
                                         ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("Shader Compilation Status", nullptr, kFlags)) {
-        ImGui::SetWindowFontScale(0.85f);
+        const bool pushed = PushOverlayFont(std::max(12.0f, ImGui::GetMainViewport()->Size.y / 1080.0f * 14.0f));
+        if (!pushed) ImGui::SetWindowFontScale(0.85f);
         ImGui::Text("%u shader%s compiling", queuedPipelines, queuedPipelines == 1 ? "" : "s");
+        if (pushed) ImGui::PopFont();
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -1582,7 +1597,7 @@ void DrawEmissaryTitle(const ImGuiViewport* viewport, const char* status, float 
     static TitleArt mask("emissary_mask.png"), wordmark("emissary_wordmark.png");
     constexpr const char* kCredit =
         "EmissaryRecomp by kalomaze, a fork of BrawlRecompiled by JosiahG, which is built on WiiCompiled by patchzyy";
-    constexpr const char* kHint = "F10 or Home = options";
+    constexpr const char* kHint = "F10, Home or hold START = options";
     ImDrawList* list = ImGui::GetWindowDrawList();
     const GameLayout::View view = GameLayout::GameView();
     const float k = view.scale, t = static_cast<float>(ImGui::GetTime());
@@ -1850,7 +1865,7 @@ void DrawStartupScreen() {
 #if MKW_BRAWL_ONLINE_CORE
                 // Brawl Online's build: online play is the launcher's; no save states, fast-forward or the
                 // recomp's own netplay (a save state or fast-forward in a match would leave the other player).
-                const auto hint = GameLayout::Utf16("F10 or Home = options");
+                const auto hint = GameLayout::Utf16("F10, Home or hold START = options");
 #else
                 const auto hint = GameLayout::Utf16("F10 or Home = options   F5 / F7 = save / load state   F8 = fast-forward   F9 = online");
 #endif

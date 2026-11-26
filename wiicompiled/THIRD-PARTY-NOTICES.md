@@ -123,6 +123,14 @@ fallback - though this project's x86_64-only target only ever compiles amd64.c) 
 Source: <https://github.com/higan-emu/libco>. Full license text:
 `runtime/third_party/libco/LICENSE`.
 
+### Barlow Condensed - SIL Open Font License 1.1
+
+Copyright 2017 The Barlow Project Authors.
+Brawl Online's build draws its menus' titles, buttons and values in Barlow Condensed Black Italic
+and SemiBold, unmodified TrueType files from Google Fonts in `runtime/assets/brawl_online/`,
+copied into `Sys/Resources` beside the program. Source: <https://github.com/jpt/barlow>. Full
+license text: `runtime/assets/brawl_online/BarlowCondensed-OFL.txt`.
+
 ---
 
 ## Fetched at build time and redistributed in release builds
