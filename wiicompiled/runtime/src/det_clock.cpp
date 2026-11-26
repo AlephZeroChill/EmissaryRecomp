@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 
 #if defined(_WIN32)
@@ -148,7 +149,10 @@ void AdvanceTo(uint64_t ticks) noexcept {
 }
 
 void PaceTo(uint64_t ticks, bool frameBoundary) {
-    if (g_resimulating) return;
+    // BRAWL_UNTHROTTLED=1 (benchmarks): the timeline runs as fast as the game does, never waiting for real time, as
+    // Dolphin's Core.EmulationSpeed = 0. Only when frames come to the screen changes, not what the game sees.
+    static const bool unthrottled = std::getenv("BRAWL_UNTHROTTLED") != nullptr;
+    if (g_resimulating || unthrottled) return;
     const auto now = Clock::now();
     if (!g_anchored || ticks < g_anchorTicks || g_loadWait) {
         // (While the session waits for loads, the timeline is not paced: it keeps re-anchoring, so the frames after the
