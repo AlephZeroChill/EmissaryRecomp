@@ -297,6 +297,7 @@ bool DolphinControlsLoad(const char*, void*) { return false; }
 bool DolphinControlsActive() { return false; }
 int DolphinControlsSiDevice(int) { return 0; }
 void DolphinControlsRead(bool, Pad*, int*) {}
+void DolphinControlsPeek(bool, Pad*, int*) {}
 void DolphinControlsRumble(int, double) {}
 bool DolphinControlsUseKey(const char*) { return false; }
 void DolphinControlsDevice(int, char* out, size_t size) { if (size) *out = '\0'; }
