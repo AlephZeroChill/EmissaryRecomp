@@ -895,6 +895,9 @@ bool present_presentation_job(const PresentationJob& job) {
       const bool acquireOk = encoder && SDL_WaitAndAcquireGPUSwapchainTexture(
                                             encoder.cmd(), gpu::swapchain_window(), &swapchainTexture,
                                             &swapchainWidth, &swapchainHeight);
+      if (encoder) {
+        gpu::note_swapchain_requested();  // its submit below retires finished work (retire_finished_work_without_present)
+      }
       acquireDuration =
           std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - acquireStarted);
       g_lastAcquireNanos.store(acquireDuration.count(), std::memory_order_relaxed);
@@ -1463,6 +1466,7 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
 std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   const auto start = PresentClock::now();
   auto jobs = encode_sealed_frame_impl(sealedFrame, ctx);
+  gpu::retire_finished_work_without_present();
   if (ctx.interpolationActive) {
     g_interpEncodeNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       PresentClock::now() - start).count()),

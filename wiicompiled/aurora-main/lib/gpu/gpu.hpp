@@ -121,6 +121,13 @@ private:
   SDL_GPUCopyPass* m_copy = nullptr;
 };
 
+// SDL_GPU's Vulkan backend frees finished command buffers, and everything they used (cycled transfer and uniform
+// buffers, descriptor sets, pending destroys), only when a submitted command buffer asked for a swapchain image, or
+// in SDL_WaitForGPUFences / SDL_WaitForGPUIdle. The presenter notes each frame it asks for one; a frame that ends
+// without one (the window minimized, or every present skipped) retires finished work through a fence instead.
+void note_swapchain_requested() noexcept;
+void retire_finished_work_without_present();
+
 // Copies recorded on an encoder's copy pass. Texture regions are mip 0, layer 0 unless given.
 void copy_texture_to_texture(Encoder& enc, const TextureObject& src, uint32_t srcX, uint32_t srcY,
                              const TextureObject& dst, uint32_t dstX, uint32_t dstY, uint32_t width, uint32_t height,

@@ -411,6 +411,39 @@ void Encoder::cancel() {
   m_cmd = nullptr;
 }
 
+// Minimized on Windows, the presenter asks for no swapchain image (the client area is 0x0), so SDL's Vulkan
+// backend retired nothing: about 37 MB a game frame stayed bound to finished command buffers (2.2 GB a second;
+// 33 GB in 20 s), the frame worker's staging maps waited longer each frame (the game fell to 30-50 fps and its
+// music stuttered), and after 15-20 s the driver lost the device (NVIDIA event 153) and crashed the game in
+// nvoglv64.dll (Brawl Online board: "my prod recomp just crashed. also the music stutters when the game is in the
+// background").
+static std::atomic<uint64_t> g_swapchainRequests{0};
+
+void note_swapchain_requested() noexcept { g_swapchainRequests.fetch_add(1, std::memory_order_relaxed); }
+
+void retire_finished_work_without_present() {
+  // Frame worker only. The fence is the previous such frame's: waiting for it costs nothing unless the GPU is a
+  // whole frame behind, and the wait is what retires every finished command buffer.
+  static SDL_GPUFence* s_fence = nullptr;
+  static uint64_t s_requestsSeen = 0;
+  const uint64_t requests = g_swapchainRequests.load(std::memory_order_relaxed);
+  if (requests != s_requestsSeen) {
+    s_requestsSeen = requests;
+    if (s_fence != nullptr) {
+      SDL_ReleaseGPUFence(g_device, s_fence);
+      s_fence = nullptr;
+    }
+    return;
+  }
+  if (s_fence != nullptr) {
+    SDL_WaitForGPUFences(g_device, true, &s_fence, 1);
+    SDL_ReleaseGPUFence(g_device, s_fence);
+    s_fence = nullptr;
+  }
+  Encoder encoder;
+  s_fence = encoder.submit_with_fence();
+}
+
 void copy_texture_to_texture(Encoder& enc, const TextureObject& src, uint32_t srcX, uint32_t srcY,
                              const TextureObject& dst, uint32_t dstX, uint32_t dstY, uint32_t width, uint32_t height,
                              uint32_t srcMip, uint32_t dstMip) {
