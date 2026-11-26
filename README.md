@@ -99,8 +99,7 @@ Every player needs the same build: vanilla, or the same mod (the Mods page; onli
 when everyone's `UserData\SD` folder is a copy of the same download). The games run in lockstep: each
 frame's controller input is all that is sent, and the games check every frame that they still match. A player's
 own controller (port 1) is their player number in the room. Each frame waits for every player's input, so a slow
-connection adds input delay (2 to 8 frames, picked from the ping when the room starts). Cross-play with Dolphin
-(Brawl Online, Slippi-style netplay) is not possible: those run an emulator, and the games would not stay in step.
+connection adds input delay (2 to 8 frames, picked from the ping when the room starts).
 
 ## Building from source
 
