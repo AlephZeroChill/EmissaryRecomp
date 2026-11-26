@@ -192,7 +192,7 @@ inline double Single(double v) {
 // (PpcResolveNanSlow: the first NaN operand, quieted, else the default NaN; the third operand is 0.0 here) is copied
 // inline for the reason given at ConvertToDoubleBits.
 inline double ResolveNan2(double result, double a, double b) {
-#if MKW_FAST_FLOAT
+#if MKW_FAST_FLOAT || !MKW_ACCURATE_NANS
     (void)a;
     (void)b;
     return result;
