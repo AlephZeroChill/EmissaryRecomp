@@ -212,6 +212,28 @@ namespace {
 void ApplyPadScript(PADStatus& port1);
 }
 
+// Brawl Online's looks at the local controllers outside the game's reads (input suggestions between them, the core's
+// read after a rollback): the ports as ReadLocalPads would make them now, changing nothing (aurora's PADPeek, no Wii
+// Remote scan, no script step), after SDL has read its controllers (the event pump does that once a frame). False
+// while a test script drives the pads (its steps count the game's reads). The game's thread.
+bool PAD_HLE_PeekLocalPads(FrameInput::GcPad* pads)
+{
+    if (WiiRemoteInput::ScriptActive() || std::getenv("BRAWL_PAD_SCRIPT") != nullptr) return false;
+    SDL_UpdateJoysticks();
+    PADStatus statuses[PAD_CHANMAX]{};
+    PADPeek(statuses);
+    WiiRemoteInput::HideRemotesFromPad(statuses, PAD_CHANMAX);
+    FillTriggersHeldByButtons(statuses);
+    InputBindings::Apply(statuses, true);
+    BrawlOnlineCore::ApplyDolphinControls(statuses, true);
+    for (uint32_t port = 0; port < PAD_CHANMAX; ++port) {
+        const PADStatus& s = statuses[port];
+        pads[port] = {s.err == PAD_ERR_NONE, s.button, s.stickX, s.stickY, s.substickX, s.substickY,
+                      s.triggerLeft, s.triggerRight};
+    }
+    return true;
+}
+
 // Deterministic mode (network play): the local ports for frame_input.cpp to latch at the retrace. A pad script
 // (BRAWL_PAD_SCRIPT) drives port 1 here too, once per latched frame, so a standalone deterministic run
 // (NSMBW_DETERMINISTIC=1) gets past the strap screen; PADRead takes the latched frame and never sees the script.

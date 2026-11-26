@@ -125,6 +125,9 @@ struct SDL_Gamepad;
 
 BOOL PADInit();
 u32 PADRead(PADStatus* status);
+// PADRead's statuses as it would make them now, changing nothing: the held-input suppression, the LEDs and the
+// next read's capture stay as they are (a look between the game's reads, Brawl Online's input suggestions).
+u32 PADPeek(PADStatus* status);
 BOOL PADReset(u32 mask);
 BOOL PADRecalibrate(u32 mask);
 void PADClamp(PADStatus* status);

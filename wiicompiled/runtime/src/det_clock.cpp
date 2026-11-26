@@ -49,6 +49,7 @@ bool g_loadWait = false;
 std::atomic<int64_t> g_maxBehindNs{0};
 bool g_presentPacing = false;
 LeadFn g_lead = nullptr;
+WaitHook g_waitHook = nullptr;
 PacingStats g_stats;
 
 void SleepUntil(Clock::time_point deadline) {
@@ -89,6 +90,44 @@ void SleepUntil(Clock::time_point deadline) {
 #endif
 }
 
+// A slice of a wait the hook asked for: no spin (the hook looks again in about a millisecond, it needs no cadence).
+void Nap(Clock::time_point until) {
+#if defined(_WIN32)
+    struct HighResolutionTimer {
+        HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                               TIMER_MODIFY_STATE | SYNCHRONIZE);
+        ~HighResolutionTimer() {
+            if (handle != nullptr) CloseHandle(handle);
+        }
+    };
+    static thread_local HighResolutionTimer timer;
+    const auto now = Clock::now();
+    if (until > now && timer.handle != nullptr) {
+        const auto wait =
+            std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(until - now);
+        LARGE_INTEGER due{};
+        due.QuadPart = -std::max<int64_t>(wait.count(), 1);
+        if (SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0) != FALSE) {
+            WaitForSingleObject(timer.handle, INFINITE);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_until(until);
+}
+
+// SleepUntil(deadline), in slices of a millisecond while the wait hook wants them (it looks before each); the last
+// stretch as SleepUntil's own precise sleep.
+void HookedSleepUntil(Clock::time_point deadline) {
+    constexpr auto kSlice = std::chrono::milliseconds(1);
+    while (g_waitHook != nullptr && g_waitHook()) {
+        const auto now = Clock::now();
+        if (deadline - now <= kSlice + kSlice / 2) break;
+        Nap(now + kSlice);
+    }
+    SleepUntil(deadline);
+}
+
 // The real time the virtual instant `ticks` is due at: the anchor, then the ticks since it at the timeline's speed.
 Clock::time_point Due(uint64_t ticks) {
     const auto elapsed = TimeBaseContract::TicksToDuration(ticks - g_anchorTicks);
@@ -117,10 +156,12 @@ void PacedSleepUntil(Clock::time_point target) {
             return;
         }
         if (wake - now <= kFinal) {
-            SleepUntil(wake);
+            HookedSleepUntil(wake);
             continue;
         }
-        std::this_thread::sleep_for(kSlice);
+        // While the wait hook looks at the controllers, a precise millisecond (sleep_for's lasts about two on Windows).
+        if (g_waitHook != nullptr && g_waitHook()) Nap(Clock::now() + kSlice);
+        else std::this_thread::sleep_for(kSlice);
     }
 }
 
@@ -173,7 +214,7 @@ void PaceTo(uint64_t ticks, bool frameBoundary) {
     const auto sleepStart = Clock::now();
     // (The lead only at the frame's own pacing point, as Dolphin's paced sleep is the first throttle after a shown frame.)
     if (frameBoundary && g_presentPacing && g_lead != nullptr) PacedSleepUntil(target);
-    else SleepUntil(target);
+    else HookedSleepUntil(target);
     g_pacingNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - sleepStart).count();
 }
 
@@ -252,6 +293,8 @@ bool ScheduledRealTime(Clock::time_point* out) noexcept {
 std::chrono::nanoseconds TakeMaxBehind() noexcept {
     return std::chrono::nanoseconds(g_maxBehindNs.exchange(0, std::memory_order_relaxed));
 }
+
+void SetWaitHook(WaitHook hook) noexcept { g_waitHook = hook; }
 
 void SetPresentPacing(bool on, LeadFn lead) noexcept {
     g_presentPacing = on;

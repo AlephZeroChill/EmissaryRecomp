@@ -46,7 +46,7 @@ bool InputBlocked() noexcept;
 
 // Mix expression output into a freshly read status set. Call once per guest
 // PADRead, after every other input source has been merged.
-void Apply(PADStatus* statuses) noexcept;
+void Apply(PADStatus* statuses, bool peek = false) noexcept;
 
 std::string GetExpression(uint32_t port, size_t control) noexcept;
 // Returns false and fills error if the text does not parse; the binding is

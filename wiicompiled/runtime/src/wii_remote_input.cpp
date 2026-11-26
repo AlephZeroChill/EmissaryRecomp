@@ -824,6 +824,8 @@ void NoteGameReport(const std::string& line) {
     }
 }
 
+bool ScriptActive() { return Script().active; }
+
 bool ScriptedPadButtons(uint32_t port, uint16_t& buttons, int8_t& stickX, int8_t& stickY) {
     if (port == 0) g_padPolls.fetch_add(1, std::memory_order_relaxed);
     KpadSample sample;

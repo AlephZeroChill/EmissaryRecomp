@@ -43,6 +43,16 @@ void PadThreadUpdated(CpuContext* ctx);
 // harness's pads instead, while one is on.
 struct HarnessPad;
 void HarnessPads(void* gc_pads);
+// The same as a look between the game's reads (no harness poll counted).
+void HarnessPeekPads(void* gc_pads);
+// The local ports FrameInput::Latch just read for the frame a retrace starts (`frame`: a FrameInput::Frame): the core
+// takes each GameCube port's read as Dolphin's SI reads (the instant it stands for, the host decode), and in a
+// rollback's re-run hands back the reads latched before it.
+void HostPadsRead(void* frame);
+// Input suggestions (the core's Gprb::Suggest): while the game's thread waits for the next field (det_clock.h's wait
+// hook), a look at the local player's controller about once a millisecond, which the core sends the other players
+// when it changes what the next frame's input would be. False when none is wanted (then the wait is not sliced).
+bool SampleForSuggestions();
 // The local controllers as FrameInput::SampleLocal just read them (`frame`: a FrameInput::Frame), every
 // retrace and while the core holds the game still: START or B (a Wii Remote's B or +) held, for the core's
 // Host::LeaveButtonsHeld (a room's game watched) from any thread.
@@ -59,8 +69,9 @@ bool UiBlocksInput();
 // Config/GCPadNew.ini there, each GameCube port is what Dolphin plugs into it (Dolphin.ini SIDevice0-3):
 // a standard controller reads as Dolphin's Controllers settings have it (any device, expressions,
 // sticks, modifiers), the GameCube adapter as the runtime reads its pads, anything else as no controller.
-// `statuses`: the four ports as aurora's PADRead and the runtime's bindings left them. The game's thread.
-void ApplyDolphinControls(PADStatus* statuses);
+// `statuses`: the four ports as aurora's PADRead and the runtime's bindings left them. The game's thread. `peek`: a
+// look between the game's reads (input suggestions: Dolphin's input channel for them, nothing loaded again).
+void ApplyDolphinControls(PADStatus* statuses, bool peek = false);
 // A port Dolphin's controls drive: its Rumble/Motor takes the game's motor command (true: done).
 bool DolphinControlsRumble(int32_t chan, bool on);
 bool DolphinControlsActive();

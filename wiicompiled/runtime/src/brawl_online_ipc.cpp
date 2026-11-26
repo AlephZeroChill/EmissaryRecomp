@@ -118,5 +118,6 @@ void Stage(){
  if(Enabled()&&(!MenuLoop()||armed)&&!stageSetup){Hold("stage");stageSetup=true;}
 }
 void SamplePads(FrameInput::GcPad* out){BrawlOnlineCore::HarnessPads(out);std::lock_guard<std::mutex> lock(padMutex);if(padsActive)for(unsigned p=0;p<4;++p)out[p]=pads[p];}
+void PeekPads(FrameInput::GcPad* out){BrawlOnlineCore::HarnessPeekPads(out);std::lock_guard<std::mutex> lock(padMutex);if(padsActive)for(unsigned p=0;p<4;++p)out[p]=pads[p];}
 void WaitForGo(){if(!Enabled())return;auto since=std::chrono::steady_clock::now();while(!go){Poll();if(std::chrono::steady_clock::now()-since>std::chrono::seconds(60))throw std::runtime_error("online go timed out");std::this_thread::sleep_for(std::chrono::milliseconds(1));}}
 }

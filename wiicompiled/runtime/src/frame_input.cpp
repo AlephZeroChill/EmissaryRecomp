@@ -6,8 +6,9 @@
 #include "input_bindings.h"
 #include "settings_overlay.h"
 
-// hle/input/pad.cpp: the local GameCube ports as the game would read them now.
+// hle/input/pad.cpp: the local GameCube ports as the game would read them now (Peek: changing nothing).
 void PAD_HLE_SampleLocalPads(FrameInput::GcPad* pads);
+bool PAD_HLE_PeekLocalPads(FrameInput::GcPad* pads);
 
 namespace FrameInput {
 namespace {
@@ -64,11 +65,22 @@ Frame SampleLocal() {
     return frame;
 }
 
+bool PeekLocal(GcPad* pads) {
+    if (!PAD_HLE_PeekLocalPads(pads)) return false;
+    BrawlOnline::PeekPads(pads);
+    if (InputBindings::InputBlocked()) {
+        for (uint32_t chan = 0; chan < 4; ++chan) pads[chan] = {pads[chan].connected};  // the overlay owns input
+    }
+    return true;
+}
+
 void Latch(uint32_t retraceCount) {
     if (g_source != nullptr) {
         g_source(retraceCount, g_frame);
     } else {
         g_frame = SampleLocal();
+        // Brawl Online's core takes these reads as Dolphin's SI reads (in a rollback's re-run: the ones before it).
+        BrawlOnlineCore::HostPadsRead(&g_frame);
     }
 }
 

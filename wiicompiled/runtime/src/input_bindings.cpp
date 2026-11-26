@@ -171,7 +171,7 @@ void Reload() noexcept {
     RecomputeAnyBoundLocked();
 }
 
-void Apply(PADStatus* statuses) noexcept {
+void Apply(PADStatus* statuses, bool peek) noexcept {
     if (statuses == nullptr) {
         return;
     }
@@ -194,13 +194,14 @@ void Apply(PADStatus* statuses) noexcept {
                 continue;
             }
             if (blocked) {
-                binding.active = false;
+                if (!peek) binding.active = false;
                 continue;
             }
             const double value = binding.expr.Evaluate(source);
-            binding.active = value > InputExpr::kConditionThreshold;
+            const bool active = value > InputExpr::kConditionThreshold;
+            if (!peek) binding.active = active;
             const ControlInfo& info = kControls[control];
-            if (info.padButton != 0 && binding.active) {
+            if (info.padButton != 0 && active) {
                 statuses[port].button |= info.padButton;
             }
             if (info.analog != 0) {

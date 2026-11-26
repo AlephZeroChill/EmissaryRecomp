@@ -36,6 +36,9 @@ const Remote& Get(uint32_t chan);
 // The local controllers as one frame (what Latch uses without a network source). Neutral while an
 // overlay owns input.
 Frame SampleLocal();
+// The local GameCube ports as SampleLocal would read them now, changing nothing (no harness poll counted, no script
+// stepped): Brawl Online's looks between the game's reads. False while a test script drives the pads.
+bool PeekLocal(GcPad* pads);
 
 // Network play: fills `frame` for `retraceCount`, waiting until every player's input for it has
 // arrived. nullptr restores local sampling.

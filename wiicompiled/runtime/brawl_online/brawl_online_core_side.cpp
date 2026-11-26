@@ -32,6 +32,7 @@
 #include "Common/Logging/LogManager.h"
 #include "Core/Core.h"
 #include "Core/Rollback/GameplayOnlineBackend.h"
+#include "Core/Rollback/InputSuggest.h"
 #include "Core/Rollback/ReplayPlayback.h"
 #include "Core/System.h"
 
@@ -268,6 +269,32 @@ private:
 };
 
 // ---- The host ------------------------------------------------------------------------------------
+// A port as the runtime reads it, as Dolphin's SI device hands it to the game (and back).
+GCPadStatus ToStatus(const B::Pad& p) {
+    GCPadStatus s{};
+    s.button = p.button;
+    s.stickX = u8(128 + p.stickX);
+    s.stickY = u8(128 + p.stickY);
+    s.substickX = u8(128 + p.substickX);
+    s.substickY = u8(128 + p.substickY);
+    s.triggerLeft = p.triggerL;
+    s.triggerRight = p.triggerR;
+    s.isConnected = p.connected;
+    return s;
+}
+B::Pad ToPad(const GCPadStatus& s) {
+    B::Pad p{};
+    p.connected = s.isConnected;
+    p.button = s.button;
+    p.stickX = int8_t(int(s.stickX) - 128);
+    p.stickY = int8_t(int(s.stickY) - 128);
+    p.substickX = int8_t(int(s.substickX) - 128);
+    p.substickY = int8_t(int(s.substickY) - 128);
+    p.triggerL = s.triggerLeft;
+    p.triggerR = s.triggerRight;
+    return p;
+}
+
 class RecompHost final : public BrawlOnline::Host {
 public:
     u8* GuestPointer(u32 addr, u32 size) override { return B::GuestPointer(addr, size); }
@@ -281,19 +308,9 @@ public:
         INFO_LOG_FMT(BRAWLBACK, "[screen] {}", t);
         B::ScreenMessage(t.c_str(), ms, argb);
     }
-    GCPadStatus LocalPad(int chan) override {
-        const B::Pad p = B::LocalPad(chan);
-        GCPadStatus s{};
-        s.button = p.button;
-        s.stickX = u8(128 + p.stickX);
-        s.stickY = u8(128 + p.stickY);
-        s.substickX = u8(128 + p.substickX);
-        s.substickY = u8(128 + p.substickY);
-        s.triggerLeft = p.triggerL;
-        s.triggerRight = p.triggerR;
-        s.isConnected = p.connected;
-        return s;
-    }
+    // The core's read outside the game's (its read after a rollback, Gprb::HostDecodeReadAt): a look at the ports
+    // now (B::LocalPad), the game's thread.
+    GCPadStatus LocalPad(int chan) override { return ToStatus(B::LocalPad(chan)); }
     // A room's game watched (RoomWatch, the Rooms thread): the controllers are only read on the game's
     // thread, which reads them while the watch stands still (B::StandStill).
 #ifdef BRAWL_ONLINE_HOST_LEAVE_BUTTONS_HELD  // a core before it has none
@@ -408,6 +425,19 @@ bool CoreDrivesLoop() { return Gprb::Session::DrivesLoop(); }
 void CoreStageCreate() { Gprb::Session::OnStageCreate(Guard()); }
 void CoreStageFile() { Gprb::Session::OnStageFileLoad(Guard()); }
 void CorePadRead() { Gprb::PadsOnPadRead(); }
+void CoreHostPadsRead(Pad* pads) {
+    auto& system = Core::System::GetInstance();
+    for (int chan = 0; chan < 4; ++chan)
+        pads[chan] = ToPad(Gprb::EngineHostPadRead(system, chan, Gprb::HostPadSource::Mapped, ToStatus(pads[chan])));
+}
+int CoreSuggestChannel() { return Gprb::Suggest::SampleChannel(); }
+int64_t CoreSuggestPeriodNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Gprb::Suggest::SamplePeriod()).count();
+}
+void CoreSuggestSample(int chan, const Pad& pad, int64_t start_ns, int64_t end_ns) {
+    const auto at = [](int64_t ns) { return Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(ns))); };
+    Gprb::Suggest::Sample(chan, ToStatus(pad), at(start_ns), at(end_ns));
+}
 void CorePadThreadUpdated() { Gprb::PadsOnPadThreadUpdated(Core::System::GetInstance()); }
 
 }  // namespace BrawlOnlineBridge

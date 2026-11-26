@@ -168,6 +168,28 @@ void DolphinControlsRead(bool window_has_focus, Pad* pads, int* si_devices) {
     }
 }
 
+void DolphinControlsPeek(bool window_has_focus, Pad* pads, int* si_devices) {
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (!s_loaded) return;
+    }
+    DP::UpdateInput(window_has_focus, true);
+    for (int port = 0; port < 4; ++port) {
+        si_devices[port] = DP::SiDevice(port);
+        pads[port] = {};
+        if (si_devices[port] != DP::SI_STANDARD_CONTROLLER) continue;
+        const GCPadStatus s = DP::GetStatus(port, true);
+        pads[port].connected = s.isConnected;
+        pads[port].button = s.button;
+        pads[port].stickX = static_cast<int8_t>(static_cast<int>(s.stickX) - 128);
+        pads[port].stickY = static_cast<int8_t>(static_cast<int>(s.stickY) - 128);
+        pads[port].substickX = static_cast<int8_t>(static_cast<int>(s.substickX) - 128);
+        pads[port].substickY = static_cast<int8_t>(static_cast<int>(s.substickY) - 128);
+        pads[port].triggerL = s.triggerLeft;
+        pads[port].triggerR = s.triggerRight;
+    }
+}
+
 void DolphinControlsRumble(int port, double strength) {
     DP::SetRumble(port, strength);
 }

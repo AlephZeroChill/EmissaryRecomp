@@ -103,6 +103,15 @@ bool CoreDrivesLoop();                       // the pacing pcs 0x800172D0 and 0x
 void CoreStageCreate();                      // __ct__7stMelee 0x809435F0
 void CoreStageFile();                        // the stage file's load (0x80949BC0 / 0x80949C20)
 void CorePadRead();                          // after the pad thread's read of the controllers
+// The four ports' reads the game gets for the frame a retrace starts (FrameInput::Latch): the core takes them as
+// Dolphin's SI reads (Gprb::EngineHostPadRead: their instant on the schedule, the host decode; in a rollback's
+// re-run the reads latched before it, which replace `pads`). The game's thread.
+void CoreHostPadsRead(Pad* pads);
+// Input suggestions (the core's Gprb::Suggest): the GameCube port whose controller to look at now between the
+// game's reads, or -1 (none would be used); a look at it, `pad`, made from `start_ns` to `end_ns` (steady clock).
+int CoreSuggestChannel();
+int64_t CoreSuggestPeriodNs();
+void CoreSuggestSample(int chan, const Pad& pad, int64_t start_ns, int64_t end_ns);
 void CorePadThreadUpdated();                 // the pad thread's loop, after P+'s code (0x8002BA84)
 
 // Brawl Online's test harness (BRAWL_ONLINE_HARNESS_PORT, brawl_online_harness.cpp): every poll of the
@@ -121,6 +130,8 @@ void CoreGameThreadStack(char* out, size_t size);
 void DumpGuestCpu();
 bool CoreHarnessActive();
 void CoreHarnessPads(Pad* pads);
+// The harness's pads now without counting a poll (a look between the game's reads).
+void CoreHarnessPeekPads(Pad* pads);
 
 // The paced wait's lead (the core's PacedSleepLead): how long the coming rollback's re-run will take, 0 for none.
 int64_t CorePacedSleepLeadNs();
@@ -149,6 +160,9 @@ int DolphinControlsSiDevice(int port);
 // The four ports as Dolphin would read them now (only SIDevice 6 ports are filled), and each port's
 // SIDevice. Reloads what Dolphin's window saved (checked once a second). The game's thread.
 void DolphinControlsRead(bool window_has_focus, Pad* pads, int* si_devices);
+// The same as a look between the game's reads (input suggestions): the devices read now, on Dolphin's input channel
+// for suggestions (a mouse's motion stays the game's reads'), nothing loaded again.
+void DolphinControlsPeek(bool window_has_focus, Pad* pads, int* si_devices);
 // The port's Rumble/Motor (Dolphin's GCPad::SetOutput), 0 or 1.
 void DolphinControlsRumble(int port, double strength);
 // Dolphin's controls name this keyboard key (Dolphin's name, "ESCAPE") in a binding: it plays the game.

@@ -101,6 +101,8 @@ void HideRemotesFromPad(PADStatus* statuses, uint32_t count);
 // Test scripts (input_script.txt): the scripted buttons on port 1 as GameCube PAD_BUTTON_* bits, or false when no
 // script runs (Brawl's menus and battles read the GameCube pad).
 bool ScriptedPadButtons(uint32_t port, uint16_t& buttons, int8_t& stickX, int8_t& stickY);
+// A test script (input_script.txt, NSMBW_INPUT_SCRIPT / NSMBW_SESSION_SCRIPT) drives the controllers.
+bool ScriptActive();
 // A line the game printed (OSReport): "-> scene" starts that scene's clock for "scene@ms" script events.
 void NoteGameReport(const std::string& line);
 

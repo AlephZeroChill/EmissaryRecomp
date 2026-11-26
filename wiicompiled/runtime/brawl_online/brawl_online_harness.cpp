@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -77,8 +78,47 @@ struct Port {
     std::optional<B::Pad> set;       // pad_set, until pad_clear
     std::vector<B::Pad> script;      // pad_script, one entry per poll
     uint64_t script_start = 0;
+    // A script that steps with the host clock (pad_script_timing "time"): entry i from script_t0 + i fields, and
+    // before script_t0 what the port presented when it was submitted.
+    bool script_timed = false;
+    std::chrono::steady_clock::time_point script_t0{};
+    std::optional<B::Pad> gap;
 };
 std::array<Port, 4> s_ports;
+
+// pad_script_timing (Dolphin's Harness::SetScriptTiming): scripts submitted from then on step with the host clock,
+// one entry a field (59.94 Hz) from a random fraction of a field after they are submitted, instead of with the
+// game's reads, as a player's presses fall anywhere between two reads. Under s_mutex.
+bool s_timed_scripts = false;
+uint64_t s_timed_rng = 0x9E3779B97F4A7C15ull;
+constexpr std::chrono::duration<double, std::micro> kField(1e6 * 1001.0 / 60000.0);
+
+uint64_t NextTimedRandom() {
+    // splitmix64, as Dolphin's
+    uint64_t z = (s_timed_rng += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+// What port `port` presents at poll `poll` (the poll's own index) and host time `now`: a controller on port 1 only,
+// as Dolphin's harness instances have (its other ports read "no controller", error 0xFF), so the game's pad memory
+// is the same on both; pad_set over it; a script over that. Under s_mutex.
+B::Pad PortPad(int port, uint64_t poll, std::chrono::steady_clock::time_point now) {
+    const Port& p = s_ports[size_t(port)];
+    B::Pad pad{};
+    pad.connected = port == 0;
+    if (p.set) pad = *p.set;
+    if (p.script.empty()) return pad;
+    if (p.script_timed) {
+        const double pos = std::chrono::duration<double, std::micro>(now - p.script_t0) / kField;
+        if (pos < 0) return p.gap ? *p.gap : pad;
+        if (pos < double(p.script.size())) return p.script[size_t(pos)];
+        return pad;
+    }
+    if (poll >= p.script_start && poll < p.script_start + p.script.size()) return p.script[size_t(poll - p.script_start)];
+    return pad;
+}
 
 picojson::value Num(double v) { return picojson::value(v); }
 
@@ -390,9 +430,20 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         std::lock_guard lock(s_mutex);
         auto& p = s_ports[port];
         uint64_t start = s_polls.load() + 1;
-        if (const picojson::value* sv = Find(a, "start"); sv && sv->is<double>()) start = uint64_t(sv->get<double>());
+        const picojson::value* sv = Find(a, "start");
+        const bool given = sv && sv->is<double>();
+        if (given) start = uint64_t(sv->get<double>());
+        // A timed script bridges the time until it starts with what the port presents now.
+        const auto now = std::chrono::steady_clock::now();
+        const B::Pad before = PortPad(port, s_polls.load(), now);
         p.script = std::move(timeline);
         p.script_start = start;
+        p.script_timed = s_timed_scripts && !given;
+        if (p.script_timed) {
+            p.gap = before;
+            const double frac = double(NextTimedRandom() >> 11) * 0x1p-53;  // [0, 1)
+            p.script_t0 = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(kField * frac);
+        }
         Object r;
         r["starts_at"] = Num(double(start));
         r["ends_at"] = Num(double(start + p.script.size()));
@@ -404,9 +455,26 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         const uint64_t polls = s_polls.load();
         const uint64_t end = p.script_start + p.script.size();
         Object r;
+        if (p.script_timed && !p.script.empty()) {
+            const double pos =
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - p.script_t0) / kField;
+            const double left = double(p.script.size()) - std::max(pos, 0.0);
+            r["active"] = picojson::value(left > 0);
+            r["remaining"] = Num(left > 0 ? std::ceil(left) : 0.0);
+            return r;
+        }
         r["active"] = picojson::value(!p.script.empty() && polls < end);
         r["remaining"] = Num(double(!p.script.empty() && polls < end ? end - polls : 0));
         return r;
+    }
+    if (cmd == "pad_script_timing") {
+        // Dolphin's (docs/harness-protocol.md): "time" (scripts step with the host clock) or "poll" (with the game's reads).
+        const std::string mode = Find(a, "mode") ? Str(a, "mode") : "poll";
+        if (mode != "time" && mode != "poll") throw Error("mode must be \"time\" or \"poll\"");
+        std::lock_guard lock(s_mutex);
+        s_timed_scripts = mode == "time";
+        s_timed_rng = U64(a, "seed", 0) ^ 0x9E3779B97F4A7C15ull;
+        return {};
     }
     if (cmd == "wait_frame") {
         const bool polls = Find(a, "input_polls") != nullptr;
@@ -971,19 +1039,20 @@ void CoreHarnessPads(Pad* pads) {
     {
         std::lock_guard lock(s_mutex);
         const uint64_t poll = ++s_polls;
-        for (int port = 0; port < 4; ++port) {
-            auto& p = s_ports[size_t(port)];
-            B::Pad pad{};
-            // A controller on port 1 only, as Dolphin's harness instances have (its other ports read
-            // "no controller", error 0xFF): the game's pad memory is the same on both.
-            pad.connected = port == 0;
-            if (p.set) pad = *p.set;
-            if (!p.script.empty() && poll >= p.script_start && poll < p.script_start + p.script.size())
-                pad = p.script[size_t(poll - p.script_start)];
-            pads[port] = pad;
-        }
+        const auto now = std::chrono::steady_clock::now();
+        for (int port = 0; port < 4; ++port) pads[port] = PortPad(port, poll, now);
     }
     s_cv.notify_all();
+}
+
+// A look between polls (input suggestions, the core's read after a rollback): the pads as now, no poll counted (a
+// script that steps with the polls shows the last poll's entry).
+void CoreHarnessPeekPads(Pad* pads) {
+    if (!CoreHarnessActive()) return;
+    std::lock_guard lock(s_mutex);
+    const uint64_t poll = s_polls.load();
+    const auto now = std::chrono::steady_clock::now();
+    for (int port = 0; port < 4; ++port) pads[port] = PortPad(port, poll, now);
 }
 
 }  // namespace BrawlOnlineBridge

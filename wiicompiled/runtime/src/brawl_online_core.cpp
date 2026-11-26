@@ -305,8 +305,10 @@ void AudioReport(char* out, size_t size) {
 }
 
 Pad LocalPad(int chan) {
+    // A look (the core's read after a rollback): what the game would read now, changing nothing; while a test
+    // script drives the pads, the latched read.
     FrameInput::GcPad pads[4]{};
-    PAD_HLE_SampleLocalPads(pads);
+    if (!FrameInput::PeekLocal(pads)) pads[chan & 3] = FrameInput::Get(uint32_t(chan & 3)).pad;
     const auto& p = pads[chan & 3];
     return {p.connected, p.button, p.stickX, p.stickY, p.substickX, p.substickY, p.triggerL, p.triggerR};
 }
@@ -442,6 +444,7 @@ void Start() {
         std::abort();
     });
     DetClock::Enable();
+    DetClock::SetWaitHook(&SampleForSuggestions);
     // The sound hooks act at pcs inside these two (SoundHook): they run in the interpreter, as a mod's patched code does.
     GuestCodePatch::InterpretForHooks(0x801C9950u, "Brawl Online's sound hooks: SoundArchivePlayer::detail_SetupSound");
     GuestCodePatch::InterpretForHooks(0x801BC684u, "Brawl Online's sound hooks: BasicSound::Stop");
@@ -559,6 +562,48 @@ void HarnessPads(void* gc_pads) {
     for (int i = 0; i < 4; ++i)
         if (p[i].button & 0x0100) settings_overlay::NotifyStrapInputAccepted();
 }
+void HarnessPeekPads(void* gc_pads) {
+    if (!Enabled() || !B::CoreHarnessActive()) return;
+    auto* pads = static_cast<FrameInput::GcPad*>(gc_pads);
+    B::Pad p[4]{};
+    B::CoreHarnessPeekPads(p);
+    for (int i = 0; i < 4; ++i)
+        pads[i] = {p[i].connected, p[i].button, p[i].stickX, p[i].stickY, p[i].substickX, p[i].substickY, p[i].triggerL, p[i].triggerR};
+}
+void HostPadsRead(void* frame) {
+    if (!Enabled()) return;
+    auto& f = *static_cast<FrameInput::Frame*>(frame);
+    B::Pad p[4]{};
+    for (int i = 0; i < 4; ++i) {
+        const FrameInput::GcPad& g = f[size_t(i)].pad;
+        p[i] = {g.connected, g.button, g.stickX, g.stickY, g.substickX, g.substickY, g.triggerL, g.triggerR};
+    }
+    B::CoreHostPadsRead(p);
+    for (int i = 0; i < 4; ++i)
+        f[size_t(i)].pad = {p[i].connected, p[i].button, p[i].stickX, p[i].stickY, p[i].substickX, p[i].substickY,
+                            p[i].triggerL, p[i].triggerR};
+}
+bool SampleForSuggestions() {
+    if (!Enabled()) return false;
+    const int chan = B::CoreSuggestChannel();
+    if (chan < 0 || chan >= 4) return false;
+    // About once a period (PPR_GPRB_SUGGEST_SAMPLE_HZ, 1000 by default), however the waits come.
+    static const auto period = std::chrono::nanoseconds(B::CoreSuggestPeriodNs());
+    static std::chrono::steady_clock::time_point last{};
+    const auto start = std::chrono::steady_clock::now();
+    if (start - last < period * 9 / 10) return true;
+    FrameInput::GcPad pads[4]{};
+    if (!FrameInput::PeekLocal(pads)) return false;
+    const auto end = std::chrono::steady_clock::now();
+    last = start;
+    const FrameInput::GcPad& g = pads[chan];
+    const auto ns = [](std::chrono::steady_clock::time_point t) {
+        return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+    };
+    B::CoreSuggestSample(chan, {g.connected, g.button, g.stickX, g.stickY, g.substickX, g.substickY, g.triggerL, g.triggerR},
+                         ns(start), ns(end));
+    return true;
+}
 void NoteLocalPads(const void* frame) {
     if (Enabled()) B::NoteLeaveButtons(*static_cast<const FrameInput::Frame*>(frame));
 }
@@ -599,12 +644,15 @@ bool DolphinControlsLoaded() {
 }
 }  // namespace
 
-void ApplyDolphinControls(PADStatus* statuses) {
+void ApplyDolphinControls(PADStatus* statuses, bool peek) {
     if (!Enabled() || statuses == nullptr || !DolphinControlsLoaded()) return;
     B::Pad pads[4]{};
     int si[4]{};
     // Dolphin reads the controls only with its game window in front (Dolphin.ini [Input] BackgroundInput off).
-    B::DolphinControlsRead(SDL_GetKeyboardFocus() != nullptr, pads, si);
+    if (peek)
+        B::DolphinControlsPeek(SDL_GetKeyboardFocus() != nullptr, pads, si);
+    else
+        B::DolphinControlsRead(SDL_GetKeyboardFocus() != nullptr, pads, si);
     if (!B::DolphinControlsActive()) return;
     for (int port = 0; port < 4; ++port) {
         PADStatus& s = statuses[port];

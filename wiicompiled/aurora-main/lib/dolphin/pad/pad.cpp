@@ -687,6 +687,17 @@ static void neutralize_status(PADStatus& status) {
   status.analogB = 0;
 }
 
+// apply_unblock_suppression's effect on `status` without its updates (PADPeek).
+static void peek_unblock_suppression(PADStatus& status, const u32 port) {
+  status.button &= ~(g_suppressedButtons[port] & status.button);
+  if (g_suppressLeftTrigger[port] && status.triggerLeft > ClampRegion.minTrigger) {
+    status.triggerLeft = 0;
+  }
+  if (g_suppressRightTrigger[port] && status.triggerRight > ClampRegion.minTrigger) {
+    status.triggerRight = 0;
+  }
+}
+
 static void apply_unblock_suppression(PADStatus& status, const u32 port, const bool captureHeldInput) {
   if (captureHeldInput) {
     g_suppressedButtons[port] |= status.button;
@@ -714,7 +725,8 @@ static void apply_unblock_suppression(PADStatus& status, const u32 port, const b
   }
 }
 
-u32 PADRead(PADStatus* status) {
+// PADRead (peek false) and PADPeek (true: the same statuses, no state changed).
+static u32 read_pads(PADStatus* status, const bool peek) {
   if (!g_keyboardBindingsLoaded) {
     g_keyboardBindingsLoaded = true;
     load_keyboard_bindings();
@@ -723,8 +735,10 @@ u32 PADRead(PADStatus* status) {
   int numKeys = 0;
   const bool* kbState = SDL_GetKeyboardState(&numKeys);
   const bool inputBlocked = g_blockPAD.load(std::memory_order_acquire);
-  const bool captureHeldInput = g_suppressHeldOnRead && !inputBlocked;
-  g_suppressHeldOnRead = false;
+  const bool captureHeldInput = !peek && g_suppressHeldOnRead && !inputBlocked;
+  if (!peek) {
+    g_suppressHeldOnRead = false;
+  }
 
   uint32_t rumbleSupport = 0;
   for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {
@@ -732,9 +746,11 @@ u32 PADRead(PADStatus* status) {
     auto controller = aurora::input::get_controller_for_player(i);
     if (controller == nullptr && !g_keyboardBindings[i].m_mappingsSet) {
       status[i].err = PAD_ERR_NO_CONTROLLER;
-      g_suppressedButtons[i] = 0;
-      g_suppressLeftTrigger[i] = false;
-      g_suppressRightTrigger[i] = false;
+      if (!peek) {
+        g_suppressedButtons[i] = 0;
+        g_suppressLeftTrigger[i] = false;
+        g_suppressRightTrigger[i] = false;
+      }
       continue;
     }
 
@@ -993,7 +1009,7 @@ u32 PADRead(PADStatus* status) {
 
       // Update the LED colors when they exist and the controller is read (which should happen once per frame in most
       // games)
-      if (controller->m_hasRgbLed && controller->m_isColorDirty) {
+      if (!peek && controller->m_hasRgbLed && controller->m_isColorDirty) {
         SDL_SetGamepadLED(controller->m_controller, controller->m_ledRed, controller->m_ledGreen,
                           controller->m_ledBlue);
         controller->m_isColorDirty = false;
@@ -1002,12 +1018,17 @@ u32 PADRead(PADStatus* status) {
 
     if (inputBlocked) {
       neutralize_status(status[i]);
+    } else if (peek) {
+      peek_unblock_suppression(status[i], i);
     } else {
       apply_unblock_suppression(status[i], i, captureHeldInput);
     }
   }
   return rumbleSupport;
 }
+
+u32 PADRead(PADStatus* status) { return read_pads(status, false); }
+u32 PADPeek(PADStatus* status) { return read_pads(status, true); }
 
 void PADControlMotor(const u32 chan, const u32 cmd) {
   const auto controller = aurora::input::get_controller_for_player(chan);
