@@ -77,6 +77,8 @@ std::atomic<uint64_t> g_frameLatencyCount{0};
 std::atomic<uint64_t> g_frameLatencyMaxNanos{0};
 // The refresh period of the screen the window is on (window.cpp note_display_refresh), 0 when unknown.
 std::atomic<uint64_t> g_displayPeriodNanos{0};
+// The swapchain's present mode blocks each present until a refresh (Fifo); gpu.cpp apply_present_mode sets it.
+std::atomic<bool> g_presentWaitsForRefresh{false};
 
 void note_display_refresh(float hz) noexcept {
   g_displayPeriodNanos.store(hz > 1.0f ? static_cast<uint64_t>(1e9 / hz) : 0, std::memory_order_release);
@@ -800,6 +802,10 @@ struct PresentationJob {
   uint32_t slot = 0;
   // When the frame was ready, on the frame's own image only (frame latency diagnostics).
   PresentClock::time_point readyAt{};
+  // An inserted frame kept a refresh after the previous present (presenter_main). False when the frame's slots come
+  // faster than the screen refreshes (240 on 144 Hz): then each goes out at its own time and the screen keeps the
+  // newest, since spacing them a refresh apart would push every later slot off its own time.
+  bool spaced = true;
 };
 
 std::array<std::vector<std::shared_ptr<PresentationImage>>, gx::MaxInterpolatedFrames + 1>
@@ -1073,7 +1079,7 @@ void presenter_main() noexcept {
       // guess instead of the frame (PresentMon, 240 Hz: 3-3.9 ms after the previous present, 41% never displayed;
       // 4.25 ms or more, under 2%). So it waits for a refresh (+3%) after the previous present; the game's own
       // frames never wait.
-      if (job.interpolated && job.presentAt != PresentClock::time_point{} &&
+      if (job.interpolated && job.spaced && job.presentAt != PresentClock::time_point{} &&
           g_lastPresentCall != PresentClock::time_point{}) {
         const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
         if (period != 0) {
@@ -1484,6 +1490,12 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
   // interpolation off, pace to the boundary that just passed plus 6.5 ms; late frames free-run.
   constexpr uint64_t kNativePresentOffsetNanos = 6'500'000;
   const uint32_t presentationJobCount = ctx.interpolatedFrameCount + 1;
+  // Slots no closer than a refresh (5% slack: 240 on a 239.76 Hz screen still counts) keep the presenter's spacing.
+  const bool slotsSpaced = [&] {
+    const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
+    const uint64_t interval = ctx.scheduleIntervalNanos != 0 ? ctx.scheduleIntervalNanos : 16'683'350;
+    return period == 0 || interval * 105 / 100 / presentationJobCount >= period;
+  }();
   // Seal-anchored (aurora_set_seal_present_schedule): Interpolate's slots start a lead after the frame was ready
   // (the time to encode them, AURORA_INTERP_LEAD_US, 3 ms by default) and end with the frame itself.
   static const uint64_t kSealLeadNanos = [] {
@@ -1586,6 +1598,7 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
           .interpolated = true,
           .sequence = ctx.sequence,
           .slot = k + 1,
+          .spaced = slotsSpaced,
       });
       submitEncodedSlot(encoder);
     }
@@ -1609,6 +1622,7 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
           .presentAt = slotPresentDeadline(interpolatedFrame),
           .interpolated = true,
           .sequence = ctx.sequence,
+          .spaced = slotsSpaced,
       });
       submitEncodedSlot(encoder);
       encoder = gpu::Encoder{};
@@ -1634,6 +1648,7 @@ std::vector<PresentationJob> encode_sealed_frame_impl(gfx::SealedFrame& sealedFr
           .interpolated = true,
           .duplicated = true,
           .sequence = ctx.sequence,
+          .spaced = slotsSpaced,
       });
       submitEncodedSlot(encoder);
       encoder = gpu::Encoder{};

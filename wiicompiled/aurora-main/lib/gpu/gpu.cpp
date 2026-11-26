@@ -27,6 +27,10 @@ namespace aurora::gx {
 void clear_display_copy_cache() noexcept;
 } // namespace aurora::gx
 
+namespace aurora {
+extern std::atomic<bool> g_presentWaitsForRefresh;  // aurora.cpp
+} // namespace aurora
+
 namespace aurora::gpu {
 static Module Log("aurora::gpu");
 
@@ -1041,6 +1045,7 @@ void apply_present_mode() noexcept {
     return;
   }
   g_graphicsConfig.presentMode = best_present_mode();
+  g_presentWaitsForRefresh.store(g_graphicsConfig.presentMode == SDL_GPU_PRESENTMODE_VSYNC, std::memory_order_release);
   if (!SDL_SetGPUSwapchainParameters(g_device, g_window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
                                      g_graphicsConfig.presentMode)) {
     Log.warn("Failed to set the present mode: {}", SDL_GetError());

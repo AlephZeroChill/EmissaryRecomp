@@ -27,6 +27,8 @@
 namespace aurora {
 // aurora.cpp: the refresh period of the screen the window is on, 0 when unknown.
 extern std::atomic<uint64_t> g_displayPeriodNanos;
+// gpu.cpp apply_present_mode: the swapchain's present mode blocks each present until a refresh (Fifo).
+extern std::atomic<bool> g_presentWaitsForRefresh;
 } // namespace aurora
 
 namespace aurora::gx {
@@ -349,10 +351,17 @@ uint32_t maximum_interpolation_samples() noexcept {
     return 0;
   }
   uint32_t samples = std::min(targetFps / 60 - 1, MaxInterpolatedFrames);
-  // No more inserted frames than the screen can show. The presenter puts each one at least a refresh after the
-  // previous present, so on a screen slower than the target (240 on a 120 Hz MacBook, 180 or 240 on a 144 Hz monitor)
-  // the extra ones queued behind it and held the game itself back: 23 game frames a second at 240 on 120 Hz. Now the
-  // target counts as the screen's: 120 Hz shows 120 (one inserted frame), 144 and 165 Hz 120, 180 Hz 180, 240 Hz 240.
+  // A screen slower than the target (240 on a 144 Hz monitor) gets every frame of the target: each one goes out at
+  // its own time and the screen shows the newest at each refresh, as a game running above the refresh rate does (240
+  // on 144 Hz shows ~144 different pictures; capped, it showed 120). Only where a present waits for the screen are
+  // inserted frames held to what it shows: macOS presents on the game's own thread, and Fifo (V-Sync without Mailbox)
+  // blocks each present for a refresh, so the extra ones held the game itself back there (23 game frames a second at
+  // 240 on the 120 Hz MacBook). There 120 Hz shows 120 (one inserted frame), 144 and 165 Hz 120, 180 Hz 180.
+#if !defined(__APPLE__)
+  if (!g_presentWaitsForRefresh.load(std::memory_order_acquire)) {
+    return samples;
+  }
+#endif
   const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
   if (period != 0) {
     const auto refreshesPerFrame = static_cast<uint32_t>(1e9 / static_cast<double>(period) / 60.0 + 0.05);
