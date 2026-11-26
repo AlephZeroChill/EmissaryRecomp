@@ -96,6 +96,17 @@ def main():
         args.native_arg += ['-DMKW_PGO_GENERATE=ON', '-DMKW_PGO_PROFILE=']
     elif args.pgo_profile:
         args.native_arg += ['-DMKW_PGO_GENERATE=OFF', f'-DMKW_PGO_PROFILE={args.pgo_profile.resolve(strict=True)}']
+    # The memory model: lean unless a native argument picks one. Passed every time, because CMake keeps a build
+    # folder's cached options: a folder first configured with the old flat default (an earlier checkout's build/, the
+    # release workflow's restored cache) switches too. Picking one side alone turns the other off.
+    picked = {m.group(1): m.group(2).upper() in ('ON', '1', 'TRUE', 'YES')
+              for a in args.native_arg if (m := re.fullmatch(r'-DMKW_(FLAT|LEAN)_MEMORY(?::BOOL)?=(\w+)', a))}
+    if not picked:
+        args.native_arg += ['-DMKW_FLAT_MEMORY=OFF', '-DMKW_LEAN_MEMORY=ON']
+    elif picked.get('FLAT') and 'LEAN' not in picked:
+        args.native_arg.append('-DMKW_LEAN_MEMORY=OFF')
+    elif picked.get('LEAN') and 'FLAT' not in picked:
+        args.native_arg.append('-DMKW_FLAT_MEMORY=OFF')
     if args.jobs < 1:
         parser.error('--jobs must be positive')
     if args.release_version and not re.fullmatch(r'v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?', args.release_version):
