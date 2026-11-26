@@ -15,6 +15,7 @@
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <aurora/render_size_limits.hpp>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_vulkan.h>
 
 #include "../gfx/common.hpp"
@@ -335,14 +336,58 @@ SDL_GPUComputePass* Encoder::begin_compute_pass(const SDL_GPUStorageTextureReadW
   return SDL_BeginGPUComputePass(m_cmd, textures, textureCount, buffers, bufferCount);
 }
 
+// A command buffer that fails to submit is never retired: SDL_GPU keeps everything it used (cycled transfer and
+// uniform buffers, descriptor sets) bound to it for good, so each later frame allocates new ones. After a driver
+// reset (VK_ERROR_DEVICE_LOST, NVIDIA event 153) every submit fails and the process grew by about 2.5 GB a second
+// to over 40 GB before the driver crashed it (Brawl Online board: "WHY are the emissary agent runs eating 22 GIGABYTES
+// OF RAM"). A lost device does not come back, so close the game the way its window's close button does: the
+// runtime's exit path stops Brawl Online's core first and saves the SD card.
+static std::atomic<uint32_t> g_failedSubmitsInARow{0};
+static std::atomic<bool> g_quitForFailedSubmits{false};
+
+static void note_submit_result(bool ok) {
+  if (ok) {
+    g_failedSubmitsInARow.store(0, std::memory_order_relaxed);
+    return;
+  }
+  const char* error = SDL_GetError();
+  Log.error("Failed to submit a command buffer: {}", error);
+  const std::string_view text = error != nullptr ? error : "";
+  const bool lost = text.find("DEVICE_LOST") != std::string_view::npos ||
+                    text.find("DEVICE_REMOVED") != std::string_view::npos ||
+                    text.find("DEVICE_HUNG") != std::string_view::npos ||
+                    text.find("DEVICE_RESET") != std::string_view::npos;
+  const uint32_t inARow = g_failedSubmitsInARow.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((lost || inARow >= 120) && !g_quitForFailedSubmits.exchange(true)) {
+    Log.error("The graphics device is gone ({} failed submits in a row): closing the game", inARow);
+    SDL_Event quit{};
+    quit.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit);
+  }
+}
+
+// Test hook: AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS=N cancels every command buffer after the Nth submit and reports
+// VK_ERROR_DEVICE_LOST, the way a driver reset does, without resetting the GPU every other program shares.
+static bool test_device_lost(SDL_GPUCommandBuffer* cmd) {
+  static const uint64_t after = [] {
+    const char* value = std::getenv("AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS");
+    return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+  }();
+  static std::atomic<uint64_t> submits{0};
+  if (after == 0 || submits.fetch_add(1, std::memory_order_relaxed) < after) {
+    return false;
+  }
+  SDL_CancelGPUCommandBuffer(cmd);
+  SDL_SetError("vkQueueSubmit VK_ERROR_DEVICE_LOST (AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS)");
+  return true;
+}
+
 void Encoder::submit() {
   if (m_cmd == nullptr) {
     return;
   }
   end_copy_pass();
-  if (!SDL_SubmitGPUCommandBuffer(m_cmd)) {
-    Log.error("Failed to submit a command buffer: {}", SDL_GetError());
-  }
+  note_submit_result(!test_device_lost(m_cmd) && SDL_SubmitGPUCommandBuffer(m_cmd));
   m_cmd = nullptr;
 }
 
@@ -351,10 +396,8 @@ SDL_GPUFence* Encoder::submit_with_fence() {
     return nullptr;
   }
   end_copy_pass();
-  SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(m_cmd);
-  if (fence == nullptr) {
-    Log.error("Failed to submit a command buffer: {}", SDL_GetError());
-  }
+  SDL_GPUFence* fence = test_device_lost(m_cmd) ? nullptr : SDL_SubmitGPUCommandBufferAndAcquireFence(m_cmd);
+  note_submit_result(fence != nullptr);
   m_cmd = nullptr;
   return fence;
 }
