@@ -174,8 +174,10 @@ jobs:
         if: always()
         run: python -c "import os, shutil; shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'], 'game'), ignore_errors=True)"
 
+      # A cache that can't be saved never fails the build (the next run builds from scratch).
       - name: Save the build cache
         if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        continue-on-error: true
         env:
           EMISSARY_GAME_KEY: ${{ secrets.EMISSARY_GAME_KEY }}
         run: |
@@ -183,9 +185,11 @@ jobs:
           skip=()
           while IFS= read -r d; do skip+=(--skip "${d#build/}"); done < <(find build -maxdepth 3 -type d \
             \( -name dotnet -o -name downloads -o -name nuget -o -name dotnet-home \) -prune)
+          mkdir -p "$RUNNER_TEMP/cache"  # only there when a cache was restored
           python tools/ci/game_code.py cache-save --dir build --out "$RUNNER_TEMP/cache/build-${{ matrix.name }}.tar.gz.gpg" "${skip[@]}"
       - name: Upload the build cache
         if: success() && vars.EMISSARY_BUILD_CACHE != 'off' && github.ref_type == 'branch'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
