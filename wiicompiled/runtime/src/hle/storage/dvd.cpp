@@ -280,7 +280,7 @@ static bool IsDvdDataRoot(const fs::path& path) {
         details += HostPathText(path);
     }
     details += "\n\nSet [paths] dvd_root in Config.toml to your Super Smash Bros. Brawl "
-               "(RSBE01 revision 1), extracted with Dolphin's Extract Entire Disc.";
+               "(RSBE01 revision 1 or 2), extracted with Dolphin's Extract Entire Disc.";
     FailDvd("dvd_root", "DVD data is unavailable", details);
 }
 
@@ -989,6 +989,10 @@ extern "C" void DVDInit_HLE()
     if (std::ifstream boot(rootPath / "sys" / "boot.bin", std::ios::binary); boot) {
         char id[0x20] = {};
         if (boot.read(id, sizeof(id))) {
+            // Brawl revision 2 differs from revision 1 only in this byte and the matching operand of main.dol's
+            // revision check (0x8001BC9F). This build runs revision 1's main.dol, so it gets revision 1's disc ID:
+            // its RAM is then the same as on a revision 1 disc.
+            if (std::memcmp(id, "RSBE01", 6) == 0 && id[7] == 2) id[7] = 1;
             for (uint32_t i = 0; i < sizeof(id); ++i) Memory::Write8(diskHeader + i, static_cast<uint8_t>(id[i]));
         }
     }
