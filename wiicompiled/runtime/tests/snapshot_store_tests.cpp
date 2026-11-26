@@ -2,6 +2,8 @@
 #include "brawl_write_watch.h"
 #include <cassert>
 #include <iostream>
+#include <memory>
+#include <new>
 #include <random>
 #include <utility>
 
@@ -217,11 +219,60 @@ static void TestBatchCallbacksAndFailures() {
     std::cout << "batch callback isolation, failures and asynchronous overlap: ok\n";
 }
 
+// A guest store's marks (Mark and MarkHost, inline through MarkSmall for writes of up to 64 bytes) are exactly
+// MarkSlow's and MarkHostSlow's: aligned, unaligned, across a 64-byte block and across a 64 KiB page, and the bulk
+// sizes they pass on.
+static void TestStoreMarksMatchSlowMarks() {
+#if !MKW_LEAN_MEMORY
+    using BrawlDirtyMemory::Page;
+    auto slow = std::make_unique<Page[]>(3), fast = std::make_unique<Page[]>(3);
+    const uintptr_t savedBase = BrawlDirtyMemory::flatBase;
+    BrawlDirtyMemory::flatBase = uintptr_t{1} << 40; // a pretend flat window: MarkHost only does arithmetic on it
+    BrawlDirtyMemory::active.store(true);
+    for (bool host : {false, true})
+        for (uint32_t base : {0x80010000u, 0x8001FFC0u, 0x8002FFF9u})
+            for (uint32_t offset = 0; offset < 130; ++offset)
+                for (size_t size : {1, 2, 4, 8, 16, 32, 63, 64, 65, 200}) {
+                    const uint32_t address = base + offset;
+                    const void* pointer = reinterpret_cast<const void*>(BrawlDirtyMemory::flatBase + address);
+                    for (int i = 0; i < 3; ++i) {
+                        slow[i].~Page();
+                        new (&slow[i]) Page();
+                        fast[i].~Page();
+                        new (&fast[i]) Page();
+                    }
+                    for (int i = 0; i < 3; ++i)
+                        BrawlDirtyMemory::pages[0x8001 + i] = &slow[i];
+                    if (host)
+                        BrawlDirtyMemory::MarkHostSlow(pointer, size);
+                    else
+                        BrawlDirtyMemory::MarkSlow(address, size);
+                    for (int i = 0; i < 3; ++i)
+                        BrawlDirtyMemory::pages[0x8001 + i] = &fast[i];
+                    if (host)
+                        BrawlDirtyMemory::MarkHost(pointer, size);
+                    else
+                        BrawlDirtyMemory::Mark(address, size);
+                    for (int i = 0; i < 3; ++i) {
+                        assert(slow[i].touched.load() == fast[i].touched.load());
+                        for (int k = 0; k < 1024; ++k)
+                            assert(slow[i].blocks[k].load() == fast[i].blocks[k].load());
+                    }
+                }
+    for (int i = 0; i < 3; ++i)
+        BrawlDirtyMemory::pages[0x8001 + i] = nullptr;
+    BrawlDirtyMemory::active.store(false);
+    BrawlDirtyMemory::flatBase = savedBase;
+    std::cout << "store marks match MarkSlow and MarkHostSlow: ok\n";
+#endif
+}
+
 int main() {
     TestBatchCallbacksAndFailures();
     TestEvictedSourcesAndSlotReuse();
     TestOnlyLaterWritesNeedRestoring();
     TestHistoryAgainstFullImages();
     TestConsumedMarksAcrossSnapshotBoundaries();
+    TestStoreMarksMatchSlowMarks();
     std::cout << "snapshot store: ok\n";
 }
