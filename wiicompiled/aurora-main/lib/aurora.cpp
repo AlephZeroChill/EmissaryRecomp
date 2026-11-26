@@ -834,7 +834,9 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
 
   auto image = std::make_shared<PresentationImage>();
   image->texture = gpu::create_render_texture(width, height, false);
-  pool.emplace_back(image);
+  if (image->texture.texture) {
+    pool.emplace_back(image);
+  }
   return image;
 }
 
@@ -1222,10 +1224,11 @@ void stop_presenter() noexcept {
 void encode_presentation_snapshot(gpu::Encoder& encoder, const gpu::PresentSource& presentSource,
                                   const PresentationImage& image, bool includeImGui) {
   ZoneScoped;
-  const auto& target = *image.texture.texture;
-  if (!presentSource.texture) {
+  // No texture: it failed to create (a lost device, which closes the game). The presenter's draw_copy skips it.
+  if (!image.texture.texture || !presentSource.texture) {
     return;
   }
+  const auto& target = *image.texture.texture;
   auto viewport = gpu::calculate_present_viewport(target.width, target.height, presentSource.texture->width,
                                                   presentSource.texture->height);
   float presentAspect = 0.f;

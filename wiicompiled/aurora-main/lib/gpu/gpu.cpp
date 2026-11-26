@@ -52,6 +52,36 @@ static std::atomic_bool g_initialized{false};
 static Texture g_presentOverrideTexture;
 static Sampler g_presentOverrideSampler;
 
+// ---- a lost device ----
+
+// A command buffer that fails to submit is never retired: SDL_GPU keeps everything it used (cycled transfer and
+// uniform buffers, descriptor sets) bound to it for good, so each later frame allocates new ones. After a driver
+// reset (VK_ERROR_DEVICE_LOST, NVIDIA event 153) every submit fails and the process grew by about 2.5 GB a second
+// to over 40 GB before the driver crashed it (Brawl Online board: "WHY are the emissary agent runs eating 22 GIGABYTES
+// OF RAM"). A lost device does not come back, so close the game the way its window's close button does: the
+// runtime's exit path stops Brawl Online's core first and saves the SD card. A texture that fails to create on a lost
+// device closes it too: that can come before any submit fails (bug report #354: the presenter was 455 ms in a
+// swapchain acquire, so the frame worker made a new presentation image, and that failed first).
+static std::atomic<uint32_t> g_failedSubmitsInARow{0};
+static std::atomic<bool> g_quitForLostDevice{false};
+static std::atomic<bool> g_testDeviceLost{false};  // AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS has fired
+
+static bool names_lost_device(const char* error) {
+  const std::string_view text = error != nullptr ? error : "";
+  return text.find("DEVICE_LOST") != std::string_view::npos || text.find("DEVICE_REMOVED") != std::string_view::npos ||
+         text.find("DEVICE_HUNG") != std::string_view::npos || text.find("DEVICE_RESET") != std::string_view::npos;
+}
+
+static void close_for_lost_device(const char* what, uint32_t count) {
+  if (g_quitForLostDevice.exchange(true)) {
+    return;
+  }
+  Log.error("The graphics device is gone ({} {}): closing the game", count, what);
+  SDL_Event quit{};
+  quit.type = SDL_EVENT_QUIT;
+  SDL_PushEvent(&quit);
+}
+
 // ---- object lifetimes ----
 
 TextureObject::~TextureObject() {
@@ -98,13 +128,22 @@ Texture create_texture(const SDL_GPUTextureCreateInfo& info, const char* label) 
     SDL_SetStringProperty(props, SDL_PROP_GPU_TEXTURE_CREATE_NAME_STRING, label);
     createInfo.props = props;
   }
-  SDL_GPUTexture* handle = SDL_CreateGPUTexture(g_device, &createInfo);
+  SDL_GPUTexture* handle = nullptr;
+  if (g_testDeviceLost.load(std::memory_order_relaxed)) {
+    SDL_SetError("vkQueueSubmit VK_ERROR_DEVICE_LOST (AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS)");
+  } else {
+    handle = SDL_CreateGPUTexture(g_device, &createInfo);
+  }
   if (props != 0) {
     SDL_DestroyProperties(props);
   }
   if (handle == nullptr) {
+    const char* error = SDL_GetError();
     Log.error("Failed to create texture {} ({}x{}, format {}): {}", label ? label : "", info.width, info.height,
-              static_cast<int>(info.format), SDL_GetError());
+              static_cast<int>(info.format), error);
+    if (names_lost_device(error)) {
+      close_for_lost_device("failed texture", 1);
+    }
     return nullptr;
   }
   auto texture = std::make_shared<TextureObject>();
@@ -340,15 +379,6 @@ SDL_GPUComputePass* Encoder::begin_compute_pass(const SDL_GPUStorageTextureReadW
   return SDL_BeginGPUComputePass(m_cmd, textures, textureCount, buffers, bufferCount);
 }
 
-// A command buffer that fails to submit is never retired: SDL_GPU keeps everything it used (cycled transfer and
-// uniform buffers, descriptor sets) bound to it for good, so each later frame allocates new ones. After a driver
-// reset (VK_ERROR_DEVICE_LOST, NVIDIA event 153) every submit fails and the process grew by about 2.5 GB a second
-// to over 40 GB before the driver crashed it (Brawl Online board: "WHY are the emissary agent runs eating 22 GIGABYTES
-// OF RAM"). A lost device does not come back, so close the game the way its window's close button does: the
-// runtime's exit path stops Brawl Online's core first and saves the SD card.
-static std::atomic<uint32_t> g_failedSubmitsInARow{0};
-static std::atomic<bool> g_quitForFailedSubmits{false};
-
 static void note_submit_result(bool ok) {
   if (ok) {
     g_failedSubmitsInARow.store(0, std::memory_order_relaxed);
@@ -356,22 +386,15 @@ static void note_submit_result(bool ok) {
   }
   const char* error = SDL_GetError();
   Log.error("Failed to submit a command buffer: {}", error);
-  const std::string_view text = error != nullptr ? error : "";
-  const bool lost = text.find("DEVICE_LOST") != std::string_view::npos ||
-                    text.find("DEVICE_REMOVED") != std::string_view::npos ||
-                    text.find("DEVICE_HUNG") != std::string_view::npos ||
-                    text.find("DEVICE_RESET") != std::string_view::npos;
   const uint32_t inARow = g_failedSubmitsInARow.fetch_add(1, std::memory_order_relaxed) + 1;
-  if ((lost || inARow >= 120) && !g_quitForFailedSubmits.exchange(true)) {
-    Log.error("The graphics device is gone ({} failed submits in a row): closing the game", inARow);
-    SDL_Event quit{};
-    quit.type = SDL_EVENT_QUIT;
-    SDL_PushEvent(&quit);
+  if (names_lost_device(error) || inARow >= 120) {
+    close_for_lost_device("failed submits in a row", inARow);
   }
 }
 
 // Test hook: AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS=N cancels every command buffer after the Nth submit and reports
-// VK_ERROR_DEVICE_LOST, the way a driver reset does, without resetting the GPU every other program shares.
+// VK_ERROR_DEVICE_LOST, the way a driver reset does, without resetting the GPU every other program shares. From then
+// on textures fail to create too (create_texture), as they do on a lost device.
 static bool test_device_lost(SDL_GPUCommandBuffer* cmd) {
   static const uint64_t after = [] {
     const char* value = std::getenv("AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS");
@@ -381,6 +404,7 @@ static bool test_device_lost(SDL_GPUCommandBuffer* cmd) {
   if (after == 0 || submits.fetch_add(1, std::memory_order_relaxed) < after) {
     return false;
   }
+  g_testDeviceLost.store(true, std::memory_order_relaxed);
   SDL_CancelGPUCommandBuffer(cmd);
   SDL_SetError("vkQueueSubmit VK_ERROR_DEVICE_LOST (AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS)");
   return true;
