@@ -151,6 +151,8 @@ trees themselves (fetched by `Launcher/Prepare-Dependencies.ps1`) so end-user bu
 | Dear ImGui | 1.91.9b-docking | MIT | <https://github.com/ocornut/imgui> |
 | {fmt} | 11.1.4 | MIT | <https://github.com/fmtlib/fmt> |
 | xxHash | 0.8.4 | BSD-2-Clause | <https://github.com/Cyan4973/xxHash> |
+| glslang (GLSL to SPIR-V) | 16.6.0 | BSD-3-Clause, with parts under MIT, Apache-2.0 and others (its `LICENSE.txt`) | <https://github.com/KhronosGroup/glslang> |
+| SPIRV-Cross (SPIR-V to HLSL, Windows) | vulkan-sdk-1.4.363.0 | Apache-2.0 | <https://github.com/KhronosGroup/SPIRV-Cross> |
 | zlib | 1.3.2 | zlib | <https://github.com/madler/zlib> |
 | libpng | 1.6.58 | PNG Reference Library License v2 | <https://github.com/pnggroup/libpng> |
 | FreeType | 2.14.3 | **FreeType License (FTL)** - see below | <https://freetype.org/> |

@@ -188,6 +188,27 @@ void LogMisc() {
   LogGpus();
 }
 
+bool system_info::dxgi_adapter_memory(const std::string& name, uint64_t& dedicatedBytes) {
+  ComPtr<IDXGIFactory1> factory;
+  if (name.empty() || FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory.Put())))) {
+    return false;
+  }
+  for (UINT i = 0;; i++) {
+    ComPtr<IDXGIAdapter1> adapter;
+    if (factory->EnumAdapters1(i, adapter.Put()) == DXGI_ERROR_NOT_FOUND) {
+      return false;
+    }
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+      continue;
+    }
+    if (wideStringToUtf8(std::wstring_view(desc.Description, wcsnlen(desc.Description, 128))) == name) {
+      dedicatedBytes = desc.DedicatedVideoMemory;
+      return true;
+    }
+  }
+}
+
 #elif __APPLE__
 
 static std::string sysCtlToString(const char* name) {

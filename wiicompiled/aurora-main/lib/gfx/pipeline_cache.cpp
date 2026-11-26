@@ -491,8 +491,29 @@ static void note_pipeline_queue_drained() {
   Log.info("Pipeline prewarm finished: {} pipelines in {:.1f} s", g_prewarmCount, elapsed.count() / 1000.0);
 }
 
+// First-use cost per backend (Direct3D 12 compiles HLSL before the driver does): a line every 200 pipelines built on
+// the workers, with the mean and longest build.
+static std::atomic<uint64_t> g_builtPipelines{0};
+static std::atomic<uint64_t> g_buildNs{0};
+static std::atomic<uint64_t> g_longestBuildNs{0};
+
+static void note_pipeline_build(std::chrono::steady_clock::duration took) {
+  const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count());
+  const uint64_t n = g_builtPipelines.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t total = g_buildNs.fetch_add(ns, std::memory_order_relaxed) + ns;
+  uint64_t longest = g_longestBuildNs.load(std::memory_order_relaxed);
+  while (ns > longest && !g_longestBuildNs.compare_exchange_weak(longest, ns, std::memory_order_relaxed)) {
+  }
+  if (n % 200 == 0) {
+    Log.info("Pipelines built on {}: {}, {:.2f} ms each, longest {:.1f} ms", gpu::backend_name(), n, total / 1e6 / n,
+             std::max(longest, ns) / 1e6);
+  }
+}
+
 static void compile_pending_pipeline(PendingPipeline pending) {
+  const auto buildStart = std::chrono::steady_clock::now();
   auto result = pending.create();
+  note_pipeline_build(std::chrono::steady_clock::now() - buildStart);
   {
     std::lock_guard lock{g_pipelineMutex};
     const auto [_, inserted] = g_pipelines.try_emplace(pending.hash, CachedPipeline{
