@@ -124,15 +124,20 @@ jobs:
 
       # Builds are incremental between runs: the last build folder (translated code, objects; encrypted with the same
       # key, since it is the game's code too), restored at the same path, so only what changed is built again. A
-      # cache saved by a run on the default branch is what tag runs and other branches start from.
+      # cache saved by a run on the default branch is what tag runs and other branches start from. Only from the same
+      # runner image: a precompiled header records the system headers' times, and a new image (macOS's Xcode SDK, the
+      # first v0.7.1 runs) makes clang refuse it ("has been modified since the precompiled header ... was built").
+      - name: Runner image
+        id: image
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Restore the build cache
         id: cache
         if: vars.EMISSARY_BUILD_CACHE != 'off'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
-          key: build-${{ matrix.name }}-${{ github.run_id }}
-          restore-keys: build-${{ matrix.name }}-
+          key: build-${{ matrix.name }}-${{ steps.image.outputs.id }}-${{ github.run_id }}
+          restore-keys: build-${{ matrix.name }}-${{ steps.image.outputs.id }}-
       - name: Unpack the build cache
         if: steps.cache.outputs.cache-matched-key != ''
         env:
@@ -193,7 +198,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
-          key: build-${{ matrix.name }}-${{ github.run_id }}
+          key: build-${{ matrix.name }}-${{ steps.image.outputs.id }}-${{ github.run_id }}
 
       # The program only (what the release holds), for the package job.
       - name: Keep the program (Linux)
