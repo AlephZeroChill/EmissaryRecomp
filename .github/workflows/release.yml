@@ -43,8 +43,28 @@ env:
   PYTHONUNBUFFERED: '1'
 
 jobs:
-  build:
+  # A tag whose release is already published (tools/release.py --publish-existing: the files built and tested
+  # before, which creates the tag) builds nothing again: no second build or release of the same version.
+  check:
     if: vars.EMISSARY_GAME_REPO != ''
+    runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.release.outputs.published }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]] && gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_REF_NAME is already published: nothing to build"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.published != 'true'
     name: build (${{ matrix.name }})
     strategy:
       fail-fast: false
