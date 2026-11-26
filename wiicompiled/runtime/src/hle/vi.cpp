@@ -818,7 +818,20 @@ struct FrameTimes {
     double gameMs = 0, endFrameMs = 0, paceMs = 0, worstMs = 0, sumSq = 0;
     int slow = 0;
     int frames = 0;
+    // The game thread's CPU cycles over each frame's game share (Windows: QueryThreadCycleTime), which a host clock
+    // that swings with load and boost does not change: the number to compare two builds by on one PC.
+    uint64_t lastPresentEndCycles = 0, gameCycles = 0;
 };
+
+static uint64_t GameThreadCycles() {
+#if defined(_WIN32)
+    ULONG64 cycles = 0;
+    ::QueryThreadCycleTime(::GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    return 0;
+#endif
+}
 
 // Called once per presented frame, on the game's thread. Does nothing: it is a uprobe target, so perf can split a
 // cycles recording into frames (cycles per frame, independent of the host clock, which swings 1.5-5 GHz here as the
@@ -1098,6 +1111,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
 
     const Clock::time_point endFrameStart = Clock::now();
+    const uint64_t endFrameStartCycles = LogFpsEnabled() && presentedXfb ? GameThreadCycles() : 0;
     aurora_end_frame();
     if (presentedXfb) {  // Aurora's draw commands this frame (unmerged) and the primitives merged into them
         if (const AuroraStats* stats = aurora_get_stats()) {
@@ -1152,6 +1166,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             const double game = ms(presentStart - times.lastPresentEnd) + ms(endFrameStart - presentStart);
             const double frame = ms(now - times.lastPresentEnd);
             times.gameMs += game;
+            times.gameCycles += endFrameStartCycles - times.lastPresentEndCycles;
             times.endFrameMs += ms(paceStart - endFrameStart);
             times.paceMs += ms(now - paceStart);
             times.worstMs = std::max(times.worstMs, frame);
@@ -1162,6 +1177,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             times.windowStart = now;
         }
         times.lastPresentEnd = now;
+        times.lastPresentEndCycles = GameThreadCycles();
         const double window = ms(now - times.windowStart);
         if (window >= 2000.0 && times.frames > 0) {
             const double n = times.frames;
@@ -1175,6 +1191,8 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
                     n * 1000.0 / window, times.gameMs / n, gxNanos / 1e6 / n, lockNanos / 1e6 / n, draws / n,
                     copies / n, creates / n, times.endFrameMs / n, times.paceMs / n, times.worstMs,
                     std::sqrt(std::max(0.0, times.sumSq / n - (window / n) * (window / n))), times.slow);
+            RT_LOGF(RT_TAG_VI, "game thread: %.3fM cycles per frame in its game share (%d frames)\n",
+                    times.gameCycles / 1e6 / n, times.frames);
             RT_LOGF(RT_TAG_VI, "aurora: %.1f draw commands (unmerged), %.1f merged primitives per frame\n",
                     s_frameUnmergedDraws / n, s_frameMergedDraws / n);
             s_frameUnmergedDraws = s_frameMergedDraws = 0;
@@ -1247,6 +1265,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             times = FrameTimes{};
             times.windowStart = now;
             times.lastPresentEnd = now;
+            times.lastPresentEndCycles = GameThreadCycles();
         }
     }
     settings_overlay::AdvancePresentedFrame();
