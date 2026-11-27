@@ -7,6 +7,7 @@
 #include "gfx/texture_replacement.hpp"
 #include "gx/gx.hpp"
 #include "gx/fifo.hpp"
+#include "gx/frame_interpolation.hpp"
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
 #include "gpu/gpu.hpp"
@@ -631,6 +632,26 @@ constexpr std::array<AuroraBackend, 0> PreferredBackendOrder{};
 
 bool g_initialFrame = false;
 
+// Where Automatic's choice after Vulkan losses is kept: one line, "direct3d12", in the user folder.
+std::string automatic_backend_file() {
+  return std::string(g_config.userPath != nullptr ? g_config.userPath : "") + "/automatic-graphics-api.txt";
+}
+
+bool automatic_prefers_d3d12() {
+#if defined(_WIN32) && defined(AURORA_ENABLE_GX)
+  std::ifstream in(automatic_backend_file());
+  std::string word;
+  return static_cast<bool>(in >> word) && word == "direct3d12";
+#else
+  return false;
+#endif
+}
+
+void remember_automatic_d3d12() {
+  std::ofstream out(automatic_backend_file(), std::ios::trunc);
+  out << "direct3d12\n";
+}
+
 
 AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexcept {
   g_config = config;
@@ -708,7 +729,13 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   }
 
   if (!windowCreated) {
-    for (const auto backendType : PreferredBackendOrder) {
+    std::vector<AuroraBackend> order(PreferredBackendOrder.begin(), PreferredBackendOrder.end());
+    if (requestedBackend == BACKEND_AUTO && automatic_prefers_d3d12()) {
+      Log.info("Automatic graphics backend: Direct3D 12 first (Vulkan lost its device twice in one run on this PC; {})",
+               automatic_backend_file());
+      std::stable_partition(order.begin(), order.end(), [](AuroraBackend b) { return b == BACKEND_D3D12; });
+    }
+    for (const auto backendType : order) {
       selectedBackend = backendType;
       if (!window::create_window(selectedBackend)) {
         rememberGraphicsError();
@@ -1219,6 +1246,86 @@ void stop_presenter() noexcept {
     g_presenter.presenting = false;
   }
   g_presenterStarted.store(false, std::memory_order_release);
+}
+
+// ---- a lost device (gpu::device_lost) ----
+
+std::atomic<uint32_t> g_deviceRecoveries{0};
+constexpr uint32_t kMaxDeviceRecoveries = 3;
+
+// On the game thread at the start of a frame, with the GX thread synced: everything made on the lost device is let go
+// and made again on a new one, as the program's start makes it (gpu::initialize, gfx::initialize, ImGui's objects).
+// The GX state the game set (its loaded texture and TLUT objects among it) stays; the frames in flight are dropped.
+// The game goes on after a pause: the pipelines come back from the pipeline cache (on Vulkan the driver's own cache
+// keeps them quick). Each loss is logged with what the driver says about it. At most kMaxDeviceRecoveries times a
+// run; on Windows a second loss on Vulkan moves to Direct3D 12 (and Automatic picks it first on this PC from then on).
+// False: the game is closing instead (gpu::close_for_lost_device).
+bool recover_lost_device() noexcept {
+  const auto started = std::chrono::steady_clock::now();
+  const AuroraBackend lostOn = gpu::current_backend();
+  gpu::log_device_lost_details();
+  const uint32_t recoveries = g_deviceRecoveries.load(std::memory_order_acquire);
+  if (recoveries >= kMaxDeviceRecoveries) {
+    gpu::close_for_lost_device("lost again after 3 new devices");
+    return false;
+  }
+  AuroraBackend next = lostOn;
+#if defined(_WIN32) && defined(AURORA_GPU_D3D12_SHADERS)
+  if (lostOn == BACKEND_VULKAN && recoveries >= 1) {
+    next = BACKEND_D3D12;
+  }
+#endif
+  Log.error("Making a new graphics device on {} (loss {} of at most {} new devices)", backend_name(next),
+            recoveries + 1, kMaxDeviceRecoveries);
+
+  // Nothing else may touch the device: the frame worker and the presenter stop (made again by the next frame), the
+  // pipeline compilers stop in gfx::shutdown.
+  stop_frame_worker();
+  stop_presenter();
+  bool ok = false;
+  {
+    window::SurfaceLock surfaceLock;
+    std::lock_guard surfaceOwnership(g_surfaceMutex);
+    std::lock_guard gpuLock(g_rendererGpuMutex);
+    g_presentationImagePools = {};
+    imgui::release_device_objects();
+    const auto loadedTextures = gx::g_gxState.loadedTextures;
+    const auto loadedTluts = gx::g_gxState.loadedTluts;
+    gfx::shutdown();
+    gpu::shutdown();
+    ok = gpu::initialize(next);
+#if defined(_WIN32) && defined(AURORA_GPU_D3D12_SHADERS)
+    // The other API when this one gives no device (or no swapchain on the window).
+    if (!ok && (next == BACKEND_VULKAN || next == BACKEND_D3D12)) {
+      const AuroraBackend other = next == BACKEND_VULKAN ? BACKEND_D3D12 : BACKEND_VULKAN;
+      Log.error("No graphics device on {}: trying {}", backend_name(next), backend_name(other));
+      gpu::shutdown();
+      next = other;
+      ok = gpu::initialize(next);
+    }
+#endif
+    if (ok) {
+      gfx::initialize();
+      gx::g_gxState.loadedTextures = loadedTextures;
+      gx::g_gxState.loadedTluts = loadedTluts;
+      imgui::restore_device_objects();
+    }
+  }
+  if (!ok) {
+    gpu::close_for_lost_device("no new device could be made");
+    return false;
+  }
+  g_config.desiredBackend = gpu::current_backend();
+  gx::mark_frame_discontinuous();
+  if (lostOn == BACKEND_VULKAN && g_config.desiredBackend == BACKEND_D3D12) {
+    remember_automatic_d3d12();
+    Log.error("Vulkan lost the device twice: this run goes on on Direct3D 12, and Automatic picks it first on this PC "
+              "from now on ({})", automatic_backend_file());
+  }
+  g_deviceRecoveries.fetch_add(1, std::memory_order_acq_rel);
+  Log.error("New graphics device on {} in {} ms; the game goes on", backend_name(g_config.desiredBackend),
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+  return true;
 }
 
 // `presentSource` is latched in the seal prologue: by the time this encodes, the producer's next
@@ -1939,6 +2046,14 @@ bool begin_frame() noexcept {
 #endif
   // end_frame already synced; anything submitted since must still land in the frame it was meant for.
   gx::worker::sync();
+#ifdef AURORA_ENABLE_GX
+  if (gpu::device_lost() && !gpu::closing_for_lost_device() && !recover_lost_device()) {
+    return false;
+  }
+  if (gpu::closing_for_lost_device()) {
+    return false;
+  }
+#endif
   if (!frame_worker_requested()) {
     return begin_frame_impl(true);
   }
@@ -2324,6 +2439,20 @@ bool aurora_read_display_copy(uint8_t* rgba, uint32_t width, uint32_t height) {
 #endif
 }
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
+uint32_t aurora_get_device_recoveries() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::g_deviceRecoveries.load(std::memory_order_acquire);
+#else
+  return 0;
+#endif
+}
+bool aurora_closing_for_lost_device() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gpu::closing_for_lost_device();
+#else
+  return false;
+#endif
+}
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
   if (count != nullptr) {
     *count = aurora::PreferredBackendOrder.size();

@@ -376,6 +376,98 @@ char *SDL_SYS_GetCurrentDirectory(void)
                 SDL_SetBooleanProperty(SDL_GetJoystickProperties(joystick), "WiiCompiled.gamecube.raw_axes", true);
             }
             if (ctx->wireless[i]) {]==])
+
+  # Vulkan, a lost device (Brawl Online bug report #365 and the other device-lost reports, all NVIDIA on Vulkan):
+  # - robustBufferAccess on wherever the device has it: a shader's read past the end of a bound buffer (aurora pulls
+  #   vertices out of storage buffers, with indices the game's display lists give) reads zeros instead of faulting the
+  #   GPU, which a driver answers by taking the device away. Direct3D 11 and 12 always check buffer views this way.
+  #   The hint "WiiCompiled.vulkan.robust_buffer_access" = 0 turns it off (aurora's AURORA_GFX_FLAGS=norobust).
+  # - VK_EXT_device_fault where the device has it (optional, as VK_KHR_driver_properties): after a loss, the driver
+  #   can say what faulted and where (aurora gpu.cpp log_device_lost_details).
+  # - The instance and device handles, and whether each of those is on, in the device's properties
+  #   ("WiiCompiled.vulkan.*"), for aurora's own calls.
+  _aurora_sdl3_replace("${_vk}" "Vulkan device fault (extension field)"
+[==[    // Only required for decoding HDR ASTC textures
+    Uint8 EXT_texture_compression_astc_hdr;
+} VulkanExtensions;]==]
+[==[    // Only required for decoding HDR ASTC textures
+    Uint8 EXT_texture_compression_astc_hdr;
+    // WiiCompiled: what faulted when the device is lost (AuroraSDL3Patches.cmake)
+    Uint8 EXT_device_fault;
+} VulkanExtensions;]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan device fault (extension check)"
+[==[else CHECK(MSFT_layered_driver) else CHECK(EXT_texture_compression_astc_hdr)
+]==]
+[==[else CHECK(MSFT_layered_driver) else CHECK(EXT_texture_compression_astc_hdr) else CHECK(EXT_device_fault)
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan device fault (extension count)"
+[==[        supports->EXT_texture_compression_astc_hdr);]==]
+[==[        supports->EXT_texture_compression_astc_hdr +
+        supports->EXT_device_fault);]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan device fault (extension list)"
+[==[    CHECK(EXT_texture_compression_astc_hdr)
+#undef CHECK]==]
+[==[    CHECK(EXT_texture_compression_astc_hdr)
+    CHECK(EXT_device_fault)
+#undef CHECK]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan robust buffer access"
+[==[    if (haveDeviceFeatures.multiDrawIndirect) {
+        features->desiredVulkan10DeviceFeatures.multiDrawIndirect = VK_TRUE;
+        renderer->supportsMultiDrawIndirect = true;
+    }
+]==]
+[==[    if (haveDeviceFeatures.multiDrawIndirect) {
+        features->desiredVulkan10DeviceFeatures.multiDrawIndirect = VK_TRUE;
+        renderer->supportsMultiDrawIndirect = true;
+    }
+
+    /* WiiCompiled: out-of-bounds buffer reads give zeros instead of a GPU fault (AuroraSDL3Patches.cmake) */
+    if (haveDeviceFeatures.robustBufferAccess &&
+        SDL_GetHintBoolean("WiiCompiled.vulkan.robust_buffer_access", true)) {
+        features->desiredVulkan10DeviceFeatures.robustBufferAccess = VK_TRUE;
+    }
+]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan device fault (feature)"
+[==[    vulkanResult = renderer->vkCreateDevice(
+        renderer->physicalDevice,
+        &deviceCreateInfo,
+        NULL,
+        &renderer->logicalDevice);]==]
+[==[    VkPhysicalDeviceFaultFeaturesEXT wiiDeviceFault; /* WiiCompiled: AuroraSDL3Patches.cmake */
+    if (renderer->supports.EXT_device_fault) {
+        SDL_zero(wiiDeviceFault);
+        wiiDeviceFault.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+        wiiDeviceFault.pNext = (void *)deviceCreateInfo.pNext;
+        wiiDeviceFault.deviceFault = VK_TRUE;
+        deviceCreateInfo.pNext = &wiiDeviceFault;
+    }
+
+    vulkanResult = renderer->vkCreateDevice(
+        renderer->physicalDevice,
+        &deviceCreateInfo,
+        NULL,
+        &renderer->logicalDevice);]==])
+  _aurora_sdl3_replace("${_vk}" "Vulkan handles in the device's properties"
+[==[    if (!VULKAN_INTERNAL_CreateLogicalDevice(renderer, &features)) {
+        SET_STRING_ERROR("Failed to create logical device!");
+        SDL_free(renderer);
+        SDL_Vulkan_UnloadLibrary();
+        return NULL;
+    }
+]==]
+[==[    if (!VULKAN_INTERNAL_CreateLogicalDevice(renderer, &features)) {
+        SET_STRING_ERROR("Failed to create logical device!");
+        SDL_free(renderer);
+        SDL_Vulkan_UnloadLibrary();
+        return NULL;
+    }
+    /* WiiCompiled: AuroraSDL3Patches.cmake */
+    SDL_SetPointerProperty(renderer->props, "WiiCompiled.vulkan.instance", (void *)renderer->instance);
+    SDL_SetPointerProperty(renderer->props, "WiiCompiled.vulkan.device", (void *)renderer->logicalDevice);
+    SDL_SetBooleanProperty(renderer->props, "WiiCompiled.vulkan.device_fault", renderer->supports.EXT_device_fault != 0);
+    SDL_SetBooleanProperty(renderer->props, "WiiCompiled.vulkan.robust_buffer_access",
+                           features.desiredVulkan10DeviceFeatures.robustBufferAccess == VK_TRUE);
+]==])
 endfunction()
 
 # Script mode (FetchContent PATCH_COMMAND).

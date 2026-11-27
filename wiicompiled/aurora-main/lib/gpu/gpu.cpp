@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cwctype>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -16,7 +17,20 @@
 #include <aurora/gfx.h>
 #include <aurora/render_size_limits.hpp>
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_vulkan.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
@@ -36,6 +50,7 @@ namespace aurora::gpu {
 static Module Log("aurora::gpu");
 
 SDL_GPUDevice* g_device = nullptr;
+std::atomic<uint32_t> g_deviceGeneration{1};
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
 TextureWithSampler g_frameBufferResolved;
@@ -55,17 +70,23 @@ static Sampler g_presentOverrideSampler;
 
 // ---- a lost device ----
 
-// A command buffer that fails to submit is never retired: SDL_GPU keeps everything it used (cycled transfer and
-// uniform buffers, descriptor sets) bound to it for good, so each later frame allocates new ones. After a driver
-// reset (VK_ERROR_DEVICE_LOST, NVIDIA event 153) every submit fails and the process grew by about 2.5 GB a second
-// to over 40 GB before the driver crashed it (Brawl Online board: "WHY are the emissary agent runs eating 22 GIGABYTES
-// OF RAM"). A lost device does not come back, so close the game the way its window's close button does: the
-// runtime's exit path stops Brawl Online's core first and saves the SD card. A texture that fails to create on a lost
-// device closes it too: that can come before any submit fails (bug report #354: the presenter was 455 ms in a
-// swapchain acquire, so the frame worker made a new presentation image, and that failed first).
+// A device is lost when the driver takes it away: a reset after the GPU stopped answering (Windows' TDR), a fault on
+// the GPU (a read or write where nothing is mapped), or a crash in the driver or in an overlay hooked into it. Every
+// object made on it is gone with it, and Vulkan does not give it back: a new device has to be made, and everything on
+// it again. None of the game's own state is on the GPU (aurora makes its textures, buffers and pipelines from guest
+// memory and the pipeline cache), so the game thread does that at its next frame (recover_lost_device in aurora.cpp)
+// and the game goes on after a pause.
+//
+// Until then a command buffer that fails to submit is never retired: SDL_GPU keeps everything it used (cycled transfer
+// and uniform buffers, descriptor sets) bound to it for good, so each later frame allocates new ones. Left alone, the
+// process grew by about 2.5 GB a second to over 40 GB before the driver crashed it (Brawl Online board: "WHY are the
+// emissary agent runs eating 22 GIGABYTES OF RAM"). A failed texture is as good a sign as a failed submit: it can come
+// first (bug report #354: the presenter was 455 ms in a swapchain acquire, so the frame worker made a new presentation
+// image, and that failed before any submit did).
 static std::atomic<uint32_t> g_failedSubmitsInARow{0};
+static std::atomic<uint32_t> g_lostGeneration{0};  // the generation whose device was lost; 0: none
 static std::atomic<bool> g_quitForLostDevice{false};
-static std::atomic<bool> g_testDeviceLost{false};  // AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS has fired
+static std::atomic<bool> g_testDeviceLost{false};  // AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS has fired on this device
 
 static bool names_lost_device(const char* error) {
   const std::string_view text = error != nullptr ? error : "";
@@ -73,11 +94,25 @@ static bool names_lost_device(const char* error) {
          text.find("DEVICE_HUNG") != std::string_view::npos || text.find("DEVICE_RESET") != std::string_view::npos;
 }
 
-static void close_for_lost_device(const char* what, uint32_t count) {
+static void note_device_lost(const char* what, uint32_t count) {
+  const uint32_t generation = g_deviceGeneration.load(std::memory_order_acquire);
+  if (g_lostGeneration.exchange(generation, std::memory_order_acq_rel) == generation) {
+    return;
+  }
+  Log.error("The graphics device is gone ({} {}): a new one is made at the next frame", count, what);
+}
+
+bool device_lost() noexcept {
+  return g_lostGeneration.load(std::memory_order_acquire) == g_deviceGeneration.load(std::memory_order_acquire);
+}
+
+bool closing_for_lost_device() noexcept { return g_quitForLostDevice.load(std::memory_order_acquire); }
+
+void close_for_lost_device(const char* why) noexcept {
   if (g_quitForLostDevice.exchange(true)) {
     return;
   }
-  Log.error("The graphics device is gone ({} {}): closing the game", count, what);
+  Log.error("The graphics device is gone and does not come back ({}): closing the game", why);
   SDL_Event quit{};
   quit.type = SDL_EVENT_QUIT;
   SDL_PushEvent(&quit);
@@ -86,37 +121,37 @@ static void close_for_lost_device(const char* what, uint32_t count) {
 // ---- object lifetimes ----
 
 TextureObject::~TextureObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUTexture(g_device, handle);
   }
 }
 SamplerObject::~SamplerObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUSampler(g_device, handle);
   }
 }
 BufferObject::~BufferObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUBuffer(g_device, handle);
   }
 }
 TransferBufferObject::~TransferBufferObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUTransferBuffer(g_device, handle);
   }
 }
 ShaderObject::~ShaderObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUShader(g_device, handle);
   }
 }
 GraphicsPipelineObject::~GraphicsPipelineObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUGraphicsPipeline(g_device, handle);
   }
 }
 ComputePipelineObject::~ComputePipelineObject() {
-  if (handle != nullptr && g_device != nullptr) {
+  if (handle != nullptr && g_device != nullptr && generation == g_deviceGeneration.load(std::memory_order_relaxed)) {
     SDL_ReleaseGPUComputePipeline(g_device, handle);
   }
 }
@@ -143,7 +178,7 @@ Texture create_texture(const SDL_GPUTextureCreateInfo& info, const char* label) 
     Log.error("Failed to create texture {} ({}x{}, format {}): {}", label ? label : "", info.width, info.height,
               static_cast<int>(info.format), error);
     if (names_lost_device(error)) {
-      close_for_lost_device("failed texture", 1);
+      note_device_lost("failed texture", 1);
     }
     return nullptr;
   }
@@ -238,7 +273,11 @@ GraphicsPipeline create_graphics_pipeline(const SDL_GPUGraphicsPipelineCreateInf
     SDL_DestroyProperties(props);
   }
   if (handle == nullptr) {
-    Log.error("Failed to create pipeline {}: {}", label ? label : "", SDL_GetError());
+    const char* error = SDL_GetError();
+    Log.error("Failed to create pipeline {}: {}", label ? label : "", error);
+    if (names_lost_device(error)) {
+      note_device_lost("failed pipeline", 1);
+    }
     return nullptr;
   }
   auto pipeline = std::make_shared<GraphicsPipelineObject>();
@@ -389,24 +428,44 @@ static void note_submit_result(bool ok) {
   Log.error("Failed to submit a command buffer: {}", error);
   const uint32_t inARow = g_failedSubmitsInARow.fetch_add(1, std::memory_order_relaxed) + 1;
   if (names_lost_device(error) || inARow >= 120) {
-    close_for_lost_device("failed submits in a row", inARow);
+    note_device_lost("failed submits in a row", inARow);
+  }
+  // The game thread makes a new device at its next frame. If that never comes (the game stuck elsewhere), the failed
+  // submits must not pile up (about 2.5 GB a second): give up as before.
+  if (inARow >= 3000) {
+    close_for_lost_device("no new device after 3000 failed submits");
   }
 }
 
-// Test hook: AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS=N cancels every command buffer after the Nth submit and reports
+// Test hook: AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS=N reports every submit after the Nth as failed with
 // VK_ERROR_DEVICE_LOST, the way a driver reset does, without resetting the GPU every other program shares. From then
-// on textures fail to create too (create_texture), as they do on a lost device.
+// on textures fail to create too (create_texture), as they do on a lost device. It does so on each of the first
+// AURORA_TEST_DEVICE_LOST_TIMES devices (default 1): the new device made after a loss counts its own N submits.
 static bool test_device_lost(SDL_GPUCommandBuffer* cmd) {
   static const uint64_t after = [] {
     const char* value = std::getenv("AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS");
     return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
   }();
+  static const uint32_t times = [] {
+    const char* value = std::getenv("AURORA_TEST_DEVICE_LOST_TIMES");
+    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1u;
+  }();
   static std::atomic<uint64_t> submits{0};
-  if (after == 0 || submits.fetch_add(1, std::memory_order_relaxed) < after) {
+  static std::atomic<uint32_t> counting{1};  // the device generation `submits` counts for
+  const uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
+  if (after == 0 || generation > times) {
+    return false;
+  }
+  if (counting.exchange(generation, std::memory_order_relaxed) != generation) {
+    submits.store(0, std::memory_order_relaxed);
+  }
+  if (submits.fetch_add(1, std::memory_order_relaxed) < after) {
     return false;
   }
   g_testDeviceLost.store(true, std::memory_order_relaxed);
-  SDL_CancelGPUCommandBuffer(cmd);
+  // Submitted all the same (only reported as failed): SDL may not cancel a command buffer that acquired a swapchain
+  // image, and its Direct3D 12 backend then keeps that image, so the window takes no other swapchain.
+  SDL_SubmitGPUCommandBuffer(cmd);
   SDL_SetError("vkQueueSubmit VK_ERROR_DEVICE_LOST (AURORA_TEST_DEVICE_LOST_AFTER_SUBMITS)");
   return true;
 }
@@ -455,6 +514,11 @@ void retire_finished_work_without_present() {
   // whole frame behind, and the wait is what retires every finished command buffer.
   static SDL_GPUFence* s_fence = nullptr;
   static uint64_t s_requestsSeen = 0;
+  static uint32_t s_fenceGeneration = 0;
+  if (s_fenceGeneration != g_deviceGeneration.load(std::memory_order_relaxed)) {
+    s_fence = nullptr;  // an old device's, gone with it (recover_lost_device)
+    s_fenceGeneration = g_deviceGeneration.load(std::memory_order_relaxed);
+  }
   const uint64_t requests = g_swapchainRequests.load(std::memory_order_relaxed);
   if (requests != s_requestsSeen) {
     s_requestsSeen = requests;
@@ -1073,9 +1137,21 @@ static bool claim_window() {
     return true;
   }
   release_surface();
-  if (!SDL_ClaimWindowForGPUDevice(g_device, window)) {
-    Log.error("Failed to claim the window for the GPU device: {}", SDL_GetError());
-    return false;
+  // A window that just had a Direct3D 12 swapchain (a new device after a lost one) can refuse the next one for a
+  // moment: DXGI answers "Access is denied" while the old one is not all gone. Give it a second.
+  for (int attempt = 0;; ++attempt) {
+    if (SDL_ClaimWindowForGPUDevice(g_device, window)) {
+      break;
+    }
+    const std::string error = SDL_GetError();
+    if (attempt >= 20 || g_backendName != "direct3d12") {
+      Log.error("Failed to claim the window for the GPU device: {}", error);
+      return false;
+    }
+    if (attempt == 0) {
+      Log.warn("Failed to claim the window for the GPU device ({}): trying again", error);
+    }
+    SDL_Delay(50);
   }
   g_window = window;
   return true;
@@ -1171,6 +1247,172 @@ PictureAdjust picture_adjust() noexcept {
   return g_pictureAdjust;
 }
 
+// ---- why a device was lost ----
+
+// VK_EXT_device_fault (Vulkan, AuroraSDL3Patches.cmake enables it where the device has it): after a loss the driver
+// can say what faulted (a read, write or execute at an address no memory backs, and the vendor's own fault codes).
+// No Vulkan headers here: the few structures needed are declared as the Vulkan 1.3 headers lay them out.
+namespace {
+struct VkDeviceFaultCounts {
+  uint32_t sType = 1000341001;  // VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT
+  void* pNext = nullptr;
+  uint32_t addressInfoCount = 0;
+  uint32_t vendorInfoCount = 0;
+  uint64_t vendorBinarySize = 0;
+};
+struct VkDeviceFaultAddressInfo {
+  uint32_t addressType = 0;
+  uint64_t reportedAddress = 0;
+  uint64_t addressPrecision = 0;
+};
+struct VkDeviceFaultVendorInfo {
+  char description[256] = {};
+  uint64_t vendorFaultCode = 0;
+  uint64_t vendorFaultData = 0;
+};
+struct VkDeviceFaultInfo {
+  uint32_t sType = 1000341002;  // VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT
+  void* pNext = nullptr;
+  char description[256] = {};
+  VkDeviceFaultAddressInfo* pAddressInfos = nullptr;
+  VkDeviceFaultVendorInfo* pVendorInfos = nullptr;
+  void* pVendorBinaryData = nullptr;
+};
+static_assert(sizeof(VkDeviceFaultAddressInfo) == 24 && sizeof(VkDeviceFaultVendorInfo) == 272);
+using PFN_GetDeviceFaultInfo = int32_t (*)(void* device, VkDeviceFaultCounts* counts, VkDeviceFaultInfo* info);
+
+struct DeviceFaultQuery {
+  void* device = nullptr;
+  PFN_GetDeviceFaultInfo get = nullptr;
+};
+DeviceFaultQuery g_deviceFault;
+
+const char* fault_address_type(uint32_t type) noexcept {
+  switch (type) {
+  case 1: return "invalid read";
+  case 2: return "invalid write";
+  case 3: return "invalid execute";
+  case 4: return "instruction pointer (unknown)";
+  case 5: return "instruction pointer (invalid)";
+  case 6: return "instruction pointer (fault)";
+  default: return "none";
+  }
+}
+} // namespace
+
+static void read_device_fault_support(SDL_PropertiesID props) {
+  g_deviceFault = {};
+  if (g_backendName != "vulkan") {
+    return;
+  }
+  const bool robust = SDL_GetBooleanProperty(props, "WiiCompiled.vulkan.robust_buffer_access", false);
+  const bool fault = SDL_GetBooleanProperty(props, "WiiCompiled.vulkan.device_fault", false);
+  void* instance = SDL_GetPointerProperty(props, "WiiCompiled.vulkan.instance", nullptr);
+  void* device = SDL_GetPointerProperty(props, "WiiCompiled.vulkan.device", nullptr);
+  Log.info("Vulkan robust buffer access {}, device fault reports {}", robust ? "on" : "off",
+           fault ? "on" : "not on this device");
+  if (!fault || instance == nullptr || device == nullptr) {
+    return;
+  }
+  using PFN_GetInstanceProcAddr = void* (*)(void*, const char*);
+  using PFN_GetDeviceProcAddr = void* (*)(void*, const char*);
+  const auto getInstanceProc = reinterpret_cast<PFN_GetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+  const auto getDeviceProc = getInstanceProc != nullptr ? reinterpret_cast<PFN_GetDeviceProcAddr>(
+                                                              getInstanceProc(instance, "vkGetDeviceProcAddr"))
+                                                        : nullptr;
+  if (getDeviceProc == nullptr) {
+    return;
+  }
+  g_deviceFault.device = device;
+  g_deviceFault.get = reinterpret_cast<PFN_GetDeviceFaultInfo>(getDeviceProc(device, "vkGetDeviceFaultInfoEXT"));
+}
+
+static void log_device_fault() noexcept {
+  if (g_deviceFault.get == nullptr) {
+    if (g_backendName == "vulkan") {
+      Log.error("Device fault: the driver gives no fault report (no VK_EXT_device_fault)");
+    }
+    return;
+  }
+  VkDeviceFaultCounts counts;
+  const int32_t first = g_deviceFault.get(g_deviceFault.device, &counts, nullptr);
+  if (first < 0) {
+    Log.error("Device fault: no report (vkGetDeviceFaultInfoEXT {})", first);
+    return;
+  }
+  std::vector<VkDeviceFaultAddressInfo> addresses(std::min<uint32_t>(counts.addressInfoCount, 64));
+  std::vector<VkDeviceFaultVendorInfo> vendor(std::min<uint32_t>(counts.vendorInfoCount, 64));
+  counts.addressInfoCount = static_cast<uint32_t>(addresses.size());
+  counts.vendorInfoCount = static_cast<uint32_t>(vendor.size());
+  counts.vendorBinarySize = 0;  // the vendor's binary dump is not read
+  VkDeviceFaultInfo info;
+  info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+  info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+  const int32_t result = g_deviceFault.get(g_deviceFault.device, &counts, &info);
+  if (result < 0) {
+    Log.error("Device fault: no report (vkGetDeviceFaultInfoEXT {})", result);
+    return;
+  }
+  Log.error("Device fault: \"{}\" ({} addresses, {} vendor records)",
+            std::string_view(info.description, strnlen(info.description, sizeof(info.description))),
+            counts.addressInfoCount, counts.vendorInfoCount);
+  for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
+    const auto& a = addresses[i];
+    Log.error("Device fault: {} at 0x{:x} (+-0x{:x})", fault_address_type(a.addressType), a.reportedAddress,
+              a.addressPrecision);
+  }
+  for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendor.size(); ++i) {
+    const auto& v = vendor[i];
+    Log.error("Device fault: vendor \"{}\" code 0x{:x} data 0x{:x}",
+              std::string_view(v.description, strnlen(v.description, sizeof(v.description))), v.vendorFaultCode,
+              v.vendorFaultData);
+  }
+}
+
+// The DLLs in the game that are neither Windows' nor the game's own: overlays and capture programs hook into the
+// game's graphics this way (OBS, Overwolf, RivaTuner, Medal, Discord, Steam, TikTok LIVE Studio were all seen in
+// device-lost reports), and a crash in one of them takes the device with it.
+static void log_foreign_modules(const char* when) noexcept {
+#if defined(_WIN32)
+  HMODULE modules[1024];
+  DWORD needed = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+    return;
+  }
+  wchar_t windowsDir[MAX_PATH]{};
+  const UINT windowsLength = GetWindowsDirectoryW(windowsDir, MAX_PATH);
+  wchar_t exePath[MAX_PATH]{};
+  const DWORD exeLength = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+  std::wstring_view exeDir(exePath, exeLength);
+  exeDir = exeDir.substr(0, exeDir.find_last_of(L"\\/") + 1);
+  const auto startsWith = [](std::wstring_view path, std::wstring_view prefix) {
+    if (prefix.empty() || path.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+      if (towlower(path[i]) != towlower(prefix[i])) return false;
+    }
+    return true;
+  };
+  std::string list;
+  size_t count = 0;
+  for (DWORD i = 0; i < std::min<DWORD>(needed / sizeof(HMODULE), 1024); ++i) {
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(modules[i], path, MAX_PATH);
+    const std::wstring_view view(path, length);
+    if (length == 0 || startsWith(view, std::wstring_view(windowsDir, windowsLength)) || startsWith(view, exeDir)) {
+      continue;
+    }
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, path, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+    std::string utf8(static_cast<size_t>(std::max(bytes, 0)), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path, static_cast<int>(length), utf8.data(), bytes, nullptr, nullptr);
+    list += count++ == 0 ? "" : "; ";
+    list += utf8;
+  }
+  Log.info("Other programs' DLLs in the game {}: {}", when, count == 0 ? std::string("none") : list);
+#else
+  (void)when;
+#endif
+}
+
 bool initialize(AuroraBackend auroraBackend) {
   load_gfx_flags();
   const char* driver = sdl_driver(auroraBackend);
@@ -1188,17 +1430,28 @@ bool initialize(AuroraBackend auroraBackend) {
   constexpr SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
 #endif
   if (g_device == nullptr) {
+    // Vulkan bounds-checks buffer reads only with robustBufferAccess, which SDL leaves off (AuroraSDL3Patches.cmake
+    // turns it on where the device has it). AURORA_GFX_FLAGS=norobust: off, to compare.
+    SDL_SetHint("WiiCompiled.vulkan.robust_buffer_access", gfx_flag("norobust") ? "0" : "1");
     g_device = SDL_CreateGPUDevice(formats, gfx_flag("debug"), driver);
     if (g_device == nullptr) {
       Log.error("Failed to create the SDL_GPU device ({}): {}", driver ? driver : "any", SDL_GetError());
       return false;
     }
   }
+  g_failedSubmitsInARow.store(0, std::memory_order_relaxed);
+  g_testDeviceLost.store(false, std::memory_order_relaxed);
   g_backendName = SDL_GetGPUDeviceDriver(g_device);
   const SDL_PropertiesID props = SDL_GetGPUDeviceProperties(g_device);
   const char* name = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, nullptr);
   g_adapterName = name != nullptr ? name : g_backendName;
   Log.info("Graphics device: {} on {}", g_adapterName, g_backendName);
+  if (const char* version = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING, nullptr)) {
+    const char* info = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING, nullptr);
+    Log.info("Graphics driver: {}{}{}", version, info != nullptr ? ", " : "", info != nullptr ? info : "");
+  }
+  read_device_fault_support(props);
+  log_foreign_modules("now");
   if (g_backendName == "vulkan" || g_backendName == "direct3d12") {
     g_deviceFacts = g_backendName == "vulkan" ? read_vulkan_device_facts(g_adapterName)
                                               : read_dxgi_device_facts(g_adapterName);
@@ -1231,7 +1484,10 @@ bool initialize(AuroraBackend auroraBackend) {
       .maxTextureDimension2D = 16384,
   };
   g_graphicsConfig.msaaSamples = supported_msaa(g_config.msaa);
-  set_texture_anisotropy(g_config.maxTextureAnisotropy);
+  // A new device after a loss keeps what the options menu set since the start.
+  static bool s_anisotropySet = false;
+  set_texture_anisotropy(s_anisotropySet ? texture_anisotropy() : g_config.maxTextureAnisotropy);
+  s_anisotropySet = true;
   g_graphicsConfig.textureAnisotropy = texture_anisotropy();
   apply_present_mode();
   Log.info("Swapchain format {}, present mode {}, MSAA {}x", static_cast<int>(g_graphicsConfig.surfaceFormat),
@@ -1263,6 +1519,21 @@ void shutdown() {
     SDL_DestroyGPUDevice(g_device);
     g_device = nullptr;
   }
+  g_deviceFault = {};
+  // Whatever of the old device is still held now belongs to no device (gpu.hpp, g_deviceGeneration).
+  g_deviceGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+AuroraBackend current_backend() noexcept {
+  if (g_backendName == "vulkan") return BACKEND_VULKAN;
+  if (g_backendName == "direct3d12") return BACKEND_D3D12;
+  if (g_backendName == "metal") return BACKEND_METAL;
+  return BACKEND_AUTO;
+}
+
+void log_device_lost_details() noexcept {
+  log_device_fault();
+  log_foreign_modules("when the device was lost");
 }
 
 void release_surface() noexcept {

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,14 @@ constexpr size_t kMaxAsyncSlots = MaxAsyncReadbackSlots;
 // NSMBW: texture patches (animated tiles) are read back every frame, one slot per patch position.
 constexpr size_t kAsyncPatchMaxBytes = 16384;
 constexpr size_t kMaxAsyncPatchSlots = 512;
+// A one-shot color copy (schedule's `keep`: drawn once and sampled for long after, like Brawl's name tags over the
+// fighters, rendered once when the match's HUD loads) is read back into guest RAM too, as a console's copy is, so the
+// texture survives the GPU copy: after a lost device the new one decodes it from RAM (gpu::device_lost). Up to this
+// size, this many destinations (the least recently copied one makes room), and once per destination in this many
+// frames. AURORA_KEEP_COPIES=0: off.
+constexpr size_t kAsyncKeepMaxBytes = 256 * 1024;
+constexpr size_t kMaxAsyncKeepSlots = 64;
+constexpr uint32_t kKeepEveryFrames = 30;
 
 struct PendingCopy {
   void* dest = nullptr;
@@ -69,6 +78,8 @@ enum class AsyncState : uint8_t {
 // One readback per destination address, reused for that destination's lifetime: the probe hits
 // the same buffer every frame, so pooling avoids a per-frame allocation.
 struct AsyncSlot {
+  bool keep = false;          // a one-shot copy kept in RAM (kAsyncKeepMaxBytes)
+  uint32_t keptFrame = 0;     // when it was last scheduled
   gpu::TransferBuffer buffer;
   TextureHandle nativeTexture;
   // The texture read back, held from encode until after_submit records its download.
@@ -205,7 +216,7 @@ void drain_async_events() noexcept {
 } // namespace
 
 void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, TextureHandle texture,
-              uint32_t strideWidth) noexcept {
+              uint32_t strideWidth, bool keep) noexcept {
   if (dest == nullptr || width == 0 || height == 0 || !texture) {
     return;
   }
@@ -228,6 +239,55 @@ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, Text
   // native render does not replay, so they stay on the lazy path.
   bool async = !is_offscreen() && encodedSize != 0 &&
                encodedSize <= (patch ? kAsyncPatchMaxBytes : kAsyncReadbackMaxBytes);
+  static const bool keepCopies = [] {
+    const char* value = std::getenv("AURORA_KEEP_COPIES");
+    return value == nullptr || value[0] != '0';
+  }();
+  if (!async && keep && keepCopies && !patch && !is_offscreen() && encodedSize != 0 &&
+      encodedSize <= kAsyncKeepMaxBytes) {
+    std::lock_guard lock{g_asyncMutex};
+    const uint32_t frame = current_frame();
+    auto it = g_asyncSlots.find(dest);
+    if (it != g_asyncSlots.end()) {
+      // A probe's or a patch's slot stays theirs; a kept one is read back again at most every kKeepEveryFrames.
+      if (it->second.keep && frame - it->second.keptFrame >= kKeepEveryFrames) {
+        it->second.keptFrame = frame;
+        async = true;
+      }
+    } else {
+      size_t kept = 0;
+      auto oldest = g_asyncSlots.end();
+      for (auto s = g_asyncSlots.begin(); s != g_asyncSlots.end(); ++s) {
+        if (!s->second.keep) continue;
+        ++kept;
+        if (s->second.state == AsyncState::Idle &&
+            (oldest == g_asyncSlots.end() || frame - s->second.keptFrame > frame - oldest->second.keptFrame)) {
+          oldest = s;
+        }
+      }
+      if (kept >= kMaxAsyncKeepSlots && oldest != g_asyncSlots.end()) {
+        g_asyncSlots.erase(oldest);
+        --kept;
+      }
+      if (kept < kMaxAsyncKeepSlots) {
+        auto& slot = g_asyncSlots[dest];
+        slot.keep = true;
+        slot.keptFrame = frame;
+        async = true;
+      }
+    }
+    if (async) {
+      // Its RAM is written when the readback lands, not now: the GPU copy is what the game samples until then.
+      auto& list = g_asyncPending;
+      if (auto p = std::find_if(list.begin(), list.end(), [dest](const PendingCopy& c) { return c.dest == dest; });
+          p != list.end()) {
+        *p = std::move(request);
+      } else {
+        list.push_back(std::move(request));
+      }
+      return;
+    }
+  }
   if (async) {
     std::lock_guard lock{g_asyncMutex};
     const auto it = g_asyncSlots.find(dest);

@@ -77,7 +77,12 @@ inline void StopBrawlOnlineForWindowClose() noexcept {
     }
 }
 
+// The exit code when the game closes because the graphics device was lost for good (aurora_closing_for_lost_device):
+// the Brawl Online launcher tells the player why (its handle_dolphin_exit_code.ts, 0x4c).
+constexpr int kExitGraphicsDeviceLost = 0x4c;
+
 [[noreturn]] inline void ExitForAuroraWindowClose() noexcept {
+    const int exitCode = aurora_closing_for_lost_device() ? kExitGraphicsDeviceLost : EXIT_SUCCESS;
     StopBrawlOnlineForWindowClose();
     settings_overlay::ReleaseControllers();
     WindowPlacementPersistence::Flush(true);
@@ -89,10 +94,10 @@ inline void StopBrawlOnlineForWindowClose() noexcept {
     // the other threads are gone; a still-joinable std::thread then calls std::terminate and the fatal popup hangs
     // the close (issue #38).
     std::fflush(nullptr);
-    ::TerminateProcess(::GetCurrentProcess(), 0);
-    std::_Exit(EXIT_SUCCESS);
+    ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(exitCode));
+    std::_Exit(exitCode);
 #else
-    std::_Exit(EXIT_SUCCESS);
+    std::_Exit(exitCode);
 #endif
 }
 
