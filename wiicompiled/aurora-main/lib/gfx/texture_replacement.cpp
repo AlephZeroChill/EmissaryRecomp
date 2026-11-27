@@ -199,15 +199,54 @@ uint32_t texture_base_level_size(const GXTexObj_& obj) noexcept {
   }
 }
 
-std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj) noexcept {
+const TlutMetadata* get_loaded_tlut(const GXTexObj_& obj) noexcept {
   if (!is_palette_format(obj.format()) || obj.tlut >= s_loadedTluts.size()) {
-    return std::nullopt;
+    return nullptr;
   }
 
   const auto& tlut = s_loadedTluts[obj.tlut];
+  return tlut.valid ? &tlut : nullptr;
+}
+
+// The palette a palette texture's name is hashed from and its dump decoded with (guest bytes, big-endian).
+struct TlutView {
+  const uint8_t* data = nullptr;
+  size_t bytes = 0;
+  uint32_t format = 0;
+  uint16_t entries = 0;
+};
+
+// The TLUT the renderer decodes the texture with when the caller has it (gx.cpp resolve_static_palette_texture: the
+// slot's loaded object), else the mirror's copy of the slot. The mirror follows only GXInitTlutObj -> GXLoadTlut on
+// one host object; Brawl's NW4R code fills TLUT objects inline and reuses one for every character portrait, and
+// deferred native draws load a copy of the object, so the mirror had no palette for the CSS portraits: their names
+// got a TLUT hash of 0 and no Dolphin HD portrait ever matched (Brawl Online bug report #374).
+std::optional<TlutView> referenced_tlut(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
+  if (!is_palette_format(obj.format())) {
+    return std::nullopt;
+  }
+  if (tlut != nullptr) {
+    if (tlut->data == nullptr || tlut->numEntries == 0) {
+      return std::nullopt;
+    }
+    return TlutView{.data = static_cast<const uint8_t*>(tlut->data),
+                    .bytes = static_cast<size_t>(tlut->numEntries) * 2,
+                    .format = static_cast<uint32_t>(tlut->format),
+                    .entries = tlut->numEntries};
+  }
+  const TlutMetadata* loaded = get_loaded_tlut(obj);
+  if (loaded == nullptr) {
+    return std::nullopt;
+  }
+  return TlutView{.data = loaded->data.data(), .bytes = loaded->data.size(), .format = loaded->format,
+                  .entries = loaded->entries};
+}
+
+std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj, const GXTlutObj_* tlutObj) noexcept {
+  const auto tlut = referenced_tlut(obj, tlutObj);
   const uint32_t textureSize = texture_base_level_size(obj);
   const auto* textureData = static_cast<const uint8_t*>(obj.data);
-  if (!tlut.valid || textureData == nullptr || textureSize == 0) {
+  if (!tlut.has_value() || textureData == nullptr || textureSize == 0) {
     return std::nullopt;
   }
 
@@ -244,19 +283,10 @@ std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj) noexc
 
   size_t tlutSize = 2 * (static_cast<size_t>(maxIndex) + 1 - minIndex);
   const size_t tlutOffset = 2 * static_cast<size_t>(minIndex);
-  if (tlutOffset + tlutSize > tlut.data.size()) {
+  if (tlutOffset + tlutSize > tlut->bytes) {
     return std::nullopt;
   }
-  return XXH64(tlut.data.data() + tlutOffset, tlutSize, 0);
-}
-
-const TlutMetadata* get_loaded_tlut(const GXTexObj_& obj) noexcept {
-  if (!is_palette_format(obj.format()) || obj.tlut >= s_loadedTluts.size()) {
-    return nullptr;
-  }
-
-  const auto& tlut = s_loadedTluts[obj.tlut];
-  return tlut.valid ? &tlut : nullptr;
+  return XXH64(tlut->data + tlutOffset, tlutSize, 0);
 }
 
 bool ensure_directory(const std::filesystem::path& dir) noexcept {
@@ -265,7 +295,7 @@ bool ensure_directory(const std::filesystem::path& dir) noexcept {
   return !ec;
 }
 
-RuntimeTextureKey build_runtime_key(const GXTexObj_& obj) noexcept {
+RuntimeTextureKey build_runtime_key(const GXTexObj_& obj, const GXTlutObj_* tlut = nullptr) noexcept {
   RuntimeTextureKey key{
       .width = obj.width(),
       .height = obj.height(),
@@ -278,7 +308,7 @@ RuntimeTextureKey build_runtime_key(const GXTexObj_& obj) noexcept {
     key.textureHash = XXH64(obj.data, textureSize, 0);
   }
   if (key.hasTlut) {
-    key.tlutHash = compute_referenced_tlut_hash(obj).value_or(0);
+    key.tlutHash = compute_referenced_tlut_hash(obj, tlut).value_or(0);
   }
   return key;
 }
@@ -692,20 +722,20 @@ void cache_replacement(const RuntimeTextureKey& key, const gfx::TextureHandle& h
   evict_replacement_cache_if_needed();
 }
 
-bool dump_editable_texture_dds(const RuntimeTextureKey& key, const GXTexObj_& obj) noexcept {
+bool dump_editable_texture_dds(const RuntimeTextureKey& key, const GXTexObj_& obj, const GXTlutObj_* tlutObj) noexcept {
   const ArrayRef<uint8_t> texData{static_cast<const uint8_t*>(obj.data), UINT32_MAX};
   const uint32_t texWidth = obj.width();
   const uint32_t texHeight = obj.height();
 
   ConvertedTexture pixels;
   if (is_palette_format(obj.format())) {
-    const TlutMetadata* tlut = get_loaded_tlut(obj);
-    if (tlut == nullptr) {
+    const auto tlut = referenced_tlut(obj, tlutObj);
+    if (!tlut.has_value()) {
       return false;
     }
     pixels =
         convert_texture_palette(obj.format(), texWidth, texHeight, 1, texData, static_cast<GXTlutFmt>(tlut->format),
-                                tlut->entries, {tlut->data.data(), tlut->data.size()});
+                                tlut->entries, {tlut->data, tlut->bytes});
   } else {
     pixels = convert_texture(obj.format(), texWidth, texHeight, 1, texData);
   }
@@ -720,13 +750,13 @@ bool dump_editable_texture_dds(const RuntimeTextureKey& key, const GXTexObj_& ob
   return dds::write_rgba8_dds(path, texWidth, texHeight, pixels.data);
 }
 
-bool report_missing_key(const RuntimeTextureKey& key, const GXTexObj_& obj) noexcept {
+bool report_missing_key(const RuntimeTextureKey& key, const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
   if (!s_reportedMisses.insert(key).second) {
     return false;
   }
 
   if (g_config.allowTextureDumps) {
-    dump_editable_texture_dds(key, obj);
+    dump_editable_texture_dds(key, obj, tlut);
   }
   return true;
 }
@@ -836,17 +866,17 @@ void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept {
   aurora::gx::worker::run_ordered([idx, handOver] { s_loadedTluts[idx] = std::move(*handOver); });
 }
 
-std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
+std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
   ZoneScoped;
 
   if (!g_config.allowTextureReplacements) {
     return std::nullopt;
   }
 
-  const RuntimeTextureKey key = build_runtime_key(obj);
+  const RuntimeTextureKey key = build_runtime_key(obj, tlut);
   const auto* path = find_replacement_path(key);
   if (path == nullptr) {
-    report_missing_key(key, obj);
+    report_missing_key(key, obj, tlut);
     return std::nullopt;
   }
 
