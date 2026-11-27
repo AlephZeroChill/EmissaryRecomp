@@ -71,6 +71,11 @@ void note_presented_slot(uint64_t sequence, uint32_t slot) noexcept;
 // Feedback for the adaptive slot controller: whether the producer met its
 // retrace boundary for the frame that just presented.
 void report_producer_paced(bool paced) noexcept;
+// The same controller for a producer that presents each frame when it is ready (Brawl Online's deterministic timing,
+// which has no retrace budget): `reasons` (bits, 0 when on time) when the frame could not show its inserted frames on
+// time: 1 it came late because the producer waited for the previous frame's encode, 2 an inserted frame presented over
+// 2 ms late, 4 inserted frames dropped for a newer frame, 8 the presenter fell behind.
+void report_presentation_health(uint32_t reasons) noexcept;
 
 void begin_frame_interpolation() noexcept;
 void finalize_frame_interpolation() noexcept;

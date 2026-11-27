@@ -29,7 +29,13 @@ namespace aurora {
 extern std::atomic<uint64_t> g_displayPeriodNanos;
 // gpu.cpp apply_present_mode: the swapchain's present mode blocks each present until a refresh (Fifo).
 extern std::atomic<bool> g_presentWaitsForRefresh;
+// aurora.cpp aurora_set_display_variable_refresh: 1 the screen follows the frames, 0 a fixed rate, -1 unknown.
+extern std::atomic<int> g_displayVariableRefresh;
 } // namespace aurora
+namespace aurora::gx {
+// Set while the game changes scene (defined with aurora_set_frame_pacing_exempt's state below).
+extern std::atomic<bool> g_pacingExempt;
+} // namespace aurora::gx
 
 namespace aurora::gx {
 namespace detail {
@@ -368,6 +374,81 @@ uint32_t maximum_interpolation_samples() noexcept {
     samples = std::min(samples, refreshesPerFrame > 0 ? refreshesPerFrame - 1 : 0u);
   }
   return samples;
+}
+
+// The slot counts the controller steps through. On a screen with a fixed refresh rate that is a whole multiple of the
+// game's 60 Hz (120, 240, 360 Hz: m refreshes a game frame), a count of n inserted frames keeps every picture on
+// screen for the same number of refreshes only when n + 1 divides m: 240 Hz shows 240, 120 or 60 evenly, but 180 as
+// pictures of one, one and two refreshes, which moves unevenly (a picture held twice as long, every game frame). Above
+// the refresh (n + 1 > m) the screen shows the newest picture at each refresh, as a game running faster than it does.
+// A screen that follows the frames (G-Sync/FreeSync) and one of another rate (144 Hz) take every count.
+bool even_slot_count(uint32_t samples) noexcept {
+  if (g_displayVariableRefresh.load(std::memory_order_acquire) == 1) return true;
+  const uint64_t period = g_displayPeriodNanos.load(std::memory_order_acquire);
+  if (period == 0) return true;
+  const double ratio = 1e9 / static_cast<double>(period) / (60000.0 / 1001.0);
+  const auto m = static_cast<uint32_t>(std::lround(ratio));
+  if (m < 2 || std::abs(ratio - static_cast<double>(m)) > 0.06) return true;
+  return samples + 1 > m || m % (samples + 1) == 0;
+}
+uint32_t lower_slot_count(uint32_t samples) noexcept {
+  while (samples > 0) {
+    --samples;
+    if (even_slot_count(samples)) break;
+  }
+  return samples;
+}
+uint32_t higher_slot_count(uint32_t samples, uint32_t maximum) noexcept {
+  for (uint32_t s = samples + 1; s <= maximum; ++s) {
+    if (even_slot_count(s)) return s;
+  }
+  return samples;
+}
+
+// The windowed backstop's step (report_producer_paced, report_presentation_health): one window of frames, `miss` for
+// each that overran; lowers or restores the slot target by one even step at most per window.
+void pacing_window_step(bool miss, uint32_t maximumSamples, const char* what,
+                        uint32_t reducePercent = kPacingReducePercent, uint32_t floorSamples = 0) noexcept {
+  if (g_pacingExempt.load(std::memory_order_acquire)) {
+    s_pacingWindowFrames.store(0, std::memory_order_release);
+    s_pacingWindowMisses.store(0, std::memory_order_release);
+    return;
+  }
+  const uint32_t frames = s_pacingWindowFrames.load(std::memory_order_acquire) + 1;
+  const uint32_t misses = s_pacingWindowMisses.load(std::memory_order_acquire) + (miss ? 1u : 0u);
+  if (frames < kPacingWindowFrames) {
+    s_pacingWindowFrames.store(frames, std::memory_order_release);
+    s_pacingWindowMisses.store(misses, std::memory_order_release);
+    return;
+  }
+  // Window complete: adjust the target one step at most, then start over. At
+  // one decision per window this cannot spam the log or flap within a second.
+  uint32_t target = std::min(s_interpolationSampleTarget.load(std::memory_order_acquire), maximumSamples);
+  if (misses * 100u >= frames * reducePercent) {
+    s_pacingCleanWindows.store(0, std::memory_order_release);
+    if (target > floorSamples && lower_slot_count(target) >= std::min(floorSamples, target)) {
+      target = lower_slot_count(target);
+      s_pacingRestoreWindows.store(
+          std::min(s_pacingRestoreWindows.load(std::memory_order_acquire) * 2, kPacingMaxRestoreWindows),
+          std::memory_order_release);
+      s_diagSlotReductions.fetch_add(1, std::memory_order_relaxed);
+      Log.info("interpolation slots reduced to {}: {}/{} frames {}", target, misses, frames, what);
+    }
+  } else if (misses == 0) {
+    const uint32_t clean = s_pacingCleanWindows.load(std::memory_order_acquire) + 1;
+    if (target < maximumSamples && clean >= s_pacingRestoreWindows.load(std::memory_order_acquire)) {
+      target = higher_slot_count(target, maximumSamples);
+      s_pacingCleanWindows.store(0, std::memory_order_release);
+      Log.info("interpolation slots restored to {} after {} clean seconds", target, clean);
+    } else {
+      s_pacingCleanWindows.store(clean, std::memory_order_release);
+    }
+  } else {
+    s_pacingCleanWindows.store(0, std::memory_order_release);
+  }
+  s_interpolationSampleTarget.store(target, std::memory_order_release);
+  s_pacingWindowFrames.store(0, std::memory_order_release);
+  s_pacingWindowMisses.store(0, std::memory_order_release);
 }
 
 constexpr float kMinimumScale = 1.0e-5f;
@@ -953,50 +1034,36 @@ void report_producer_paced(bool paced) noexcept {
   // Per-frame decision, no streaks: a late frame seals without its inserted slots and
   // the next one is back at full count. See s_dropInterpolationAtSeal.
   s_dropInterpolationAtSeal.store(!paced, std::memory_order_release);
-  if (g_pacingExempt.load(std::memory_order_acquire)) {
+  pacing_window_step(!paced, maximumSamples, "overran their retrace budget");
+}
+
+void report_presentation_health(uint32_t reasons) noexcept {
+  const uint32_t maximumSamples = maximum_interpolation_samples();
+  if (maximumSamples == 0) {
     s_pacingWindowFrames.store(0, std::memory_order_release);
     s_pacingWindowMisses.store(0, std::memory_order_release);
+    s_interpolationSampleTarget.store(0, std::memory_order_release);
     return;
   }
-
-  const uint32_t frames = s_pacingWindowFrames.load(std::memory_order_acquire) + 1;
-  const uint32_t misses =
-      s_pacingWindowMisses.load(std::memory_order_acquire) + (paced ? 0u : 1u);
-  if (frames < kPacingWindowFrames) {
-    s_pacingWindowFrames.store(frames, std::memory_order_release);
-    s_pacingWindowMisses.store(misses, std::memory_order_release);
-    return;
+  const bool late = reasons != 0;
+  // The window's frames by reason, for the log line of a change (aurora.cpp end_frame's bits).
+  static uint32_t s_reasonCounts[4] = {};
+  for (int i = 0; i < 4; ++i) {
+    if (reasons & (1u << i)) ++s_reasonCounts[i];
   }
-  // Window complete: adjust the target one step at most, then start over. At
-  // one decision per window this cannot spam the log or flap within a second.
-  uint32_t target =
-      std::min(s_interpolationSampleTarget.load(std::memory_order_acquire), maximumSamples);
-  if (misses * 100u >= frames * kPacingReducePercent) {
-    s_pacingCleanWindows.store(0, std::memory_order_release);
-    if (target > 0) {
-      --target;
-      s_pacingRestoreWindows.store(
-          std::min(s_pacingRestoreWindows.load(std::memory_order_acquire) * 2, kPacingMaxRestoreWindows),
-          std::memory_order_release);
-      s_diagSlotReductions.fetch_add(1, std::memory_order_relaxed);
-      Log.info("interpolation slots reduced to {}: {}/{} frames overran their retrace budget",
-               target, misses, frames);
-    }
-  } else if (misses == 0) {
-    const uint32_t clean = s_pacingCleanWindows.load(std::memory_order_acquire) + 1;
-    if (target < maximumSamples && clean >= s_pacingRestoreWindows.load(std::memory_order_acquire)) {
-      ++target;
-      s_pacingCleanWindows.store(0, std::memory_order_release);
-      Log.info("interpolation slots restored to {} after {} clean seconds", target, clean);
-    } else {
-      s_pacingCleanWindows.store(clean, std::memory_order_release);
-    }
-  } else {
-    s_pacingCleanWindows.store(0, std::memory_order_release);
+  char what[200] = "could not show their inserted frames on time";
+  if (s_pacingWindowFrames.load(std::memory_order_acquire) + 1 >= kPacingWindowFrames ||
+      g_pacingExempt.load(std::memory_order_acquire)) {
+    std::snprintf(what, sizeof what,
+                  "could not show their inserted frames on time (frame late %u, inserted frame late %u, dropped for a "
+                  "newer frame %u, presenter behind %u)",
+                  s_reasonCounts[0], s_reasonCounts[1], s_reasonCounts[2], s_reasonCounts[3]);
+    std::fill(std::begin(s_reasonCounts), std::end(s_reasonCounts), 0u);
   }
-  s_interpolationSampleTarget.store(target, std::memory_order_release);
-  s_pacingWindowFrames.store(0, std::memory_order_release);
-  s_pacingWindowMisses.store(0, std::memory_order_release);
+  // A quarter of a second's frames, not a tenth: the frames here are on time (the game's schedule holds them), only
+  // some inserted frames missed theirs, and a lower count costs every frame. Never below one inserted frame (120 at
+  // 240): no inserted frames at all is the 60 Hz picture this is meant to keep away.
+  pacing_window_step(late, maximumSamples, what, 25, std::min<uint32_t>(1, maximumSamples));
 }
 
 void begin_frame_interpolation() noexcept {
@@ -1058,13 +1125,23 @@ void finalize_frame_interpolation() noexcept {
   s_sealedPredicts.store(predicts, std::memory_order_release);
   s_sealedArrivalGlide.store(false, std::memory_order_release);
   s_previousSlotDenominator = 1;
-  // A frame right after a rollback was not simulated from the frame shown before it, so the step between the two
-  // mixes two timelines: Predict shows it as drawn (no inserted frames). Its transforms still seed the next frame,
-  // which is on one timeline again.
-  const bool discontinuous = s_discontinuousPending.exchange(false, std::memory_order_acq_rel) && predicts;
-  if (discontinuous) {
+  // A frame right after a rollback: the frame shown before it was on the timeline the rollback rewrote, but the
+  // transforms it is matched against are not that frame's. A rollback's re-run frames end in Aurora as well
+  // (aurora_end_frame_unpresented), and the last of them draws in full (the presented frame copies its image), so
+  // they retire their transforms here like any frame: the previous transforms are the re-run's last frame, the
+  // frame before this one on the same new timeline, and Predict carries it on by that frame's motion like any other.
+  // Showing it without inserted frames (as before, AURORA_PREDICT_ROLLBACK_HOLD=1) made every frame after a rollback
+  // one picture for a whole game frame between frames of four: online, with a rollback every other frame, the
+  // picture changed between 240 and 60 Hz several times a second.
+  static const bool holdAfterRollback = [] {
+    const char* v = std::getenv("AURORA_PREDICT_ROLLBACK_HOLD");
+    return v != nullptr && std::strcmp(v, "0") != 0;
+  }();
+  const bool afterRollback = s_discontinuousPending.exchange(false, std::memory_order_acq_rel) && predicts;
+  if (afterRollback) {
     s_diagDiscontinuousFrames.fetch_add(1, std::memory_order_relaxed);
   }
+  const bool discontinuous = afterRollback && holdAfterRollback;
   // A frame reported late seals without inserted slots, so the encode phase renders
   // the native frame only. Its transforms still seed the next frame's matching.
   if (s_dropInterpolationAtSeal.exchange(false, std::memory_order_acq_rel) || discontinuous) {

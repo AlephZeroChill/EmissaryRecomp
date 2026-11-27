@@ -52,6 +52,8 @@ void AddAudioPause(int64_t ticks);
 double SetAudioMuted(bool muted);
 // The audio's counters since SetPresentPacing(true), one line (logged with PacingReport's).
 void AudioReport(char* out, size_t size);
+// The display cadence since SetPresentPacing(true), one line (logged with PacingReport's).
+void DisplayReport(char* out, size_t size);
 
 // Snapshots of guest RAM in the runtime's delta store (SnapshotStore + WriteWatch), driven by the
 // core's ring: the ranges (sorted by physical address, not overlapping), then saves and restores

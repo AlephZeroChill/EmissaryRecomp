@@ -140,6 +140,8 @@ public:
             INFO_LOG_FMT(BRAWLBACK, "{}", line);
             B::AudioReport(line, sizeof line);
             INFO_LOG_FMT(BRAWLBACK, "{}", line);
+            B::DisplayReport(line, sizeof line);
+            INFO_LOG_FMT(BRAWLBACK, "{}", line);
         }
         present_pacing = on;
         B::SetPresentPacing(on, lead != nullptr);

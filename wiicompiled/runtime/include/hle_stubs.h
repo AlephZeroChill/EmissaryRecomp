@@ -29,6 +29,9 @@ void VI_HLE_SetPresentSuppressed(bool suppressed);
 // than the frame shown before it (aurora_mark_frame_discontinuous).
 void VI_HLE_NoteRollback();
 bool VI_HLE_PresentSuppressed();
+// The display cadence since the last reset, one line (the presents, the game frames' spacing on screen, the present
+// hold, the modelled screen; vi.cpp TickPacingWindow), for a match's log.
+void VI_HLE_DisplayReport(char* out, size_t size, bool reset);
 // Rollback (BRAWL_RESIM_LIGHT_LAST): while set, GXCopyDisp clears the EFB but leaves the display copy holding the image
 // already in it, which the next present shows.
 void VI_HLE_SetKeepDisplayCopy(bool keep);
