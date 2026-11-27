@@ -256,6 +256,7 @@ void SetPresentPacing(bool on, bool lead) {
     DetClock::SetPresentPacing(on, on && lead ? &PacedLead : nullptr);
     if (on && !s_pacingMark.on) {
         DetClock::ResetSpeedRange();
+        AudioBackend::Instance().ResetRateRange();
         char discard[8];
         VI_HLE_DisplayReport(discard, sizeof discard, true);
         s_pacingMark = {true, std::chrono::steady_clock::now(), DetClock::Now(), DetClock::PacingNanoseconds(), DetClock::Stats(),
@@ -288,7 +289,9 @@ void PacingReport(char* out, size_t size) {
 void AudioReport(char* out, size_t size) {
     // Since the match's pacing went on: the AI DMA blocks played against the shown timeline (the timeline less the
     // re-runs and the load waits: what the audio has to follow), the blocks held for re-runs against the re-runs' own
-    // time, those played while a re-run ran, and what the output queue did (its latency, blocks it dropped as full).
+    // time, those played while a re-run ran, and what the output queue did (its latency, blocks it dropped as full,
+    // the times the device ran dry and how much silence that was, the silence that filled the queue again after, and
+    // the playback rate's range keeping its level: audio_backend.cpp).
     const auto& m = s_pacingMark;
     const AudioHleStats a = Audio_HLE_Stats();
     const AudioBackend::Stats o = AudioBackend::Instance().GetStats();
@@ -303,7 +306,8 @@ void AudioReport(char* out, size_t size) {
     std::snprintf(out, size,
                   "recomp audio: played %llu blocks (%.3f s) for %.3f s shown (%.2f%%), held %llu for re-runs (%.3f s; "
                   "re-runs %.3f s), %llu in load waits, %llu played during re-runs, %llu muted; output queue avg %.1f ms, "
-                  "max %.1f ms, %llu of %llu blocks dropped (full)",
+                  "max %.1f ms, %llu of %llu blocks dropped (full), ran dry %llu times (%.1f ms short), refilled %.1f ms, "
+                  "rate [%.3f, %.3f]",
                   (unsigned long long)played, double(played) * block, shown,
                   shown > 0 ? 100.0 * double(played) * block / shown : 0.0, (unsigned long long)rerunsHeld,
                   double(rerunsHeld) * block, rerun, (unsigned long long)loadsHeld,
@@ -311,7 +315,9 @@ void AudioReport(char* out, size_t size) {
                   (unsigned long long)(a.muted - m.audio.muted),
                   offered ? double(o.queuedBytesSum - m.output.queuedBytesSum) / double(offered) * perMs : 0.0,
                   double(o.queuedBytesMax) * perMs, (unsigned long long)(o.dropped - m.output.dropped),
-                  (unsigned long long)offered);
+                  (unsigned long long)offered, (unsigned long long)(o.ranDry - m.output.ranDry),
+                  double(o.shortBytes - m.output.shortBytes) * perMs, double(o.refillBytes - m.output.refillBytes) * perMs,
+                  double(o.rateMin), double(o.rateMax));
 }
 
 Pad LocalPad(int chan) {
