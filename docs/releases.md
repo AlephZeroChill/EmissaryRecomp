@@ -268,6 +268,26 @@ branch and `v*` tags (and, if wanted, required reviewers), and give the workflow
 packed `--game-file`, `--key-file`; it only says what it would do without `--apply`), forking kalomaze/EmissaryRecomp
 when the CI repository does not exist.
 
+### Signing
+
+The Windows download is signed with Brawl Online's Azure Artifact Signing account (brawlonline.net `docs/ci.md`,
+"Windows signing", which also says how that account is set up) once the repository variable `WIN_SIGN_ACCOUNT` is set:
+the step "Sign (Windows)" signs `WiiCompiled.exe` and every DLL of the download that has no valid signature yet
+(`engine_usa.dll`, `SDL3.dll`, `libc++.dll`, ...; in `windows-v2`, `engine_usa_v2.dll`) with the `ArtifactSigning`
+PowerShell module, checks each one is validly signed by `WIN_SIGN_PUBLISHER`, and only then hands them to the package
+job, so `manifest.json` and `SHA256SUMS` describe the signed files. It runs after the build cache is saved (the cache
+stays unsigned). Without `WIN_SIGN_ACCOUNT` nothing is signed, as before; with it, a missing setting fails the job.
+Unsigned, Windows Defender's cloud model flagged Brawl Online and its downloads as `Trojan:Win32/Bearfoos.A!ml` on
+2026-11-26 (a new unsigned file with every release has no reputation of its own).
+
+Variables `WIN_SIGN_ACCOUNT` (the account's name), `WIN_SIGN_ENDPOINT` (its region's endpoint, e.g.
+`https://eus.codesigning.azure.net`), `WIN_SIGN_PROFILE` (the Public Trust certificate profile), `WIN_SIGN_PUBLISHER`
+(the certificate's CN exactly); secrets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (an Entra app
+registration with the role "Artifact Signing Certificate Profile Signer"). Only the repository's owner can add them.
+Whoever can run this workflow can sign any file with them, as Sarah: use an app registration of this repository's own
+(not brawlonline.net's), so its secret can be revoked alone. The launcher does not check the recomp's signature, so
+turning signing off again breaks nothing; macOS and Linux are not affected.
+
 ### Ways to build releases, and what each costs
 
 | | Where | Needs | Risks and costs |

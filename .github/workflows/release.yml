@@ -272,6 +272,44 @@ jobs:
           path: ${{ runner.temp }}/cache/build-${{ matrix.name }}.tar.gz.gpg
           key: build-${{ matrix.name }}-${{ steps.image.outputs.id }}-${{ github.run_id }}
 
+      # Code signing (docs/releases.md, "Signing"): WiiCompiled.exe and every DLL the Windows download has that is not
+      # already signed (windows-v2: engine_usa_v2.dll), with Azure Artifact Signing, once the variable WIN_SIGN_ACCOUNT
+      # is set; without it the files stay unsigned, as before. After the build cache is saved (the cache stays
+      # unsigned) and before the files go to the package job, which takes the sizes and SHA-256s from these.
+      - name: Sign (Windows)
+        if: runner.os == 'Windows' && vars.WIN_SIGN_ACCOUNT != ''
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          WIN_SIGN_ACCOUNT: ${{ vars.WIN_SIGN_ACCOUNT }}
+          WIN_SIGN_ENDPOINT: ${{ vars.WIN_SIGN_ENDPOINT }}
+          WIN_SIGN_PROFILE: ${{ vars.WIN_SIGN_PROFILE }}
+          WIN_SIGN_PUBLISHER: ${{ vars.WIN_SIGN_PUBLISHER }}
+          OLD_CPU: ${{ matrix.old-cpu }}
+        run: |
+          foreach ($v in 'WIN_SIGN_ENDPOINT', 'WIN_SIGN_PROFILE', 'WIN_SIGN_PUBLISHER', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET') {
+            if (-not [Environment]::GetEnvironmentVariable($v)) { throw "WIN_SIGN_ACCOUNT is set but $v is not (docs/releases.md, Signing)" }
+          }
+          if ($env:OLD_CPU -eq 'true') { $files = @(Get-Item build/release-v2/native/engine_usa_v2.dll) }
+          else { $files = @(Get-ChildItem build/release/native -File | Where-Object { $_.Extension -in '.exe', '.dll' }) }
+          # Someone else's signature (a Microsoft DLL) stays.
+          $files = @($files | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' })
+          if (-not $files) { throw "nothing to sign" }
+          $files | ForEach-Object { Write-Host "signing $($_.Name) ($([math]::Round($_.Length / 1MB, 1)) MB)" }
+          Install-Module -Name ArtifactSigning -Force -Scope CurrentUser -Repository PSGallery
+          Invoke-ArtifactSigning -Endpoint $env:WIN_SIGN_ENDPOINT -CodeSigningAccountName $env:WIN_SIGN_ACCOUNT `
+            -CertificateProfileName $env:WIN_SIGN_PROFILE -Files ($files.FullName -join ',') -FileDigest SHA256 `
+            -TimestampRfc3161 'http://timestamp.acs.microsoft.com' -TimestampDigest SHA256
+          $bad = 0
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            Write-Host "$($s.Status) $($f.Name) $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notlike "*CN=$env:WIN_SIGN_PUBLISHER*") { $bad++ }
+          }
+          if ($bad) { throw "$bad file(s) not signed by $env:WIN_SIGN_PUBLISHER" }
+
       # The program only (what the release holds), for the package job.
       - name: Keep the program (Linux)
         if: runner.os == 'Linux'
