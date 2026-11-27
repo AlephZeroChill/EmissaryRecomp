@@ -468,6 +468,156 @@ char *SDL_SYS_GetCurrentDirectory(void)
     SDL_SetBooleanProperty(renderer->props, "WiiCompiled.vulkan.robust_buffer_access",
                            features.desiredVulkan10DeviceFeatures.robustBufferAccess == VK_TRUE);
 ]==])
+
+  # Direct3D 12, a removed device (Brawl Online bug report #369: an RTX 3060 Ti that Vulkan's recovery had moved to
+  # D3D12 crashed three times in SDL at the driver's next reset, with exit code 1, and no recovery happened):
+  # - A uniform buffer is mapped each time a command buffer takes one, and Map fails on a removed device, so
+  #   D3D12_INTERNAL_AcquireUniformBufferFromPool gives NULL, which PushUniformData (read 0x8, writeOffset) and
+  #   BindGraphicsResources (read 0x0, ->buffer) then read through on the frame worker. Without a uniform buffer a
+  #   push does nothing and a bind leaves the slot alone: the device is gone and its commands are thrown away anyway.
+  # - A failed Present set no error, so aurora logged "Failed to submit a command buffer: " and never knew the device
+  #   was gone. It sets one now, and every error whose HRESULT is a device removal (DEVICE_REMOVED/HUNG/RESET,
+  #   DRIVER_INTERNAL_ERROR) ends in "[DXGI_ERROR_DEVICE_REMOVED]": SDL replaces DEVICE_REMOVED by the removal
+  #   reason, and its system text does not say that the device is gone. Aurora's names_lost_device looks for it.
+  # - A command list that fails to close returned from D3D12_Submit still holding submitLock: every later submit
+  #   waited for good.
+  # - Test hook: WIICOMPILED_TEST_D3D12_REMOVE_DEVICE_AFTER_SUBMITS=N removes the device for real at the Nth submit
+  #   (ID3D12Device5::RemoveDevice, which takes it away from this process only, as a driver reset does to all).
+  set(_d3d12 "${sdl_source_dir}/src/gpu/d3d12/SDL_gpu_d3d12.c")
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (error names it)"
+[==[    if (res == DXGI_ERROR_DEVICE_REMOVED) {
+        if (renderer->device) {]==]
+[==[    /* WiiCompiled: AuroraSDL3Patches.cmake */
+    const char *wiiRemoved = "";
+    if (res == (HRESULT)0x887A0005L || res == (HRESULT)0x887A0006L || res == (HRESULT)0x887A0007L ||
+        res == (HRESULT)0x887A0020L) {
+        wiiRemoved = " [DXGI_ERROR_DEVICE_REMOVED]";
+    }
+
+    if (res == DXGI_ERROR_DEVICE_REMOVED) {
+        if (renderer->device) {]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (error names it, code only)"
+[==[        SDL_SetError("%s! Error Code: " HRESULT_FMT, msg, res);]==]
+[==[        SDL_SetError("%s! Error Code: " HRESULT_FMT "%s", msg, res, wiiRemoved);]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (error names it, with text)"
+[==[    SDL_SetError("%s! Error Code: %s " HRESULT_FMT, msg, wszMsgBuff, res);]==]
+[==[    SDL_SetError("%s! Error Code: %s " HRESULT_FMT "%s", msg, wszMsgBuff, res, wiiRemoved);]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (present error)"
+[==[        res = IDXGISwapChain_Present(
+            windowData->swapchain,
+            syncInterval,
+            presentFlags);
+        if (FAILED(res)) {
+            result = false;
+        }]==]
+[==[        res = IDXGISwapChain_Present(
+            windowData->swapchain,
+            syncInterval,
+            presentFlags);
+        if (FAILED(res)) {
+            D3D12_INTERNAL_SetError(renderer, "Failed to present", res); /* WiiCompiled: AuroraSDL3Patches.cmake */
+            result = false;
+        }]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (close unlocks)"
+[==[    res = ID3D12GraphicsCommandList_Close(d3d12CommandBuffer->graphicsCommandList);
+    CHECK_D3D12_ERROR_AND_RETURN("Failed to close command list!", false);
+
+    res = ID3D12GraphicsCommandList_QueryInterface(]==]
+[==[    res = ID3D12GraphicsCommandList_Close(d3d12CommandBuffer->graphicsCommandList);
+    if (FAILED(res)) { /* WiiCompiled: AuroraSDL3Patches.cmake */
+        SDL_UnlockMutex(renderer->submitLock);
+        CHECK_D3D12_ERROR_AND_RETURN("Failed to close command list!", false);
+    }
+
+    res = ID3D12GraphicsCommandList_QueryInterface(]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (push without a uniform buffer)"
+[==[        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Unrecognized shader stage!");
+        return;
+    }
+
+    blockSize =]==]
+[==[        SDL_LogError(SDL_LOG_CATEGORY_GPU, "Unrecognized shader stage!");
+        return;
+    }
+
+    if (uniformBuffer == NULL) { /* WiiCompiled: Map failed (a removed device), AuroraSDL3Patches.cmake */
+        return;
+    }
+
+    blockSize =]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (no next uniform buffer)"
+[==[        uniformBuffer = D3D12_INTERNAL_AcquireUniformBufferFromPool(commandBuffer);
+
+        uniformBuffer->drawOffset = 0;]==]
+[==[        uniformBuffer = D3D12_INTERNAL_AcquireUniformBufferFromPool(commandBuffer);
+        if (uniformBuffer == NULL) { /* WiiCompiled: AuroraSDL3Patches.cmake */
+            if (shaderStage == SDL_GPU_SHADERSTAGE_VERTEX) {
+                commandBuffer->vertexUniformBuffers[slotIndex] = NULL;
+            } else if (shaderStage == SDL_GPU_SHADERSTAGE_FRAGMENT) {
+                commandBuffer->fragmentUniformBuffers[slotIndex] = NULL;
+            } else if (shaderStage == SDL_GPU_SHADERSTAGE_COMPUTE) {
+                commandBuffer->computeUniformBuffers[slotIndex] = NULL;
+            }
+            return;
+        }
+
+        uniformBuffer->drawOffset = 0;]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (vertex uniform bind)"
+[==[            if (graphicsPipeline->header.num_vertex_uniform_buffers > i) {]==]
+[==[            if (graphicsPipeline->header.num_vertex_uniform_buffers > i &&
+                commandBuffer->vertexUniformBuffers[i] != NULL) { /* WiiCompiled */]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (fragment uniform bind)"
+[==[            if (graphicsPipeline->header.num_fragment_uniform_buffers > i) {]==]
+[==[            if (graphicsPipeline->header.num_fragment_uniform_buffers > i &&
+                commandBuffer->fragmentUniformBuffers[i] != NULL) { /* WiiCompiled */]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (compute uniform bind)"
+[==[            if (computePipeline->header.numUniformBuffers > i) {]==]
+[==[            if (computePipeline->header.numUniformBuffers > i &&
+                commandBuffer->computeUniformBuffers[i] != NULL) { /* WiiCompiled */]==])
+  _aurora_sdl3_replace("${_d3d12}" "D3D12 removed device (test hook)"
+[==[static bool D3D12_Submit(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
+    D3D12Renderer *renderer = d3d12CommandBuffer->renderer;
+    ID3D12CommandList *commandLists[1];
+    HRESULT res;
+
+    SDL_LockMutex(renderer->submitLock);
+]==]
+[==[/* WiiCompiled test hook (AuroraSDL3Patches.cmake): WIICOMPILED_TEST_D3D12_REMOVE_DEVICE_AFTER_SUBMITS=N removes
+   the device at the process's Nth submit, once. Called with submitLock held. */
+static void D3D12_INTERNAL_WiiTestRemoveDevice(D3D12Renderer *renderer)
+{
+    static const IID wiiIIDDevice5 = { 0x8b4f173b, 0x2fea, 0x4b80, { 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d } };
+    static Sint64 after = -1;
+    static Sint64 submits = 0;
+    if (after < 0) {
+        const char *value = SDL_getenv("WIICOMPILED_TEST_D3D12_REMOVE_DEVICE_AFTER_SUBMITS");
+        after = value != NULL ? SDL_strtoll(value, NULL, 10) : 0;
+    }
+    if (after <= 0 || ++submits != after) {
+        return;
+    }
+    ID3D12Device5 *device5 = NULL;
+    if (SUCCEEDED(ID3D12Device_QueryInterface(renderer->device, &wiiIIDDevice5, (void **)&device5))) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_GPU, "WIICOMPILED_TEST_D3D12_REMOVE_DEVICE_AFTER_SUBMITS: removing the device");
+        ID3D12Device5_RemoveDevice(device5);
+        ID3D12Device5_Release(device5);
+    }
+}
+
+static bool D3D12_Submit(
+    SDL_GPUCommandBuffer *commandBuffer)
+{
+    D3D12CommandBuffer *d3d12CommandBuffer = (D3D12CommandBuffer *)commandBuffer;
+    D3D12Renderer *renderer = d3d12CommandBuffer->renderer;
+    ID3D12CommandList *commandLists[1];
+    HRESULT res;
+
+    SDL_LockMutex(renderer->submitLock);
+    D3D12_INTERNAL_WiiTestRemoveDevice(renderer);
+]==])
 endfunction()
 
 # Script mode (FetchContent PATCH_COMMAND).

@@ -601,6 +601,19 @@ void download_from_buffer(Encoder& enc, const BufferObject& src, uint32_t srcOff
   SDL_DownloadFromGPUBuffer(enc.copy_pass(), &from, &to);
 }
 
+// Map fails on a lost device (Direct3D 12 maps on each call): nothing to write then (bug report #369).
+static void* map_upload_buffer(const TransferBufferObject& staging) {
+  void* mapped = SDL_MapGPUTransferBuffer(g_device, staging.handle, false);
+  if (mapped == nullptr) {
+    const char* error = SDL_GetError();
+    Log.error("Failed to map an upload buffer: {}", error);
+    if (names_lost_device(error)) {
+      note_device_lost("failed buffer maps", 1);
+    }
+  }
+  return mapped;
+}
+
 void write_buffer(const BufferObject& dst, uint32_t offset, const void* data, uint32_t size) {
   if (size == 0) {
     return;
@@ -609,7 +622,10 @@ void write_buffer(const BufferObject& dst, uint32_t offset, const void* data, ui
   if (!staging) {
     return;
   }
-  void* mapped = SDL_MapGPUTransferBuffer(g_device, staging->handle, false);
+  void* mapped = map_upload_buffer(*staging);
+  if (mapped == nullptr) {
+    return;
+  }
   std::memcpy(mapped, data, size);
   SDL_UnmapGPUTransferBuffer(g_device, staging->handle);
   Encoder enc;
@@ -627,7 +643,10 @@ void write_texture(const TextureObject& dst, uint32_t x, uint32_t y, uint32_t wi
   if (!staging) {
     return;
   }
-  void* mapped = SDL_MapGPUTransferBuffer(g_device, staging->handle, false);
+  void* mapped = map_upload_buffer(*staging);
+  if (mapped == nullptr) {
+    return;
+  }
   std::memcpy(mapped, data, size);
   SDL_UnmapGPUTransferBuffer(g_device, staging->handle);
   const uint32_t block = format_block_size(dst.format);
