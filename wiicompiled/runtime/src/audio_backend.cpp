@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,30 @@ void DumpQueued(const void* data, int bytes) {
     std::fwrite(data, 1, static_cast<size_t>(bytes), file);
     std::fflush(file);
 }
+
+// The output queue's level control: how much sound it keeps ahead of the device, WIICOMPILED_AUDIO_BUFFER_MS
+// (default 60; 0 = none, the queue as it was before: no refill, the rate fixed at 1, full at 120 ms).
+//
+// The game's sound comes in at the emulated time's pace, one frame's blocks at a time, while the device plays at its
+// own. A frame shown late (a rollback's re-runs, a slow scene, the GPU behind) delivers its sound late by as much;
+// with nothing kept ahead the device runs out and plays silence: gaps in the sound, heard as choppy audio (Brawl
+// Online bug report #376: frames up to 85 ms late, the queue anywhere from 14 to 88 ms). Like Dolphin's mixer
+// (Config AudioBufferSize, 80 ms), the queue keeps its level: the stream plays a little faster when it holds more
+// than the target and a little slower when it holds less (up to 2%, a third of a semitone), and when the device has
+// run dry the gap is made up to the target at once, so the next late frame finds the sound ahead of it again.
+uint32_t TargetBufferMs() {
+    static const uint32_t ms = [] {
+        const char* v = std::getenv("WIICOMPILED_AUDIO_BUFFER_MS");
+        if (v == nullptr || *v == '\0') return 60u;
+        const long n = std::strtol(v, nullptr, 10);
+        return static_cast<uint32_t>(std::clamp<long>(n, 0, 250));
+    }();
+    return ms;
+}
+constexpr double kLevelSmoothingSeconds = 0.5;  // the level the rate follows: its average over about this long
+constexpr double kRateGain = 0.04;              // rate change per target's worth off the target
+constexpr float kMaxRateChange = 0.02f;
+constexpr float kRateStep = 0.001f;             // smaller changes are not passed on to SDL
 }  // namespace
 
 AudioBackend& AudioBackend::Instance() {
@@ -229,6 +254,18 @@ bool AudioBackend::InstallStreamLocked(SDL_AudioStream* stream, const SDL_AudioS
     m_sampleRate = sampleRate;
     m_channels = channels;
     m_initialized = true;
+    // The level control starts over with each stream, the queue filled to its target before the first block.
+    m_targetMs = TargetBufferMs();
+    m_levelMs = -1.0;
+    m_rate = 1.0f;
+    m_dryReadsSeen = m_dryReads.load();
+    SDL_SetAudioStreamGetCallback(stream, &AudioBackend::OnDeviceRead, this);
+    if (m_targetMs != 0) {
+        m_silence.assign(BytesForMsLocked(m_targetMs), 0);
+        if (SDL_PutAudioStreamData(stream, m_silence.data(), static_cast<int>(m_silence.size()))) {
+            m_stats.refillBytes += m_silence.size();
+        }
+    }
 #if defined(__SWITCH__)
     if (!m_audoutRunning.exchange(true)) {
         m_audoutThread = std::thread([this] { AudoutLoop(); });
@@ -318,33 +355,110 @@ void AudioBackend::Shutdown() {
     m_convertBuffer.clear();
 }
 
-uint32_t AudioBackend::QueueLimitBytesLocked() const {
-    constexpr uint32_t queueMs = 120;
-
+uint32_t AudioBackend::BytesForMsLocked(uint32_t ms) const {
     const uint64_t bytesPerSecond = static_cast<uint64_t>(m_spec.freq) *
                                     static_cast<uint64_t>(m_spec.channels) *
                                     sizeof(int16_t);
-    return static_cast<uint32_t>((bytesPerSecond * queueMs) / 1000u);
+    const uint32_t frame = static_cast<uint32_t>(m_spec.channels) * sizeof(int16_t);
+    const uint32_t bytes = static_cast<uint32_t>((bytesPerSecond * ms) / 1000u);
+    return frame ? bytes - bytes % frame : bytes;
+}
+
+uint32_t AudioBackend::QueueLimitBytesLocked() const {
+    // With the level control the rate keeps the queue near its target; the limit only catches what it cannot (sound
+    // coming in much faster than it plays) and sits well above the target, so a block is dropped only then.
+    return BytesForMsLocked(m_targetMs != 0 ? std::max<uint32_t>(120, m_targetMs * 2 + 60) : 120);
 }
 
 AudioBackend::Stats AudioBackend::GetStats() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     Stats s = m_stats;
     s.bytesPerSecond = static_cast<uint32_t>(m_spec.freq) * static_cast<uint32_t>(m_spec.channels) * sizeof(int16_t);
+    s.shortBytes = m_dryBytes.load(std::memory_order_relaxed);
     return s;
+}
+
+void AudioBackend::ResetRateRange() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_stats.rateMin = m_stats.rateMax = m_rate;
+}
+
+// SDL's device thread, before it takes the stream's next data (the stream's lock held: atomics only here).
+// `additional` is how much of the request the queue lacks, in the stream's input format, overestimated by a few
+// samples for the resampler: a shortfall over 2 ms is the device running dry.
+void SDLCALL AudioBackend::OnDeviceRead(void* self, SDL_AudioStream*, int additional, int) {
+    auto* backend = static_cast<AudioBackend*>(self);
+    const int bytesPerMs = std::max(1, backend->m_spec.freq * backend->m_spec.channels * 2 / 1000);
+    if (additional > 2 * bytesPerMs) {
+        backend->m_dryReads.fetch_add(1, std::memory_order_relaxed);
+        backend->m_dryBytes.fetch_add(static_cast<uint64_t>(additional), std::memory_order_relaxed);
+    }
+}
+
+// Each block offered: when the device ran dry since the last one, count it once and (with the level control) fill
+// the queue back to its target with silence (the gap is already heard; the sound that follows plays a target's worth
+// ahead again); then move the playback rate toward keeping the target.
+void AudioBackend::KeepLevelLocked(int queued) {
+    const uint64_t dry = m_dryReads.load(std::memory_order_relaxed);
+    if (dry != m_dryReadsSeen) {
+        m_dryReadsSeen = dry;
+        ++m_stats.ranDry;
+        if (m_targetMs != 0) {
+            const uint32_t target = BytesForMsLocked(m_targetMs);
+            if (static_cast<uint32_t>(queued) < target) {
+                const uint32_t frame = static_cast<uint32_t>(m_spec.channels) * sizeof(int16_t);
+                uint32_t fill = target - static_cast<uint32_t>(queued);
+                fill -= frame ? fill % frame : 0;
+                if (m_silence.size() < fill) m_silence.assign(fill, 0);
+                if (fill != 0 && SDL_PutAudioStreamData(m_stream, m_silence.data(), static_cast<int>(fill))) {
+                    m_stats.refillBytes += fill;
+                    DumpQueued(m_silence.data(), static_cast<int>(fill));
+                    queued += static_cast<int>(fill);
+                    m_levelMs = -1.0;  // the level starts over at the target
+                }
+            }
+        }
+    }
+    if (m_targetMs == 0) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point s_last{};
+    const Clock::time_point now = Clock::now();
+    const double bytesPerMs = static_cast<double>(m_spec.freq) * m_spec.channels * sizeof(int16_t) / 1000.0;
+    const double levelMs = bytesPerMs > 0 ? queued / bytesPerMs : 0.0;
+    if (m_levelMs < 0) {
+        m_levelMs = levelMs;
+    } else {
+        const double dt = std::chrono::duration<double>(now - s_last).count();
+        const double a = 1.0 - std::exp(-std::max(0.0, dt) / kLevelSmoothingSeconds);
+        m_levelMs += a * (levelMs - m_levelMs);
+    }
+    s_last = now;
+    const double off = (m_levelMs - m_targetMs) / m_targetMs;  // above the target: play faster
+    const float rate = 1.0f + std::clamp(static_cast<float>(off * kRateGain), -kMaxRateChange, kMaxRateChange);
+    if (std::fabs(rate - m_rate) >= kRateStep) {
+        if (SDL_SetAudioStreamFrequencyRatio(m_stream, rate)) {
+            m_rate = rate;
+            m_stats.rateMin = std::min(m_stats.rateMin, rate);
+            m_stats.rateMax = std::max(m_stats.rateMax, rate);
+        }
+    }
 }
 
 bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
     if (!m_stream) {
         return false;
     }
-    const int queued = SDL_GetAudioStreamQueued(m_stream);
+    int queued = SDL_GetAudioStreamQueued(m_stream);
     if (queued < 0) {
         return true;
     }
     ++m_stats.blocks;
     m_stats.queuedBytesSum += static_cast<uint64_t>(queued);
     m_stats.queuedBytesMax = std::max(m_stats.queuedBytesMax, static_cast<uint32_t>(queued));
+    KeepLevelLocked(queued);
+    queued = std::max(queued, SDL_GetAudioStreamQueued(m_stream));  // with a refill's silence
     const uint32_t maxQueued = QueueLimitBytesLocked();
     if (static_cast<uint64_t>(queued) + static_cast<uint64_t>(std::max(incomingBytes, 0)) > maxQueued) {
         ++m_stats.dropped;

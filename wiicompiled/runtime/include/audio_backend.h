@@ -27,15 +27,23 @@ public:
     void SetMuted(bool muted);
 
     // Since the start: blocks offered, those dropped because the output queue was full, and what was queued ahead of
-    // each offered block (the output's latency then), for the session's logs.
+    // each offered block (the output's latency then), for the session's logs. The times the device found the queue
+    // empty and how much it was short (heard as silence), the silence put in after it to fill the queue again, and the
+    // playback rate's range since ResetRateRange (the queue's level control, AudioBackend.cpp).
     struct Stats {
         uint64_t blocks = 0;
         uint64_t dropped = 0;
         uint64_t queuedBytesSum = 0;
         uint32_t queuedBytesMax = 0;
         uint32_t bytesPerSecond = 0;
+        uint64_t ranDry = 0;
+        uint64_t shortBytes = 0;
+        uint64_t refillBytes = 0;
+        float rateMin = 1.0f;
+        float rateMax = 1.0f;
     };
     Stats GetStats() const;
+    void ResetRateRange();
 
 private:
     AudioBackend() = default;
@@ -51,6 +59,9 @@ private:
                              uint32_t channels);
     bool QueueHasCapacityLocked(int incomingBytes);
     uint32_t QueueLimitBytesLocked() const;
+    uint32_t BytesForMsLocked(uint32_t ms) const;
+    void KeepLevelLocked(int queued);
+    static void SDLCALL OnDeviceRead(void* self, SDL_AudioStream* stream, int additional, int total);
     float EffectiveGainLocked() const;
     void ApplyGainLocked();
 
@@ -71,6 +82,15 @@ private:
     bool m_retryStarted = false;                 // the retry thread: started at the first failed open, then kept
     std::condition_variable m_retryWake;
     std::vector<int16_t> m_convertBuffer;
+
+    // The output queue's level control (WIICOMPILED_AUDIO_BUFFER_MS, 0 = off: no refill, rate fixed at 1).
+    uint32_t m_targetMs = 0;
+    double m_levelMs = -1.0;            // the queue's smoothed level (below 0: none yet)
+    float m_rate = 1.0f;                // the stream's frequency ratio now
+    std::atomic<uint64_t> m_dryReads{0};     // device reads that found the queue short (OnDeviceRead)
+    std::atomic<uint64_t> m_dryBytes{0};     // and the bytes they were short
+    uint64_t m_dryReadsSeen = 0;        // m_dryReads at the last refill
+    std::vector<uint8_t> m_silence;
 
 #if defined(__SWITCH__)
     // SDL3 has no Horizon audio driver: m_stream is a device-less SDL stream (rate conversion and gain), drained into
