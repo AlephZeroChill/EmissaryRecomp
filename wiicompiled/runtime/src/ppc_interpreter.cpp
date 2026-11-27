@@ -10,6 +10,7 @@
 // one per use, and here each register remembers which form its last write left and is converted at a use of the
 // other form, the same PPC_PsFromScalarInline / PPC_PsToScalarInline conversions translated code makes.
 #include "ppc_interpreter.h"
+#include "ppc_interpreter_internal.h"
 #include "brawl_online_core.h"
 #include "brawl_rollback.h"
 #include "brawl_dirty_memory.h"
@@ -55,6 +56,7 @@
 #endif
 
 namespace PpcInterpreter {
+using namespace detail;
 namespace {
 
 constexpr uint32_t kXerSo = 0x80000000u;
@@ -68,13 +70,16 @@ struct InstructionCounter { std::atomic<uint64_t> count{0}; };
 std::mutex g_countersMutex;
 std::vector<InstructionCounter*> g_counters;  // never freed: a thread's count outlives it
 thread_local InstructionCounter* t_counter = nullptr;
-void CountInstructions(uint64_t n) {
+// A thread's first count: its counter is made and registered (out of line: the common call is the two lines below it).
+MKW_PPC_NO_INLINE InstructionCounter* NewCounter() {
+    InstructionCounter* const c = t_counter = new InstructionCounter;
+    std::lock_guard<std::mutex> lock(g_countersMutex);
+    g_counters.push_back(c);
+    return c;
+}
+inline void CountInstructions(uint64_t n) {
     InstructionCounter* c = t_counter;
-    if (c == nullptr) {
-        c = t_counter = new InstructionCounter;
-        std::lock_guard<std::mutex> lock(g_countersMutex);
-        g_counters.push_back(c);
-    }
+    if (c == nullptr) c = NewCounter();
     c->count.store(c->count.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
 
@@ -88,7 +93,7 @@ thread_local uint32_t t_lastPc = 0;
 // BrawlRollback::LoopCall sees (and, during resimulation, may skip or run inline). Only the game thread sets it; other
 // threads' frames never compare equal. Not a thread_local: Call() reads it on every interpreted call, and a
 // thread_local access is not a plain load on every target (emulated TLS makes it a runtime call).
-std::atomic<const struct Frame*> g_rollbackLoopFrame{nullptr};
+std::atomic<const Frame*> g_rollbackLoopFrame{nullptr};
 
 #if MKW_INTERP_PROFILE
 // MKW_INTERP_PROFILE=1 builds only (a diagnostic; product builds compile none of this). With BRAWL_INTERP_PROFILE=<prefix>
@@ -217,14 +222,6 @@ void TracePc(const CpuContext* c, uint32_t pc) {
     RT_LOGF(RT_TAG_RUNTIME, "[trace] 0x%08X lr=%08X ctr=%08X%s\n", pc, c->lr, c->ctr, regs.c_str());
 }
 
-enum class Form : uint8_t { Unknown, Scalar, Paired };
-
-struct Frame {
-    CpuContext* ctx;
-    Form form[32];
-    uint32_t pc;
-};
-
 inline uint32_t Bits(uint32_t w, int from, int count) { return (w >> from) & ((1u << count) - 1u); }
 inline uint32_t RD(uint32_t w) { return Bits(w, 21, 5); }
 inline uint32_t RA(uint32_t w) { return Bits(w, 16, 5); }
@@ -239,23 +236,6 @@ inline uint32_t Mask(uint32_t mb, uint32_t me) {
     const uint32_t b = me == 31 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> (me + 1));
     return mb <= me ? (a & b) : (a | b);
 }
-
-// --- FPR forms ------------------------------------------------------------------------------------------------
-
-double Scalar(Frame& f, uint32_t r) {
-    if (f.form[r] == Form::Paired) {
-        return PPC_PsToScalarInline(f.ctx->fpr[r].d);
-    }
-    return f.ctx->fpr[r].d;
-}
-double Paired(Frame& f, uint32_t r) {
-    if (f.form[r] == Form::Scalar) {
-        return PPC_PsFromScalarInline(f.ctx->fpr[r].d);
-    }
-    return f.ctx->fpr[r].d;
-}
-void SetScalar(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.form[r] = Form::Scalar; }
-void SetPaired(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.form[r] = Form::Paired; }
 
 // --- integer helpers -------------------------------------------------------------------------------------------
 
@@ -287,6 +267,10 @@ uint32_t AddCarry(uint32_t a, uint32_t b, uint32_t carryIn, bool& carry, bool& o
     SystemBridge::DumpCpuState(c);  // where the interpreted code came from: lr, the stack's return addresses
     PPC_Undefined(pc, w, what);
 }
+
+}  // namespace
+
+namespace detail {
 
 uint32_t ReadSpr(CpuContext* c, uint32_t spr, uint32_t pc, uint32_t w) {
     switch (spr) {
@@ -323,15 +307,9 @@ void WriteSpr(CpuContext* c, uint32_t spr, uint32_t value) {
     }
 }
 
-// Branch condition (BO/BI) with the ctr decrement.
-bool BranchTaken(CpuContext* c, uint32_t bo, uint32_t bi) {
-    if ((bo & 0x04u) == 0) {
-        --c->ctr;
-    }
-    const bool ctrOk = (bo & 0x04u) != 0 || ((c->ctr != 0) != ((bo & 0x02u) != 0));
-    const bool condOk = (bo & 0x10u) != 0 || (PpcCrvBit(c->crv[(bi >> 2) & 7u], bi & 3u) == ((bo & 0x08u) != 0));
-    return ctrOk && condOk;
-}
+}  // namespace detail
+
+namespace {
 
 // Match translated callers: f1 is the scalar floating-point return; retain the
 // other registers' representation tags across calls. ABI volatility alone does
@@ -380,23 +358,21 @@ void NormalizeCalleeFloatReturn(Frame& f, const MkwGuestFloatAbi* abi) {
     if (abi != nullptr && abi->returnsPairedScalarFloat != 0) f.ctx->fpr[1].d = PPC_PsToScalarInline(f.ctx->fpr[1].d);
 }
 
-// A bl's target, resolved when its block is built once the function registry is published (nothing in it changes
-// after that): the translated function, its raw dispatch record and its float ABI, each null when there is none.
-struct CallSite {
-    const TranslatedFunctionInfo* info;
-    const RawDispatchRecord* raw;
-    const MkwGuestFloatAbi* abi;
-};
+// A bl's target resolved (see CallSite).
 inline CallSite ResolveCall(uint32_t target) {
     return CallSite{TranslatedFunctionRegistry::FindByAddressPtr(target),
                     TranslatedFunctionRegistry::FindRawByAddressPtr(target), FloatAbiSearch(target)};
 }
 
+}  // namespace
+
+namespace detail {
+
 // A call (bl, bcl, blrl, bctrl). Translated, native and patched code runs through the function registry; other code
 // (a mod's) returns false and is interpreted right here, as the processor would run it: code that does not return the
 // usual way (bl to read its own address, a hook that branches back) must not leave a host call frame behind.
 // site: the call's target resolved at decode, if it was.
-bool Call(Frame& f, uint32_t target, uint32_t returnTo, const CallSite* site = nullptr) {
+bool Call(Frame& f, uint32_t target, uint32_t returnTo, const CallSite* site) {
     f.ctx->lr = returnTo;
     const bool loopCall = &f == g_rollbackLoopFrame.load(std::memory_order_relaxed);
     if (loopCall) {
@@ -476,10 +452,269 @@ bool TailCallEntry(Frame& f, void (*entry)(CpuContext*), uint32_t returnAddress)
 }
 
 
+// --- thin calls ---------------------------------------------------------------------------------------------------------------
+// A call from compiled code to a translated function does what Call and TryDispatchRawCpuTarget do, with everything they look
+// up decided once per target (JitCallTarget): the rest in this order, as they do it.
+
+static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept;
+
+
+const JitCallTarget* JitCallTargetFor(uint32_t target) noexcept {
+    // The records never change once the registry is published: the last answers are kept per thread (a null answer too).
+    struct Memo { uint32_t target; bool valid; const JitCallTarget* record; };
+    constexpr uint32_t kMemo = 1024;
+    thread_local Memo memo[kMemo];
+    if (!TranslatedFunctionRegistry::IsLookupPublished()) return nullptr;
+    Memo& m = memo[((target >> 2) ^ (target >> 12)) & (kMemo - 1u)];
+    if (m.valid && m.target == target) return m.record;
+    const JitCallTarget* const record = JitCallTargetForSlow(target);
+    m = Memo{target, true, record};
+    return record;
+}
+
+static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept {
+    // One record per target, kept for the life of the process; a null entry remembers a target that has none.
+    static std::mutex mutex;
+    static auto* const table = new std::unordered_map<uint32_t, JitCallTarget*>();
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = table->find(target);
+    if (found != table->end()) return found->second;
+    JitCallTarget* record = nullptr;
+    const TranslatedFunctionInfo* const info = TranslatedFunctionRegistry::FindByAddressPtr(target);
+    const RawDispatchRecord* const raw = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
+    if (info != nullptr && raw != nullptr && raw->entry != nullptr) {
+        record = new JitCallTarget{};
+        record->target = target;
+        record->address = raw->address;
+        record->entry = raw->entry;
+        record->fprMask = raw->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask;
+        record->preserveGprs = raw->preserveNonvolatileGprs;
+        if (const uint32_t m = record->fprMask; m != 0) {
+            const uint32_t lowest = m & (0u - m), aboveRun = m + lowest;
+            if ((aboveRun & (aboveRun - 1u)) == 0u) {  // one run of set bits
+                const unsigned first = static_cast<unsigned>(__builtin_ctz(m));
+                const unsigned end = aboveRun == 0u ? 32u : static_cast<unsigned>(__builtin_ctz(aboveRun));
+                record->fprFirst = static_cast<uint8_t>(first - 14u);
+                record->fprCount = static_cast<uint8_t>(end - first);
+            }
+        }
+        record->special = target == 0x80017618u || target == 0x8002A210u || target == 0x80029438u;
+        const MkwGuestFloatAbi* const abi = FloatAbiSearch(target);
+        record->returnsPaired = abi != nullptr && abi->returnsPairedScalarFloat != 0;
+        record->argMask = abi != nullptr ? (abi->scalarFloatArgMask & 0x3FFEu) >> 1 : 0u;
+        for (uint32_t m = record->argMask, r = 1; m != 0; m >>= 1, ++r)
+            if ((m & 1u) != 0) record->argRegs[record->argCount++] = static_cast<uint8_t>(r);
+        record->argRounded = record->argCount == 0 ? 0 : record->argCount <= 4 ? 4 : record->argCount <= 8 ? 8 : 16;
+        for (uint32_t i = record->argCount; i < 16; ++i) record->argRegs[i] = static_cast<uint8_t>(kFormZero);
+        record->lean = record->fprMask == 0 && !record->preserveGprs;
+        record->fprsOnly = record->fprMask != 0 && !record->preserveGprs;
+    }
+    (*table)[target] = record;
+    return record;
+}
+
+namespace {
+
+// NormalizeCallFloatArguments for a mask worked out beforehand (JitCallTarget::argMask). The paired ones are rare: NormalizeArgs
+// looks at the form bytes first.
+inline void NormalizeArgMask(Frame& f, uint32_t mask) {
+    uint32_t r = 1;
+    for (; mask != 0; mask >>= 1, ++r)
+        if ((mask & 1u) != 0 && f.form[r] == Form::Paired) SetScalar(f, r, Scalar(f, r));
+}
+
+// NormalizeArgMask for a target's argument registers, by their form bytes. The paired ones are rare, so the bytes are read (one at a
+// time, which the byte stores compiled code made to them a moment ago forward; one wide read of them would not) and combined
+// without a branch each: Paired is the only form with bit 1 set. Padding entries read Frame::formZero.
+inline void NormalizeArgs(Frame& f, const JitCallTarget& t) {
+    const uint8_t* const forms = reinterpret_cast<const uint8_t*>(f.form);
+    uint32_t any = 0;
+    switch (t.argRounded) {
+    case 16:
+        for (uint32_t i = 8; i < 16; ++i) any |= forms[t.argRegs[i]];
+        [[fallthrough]];
+    case 8:
+        for (uint32_t i = 4; i < 8; ++i) any |= forms[t.argRegs[i]];
+        [[fallthrough]];
+    case 4:
+        for (uint32_t i = 0; i < 4; ++i) any |= forms[t.argRegs[i]];
+        break;
+    default: break;
+    }
+    if ((any & 2u) != 0) NormalizeArgMask(f, t.argMask);
+}
+
+// The FPRs of `mask` (bits 14-31 as PpcNonvolatileFprGuard keeps them) to and from the record's slots.
+inline void SaveFprs(const CpuContext* c, uint32_t mask, PPC_FPR* saved) {
+    for (uint32_t m = mask; m != 0; m &= m - 1) {
+        const unsigned r = static_cast<unsigned>(__builtin_ctz(m));
+        saved[r - 14] = c->fpr[r];
+    }
+}
+inline void RestoreFprs(CpuContext* c, uint32_t mask, const PPC_FPR* saved) {
+    for (uint32_t m = mask; m != 0; m &= m - 1) {
+        const unsigned r = static_cast<unsigned>(__builtin_ctz(m));
+        c->fpr[r] = saved[r - 14];
+    }
+}
+
+// A run of registers copied: two at a time in one 16-byte move, then the rest one by one. The barrier keeps the compiler from
+// turning the loops into a call of memcpy, which costs more than the copy for a few registers.
+static_assert(sizeof(PPC_FPR) == 8);
+inline void CopyFprs(PPC_FPR* to, const PPC_FPR* from, unsigned count) noexcept {
+    unsigned i = 0;
+    for (; i + 2 <= count; i += 2) {
+        std::memcpy(to + i, from + i, 16);
+        __asm__ volatile("" ::: "memory");
+    }
+    for (; i < count; ++i) {
+        to[i] = from[i];
+        __asm__ volatile("" ::: "memory");
+    }
+}
+
+// PpcNonvolatileFprGuard's work for the record `t` stands for, inline: the registers of its mask saved on construction and put
+// back on destruction (also when the callee throws), nothing else touched.
+struct ThinFprGuard {
+    CpuContext* const cpu;
+    const JitCallTarget& t;
+    PPC_FPR saved[18];
+    ThinFprGuard(CpuContext* c, const JitCallTarget& target) noexcept : cpu(c), t(target) {
+        if (t.fprCount != 0) CopyFprs(saved + t.fprFirst, cpu->fpr + 14u + t.fprFirst, t.fprCount);
+        else SaveFprs(cpu, t.fprMask, saved);
+    }
+    ~ThinFprGuard() {
+        if (t.fprCount != 0) CopyFprs(cpu->fpr + 14u + t.fprFirst, saved + t.fprFirst, t.fprCount);
+        else RestoreFprs(cpu, t.fprMask, saved);
+    }
+    ThinFprGuard(const ThinFprGuard&) = delete;
+    ThinFprGuard& operator=(const ThinFprGuard&) = delete;
+};
+
+// TryDispatchRawCpuTarget(record, cpu) for the record `t` stands for: the execution address scope, the guards, the context scope
+// when the ambient context is another, the call. A callee that throws unwinds the same guards.
+// The call of a target whose guards have nothing to save, made in another ambient context than the caller's: out of line, as it
+// sets the host float mode and is rare.
+MKW_PPC_NO_INLINE void EnterUnderContext(CpuContext* cpu, void (*entry)(CpuContext*)) {
+    CpuContextScope scope(cpu);
+    entry(cpu);
+}
+
+// ThinDispatch for a target with no guard to keep (JitCallTarget::lean): the execution address scope and the context test, in
+// the caller's frame (the guarded path below has a large frame of its own that this one must not pay for).
+inline void ThinLean(CpuContext* cpu, const JitCallTarget& t) {
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(t.address);
+    if (TryGetCpuContext() != cpu) EnterUnderContext(cpu, t.entry);
+    else t.entry(cpu);
+}
+
+// ThinDispatch for a target with a GPR guard (a native): the execution address scope, the guards, the context test.
+MKW_PPC_NO_INLINE void ThinGuarded(CpuContext* cpu, const JitCallTarget& t) {
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(t.address);
+    PpcNonvolatileGprGuard gprGuard(cpu, t.preserveGprs);
+    if (t.fprMask == 0) {
+        if (TryGetCpuContext() != cpu) {
+            CpuContextScope scope(cpu);
+            t.entry(cpu);
+        } else {
+            t.entry(cpu);
+        }
+        return;
+    }
+    ThinFprGuard fprGuard(cpu, t);
+    if (TryGetCpuContext() != cpu) {
+        CpuContextScope scope(cpu);
+        t.entry(cpu);
+    } else {
+        t.entry(cpu);
+    }
+}
+
+// ThinDispatch for a target with FPRs to keep and no GPR guard: the execution address scope, the FPR guard, the context test.
+MKW_PPC_NO_INLINE void ThinFprs(CpuContext* cpu, const JitCallTarget& t) {
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(t.address);
+    ThinFprGuard fprGuard(cpu, t);
+    if (TryGetCpuContext() != cpu) EnterUnderContext(cpu, t.entry);
+    else t.entry(cpu);
+}
+
+inline void ThinDispatch(CpuContext* cpu, const JitCallTarget& t) {
+    if (t.lean) ThinLean(cpu, t);
+    else if (t.fprsOnly) ThinFprs(cpu, t);
+    else ThinGuarded(cpu, t);
+}
+
+// What Call does after the callee returns. The form byte is written only when it changes (the value is the same): a byte store
+// that follows every call would keep the next wide read of the forms from being forwarded from the store buffer.
+inline void ThinAfterCall(Frame& f, const JitCallTarget& t) {
+    if (t.returnsPaired) f.ctx->fpr[1].d = PPC_PsToScalarInline(f.ctx->fpr[1].d);  // NormalizeCalleeFloatReturn
+    if (f.form[1] != Form::Scalar) f.form[1] = Form::Scalar;                      // NormalizeCallFloatReturn
+}
+
+template <bool Normalize>
+inline uint64_t ThinCallImpl(Frame* f, const JitCallTarget* t) noexcept {
+    try {
+        if (Normalize) NormalizeArgs(*f, *t);
+        ThinDispatch(f->ctx, *t);
+        ThinAfterCall(*f, *t);
+        return 0;
+    } catch (...) {
+        f->pending = std::current_exception();
+        return uint64_t{3} << 32;
+    }
+}
+
+template <bool Normalize>
+inline uint64_t ThinTailImpl(Frame* f, const JitCallTarget* t) noexcept {
+    try {
+        CpuContext* const c = f->ctx;
+        const uint32_t back = c->lr & ~3u;  // TailCall
+        if (Normalize) NormalizeArgs(*f, *t);
+        ThinDispatch(c, *t);
+        ThinAfterCall(*f, *t);
+        c->lr = back;
+        if (back == (f->returnAddress & ~3u)) return uint64_t{2} << 32;
+        return (uint64_t{1} << 32) | back;
+    } catch (...) {
+        f->pending = std::current_exception();
+        return uint64_t{3} << 32;
+    }
+}
+}  // namespace
+
+uint64_t JitThinCall(Frame* f, const JitCallTarget* t) noexcept { return ThinCallImpl<true>(f, t); }
+uint64_t JitThinCallPrepared(Frame* f, const JitCallTarget* t) noexcept { return ThinCallImpl<false>(f, t); }
+uint64_t JitThinTail(Frame* f, const JitCallTarget* t) noexcept { return ThinTailImpl<true>(f, t); }
+uint64_t JitThinTailPrepared(Frame* f, const JitCallTarget* t) noexcept { return ThinTailImpl<false>(f, t); }
+void JitNormalizeArgs(Frame* f, const JitCallTarget* t) noexcept { NormalizeArgMask(*f, t->argMask); }
+
+namespace {
+// Puts `t` at the front of the site's cell, the older entries moving down (the oldest falls out), unless it is there already (a call
+// made in the rollback loop frame comes here without having probed).
+inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTarget* t) noexcept {
+    for (uint32_t i = 0; i < kCellWays; ++i)
+        if (cell[i].target == target) return;
+    for (uint32_t i = kCellWays - 1; i > 0; --i) cell[i] = cell[i - 1];
+    cell[0].record = t;
+    cell[0].target = target;
+}
+}  // namespace
+
+uint64_t JitCallOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell* cell) noexcept {
+    const uint32_t target = f->ctx->ctr & ~3u;
+    if (const JitCallTarget* t = JitCallTargetFor(target); t != nullptr && !t->special) RememberTarget(cell, target, t);
+    return JitCallOp(f, b, index);
+}
+
+uint64_t JitTailOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell* cell) noexcept {
+    const uint32_t target = f->ctx->ctr & ~3u;
+    if (const JitCallTarget* t = JitCallTargetFor(target)) RememberTarget(cell, target, t);
+    return JitTailOp(f, b, index);
+}
+
+
 // One guest instruction w at pc, with next = pc + 4 on entry: the pc to continue at afterwards. Return when the frame
 // is done (a blr or tail call back to the address it was entered with).
-enum class Step : uint8_t { Continue, Return };
-
 Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddress) {
     CpuContext* const c = f.ctx;
     switch (w >> 26) {
@@ -930,6 +1165,10 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
     return Step::Continue;
 }
 
+}  // namespace detail
+
+namespace {
+
 // --- the cached interpreter ----------------------------------------------------------------------------------------
 //
 // Run's default path. Guest code is decoded once into blocks: straight runs of instructions that end at b, a call (bl,
@@ -956,103 +1195,33 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
 // BRAWL_INTERP=classic: decode every instruction as it runs (the previous interpreter). BRAWL_INTERP_VERIFY=1: run
 // every register-only handler (all but the stores) against Exec on a copy of the registers, and log differences.
 
+}  // namespace
+
+namespace detail {
+
 constexpr uint32_t kHookPcs[] = {0x80949BC0u, 0x809435F0u, 0x800171B4u, 0x80017508u, 0x800172D0u, 0x8001730Cu,
     0x80017504u, 0x801C9AACu, 0x801C9B54u, 0x801C9BFCu, 0x801C9C70u, 0x801BC684u};
-constexpr uint32_t kMaxBlock = 32;
-constexpr uint32_t kMaxSegments = 6;
-constexpr size_t kMaxCacheBytes = 32u << 20;
 
 bool IsHookPc(uint32_t pc) {
     for (uint32_t h : kHookPcs) if (pc == h) return true;
     return false;
 }
 
-enum class K : uint8_t {
-    Generic,
-    // integer: d, a, b are register numbers; imm the immediate as the handler uses it
-    Li, Addi, Lis, Addis, Mulli, Ori, Oris, Xori, Xoris, AndiRc, AndisRc,
-    Rlwinm, RlwinmRc, Rlwimi, Cmpwi, Cmplwi, Cmpw, Cmplw,
-    Add, Subf, Neg, Mullw, Or, OrRc, And, Xor, Andc, Nor, Slw, Srw, Srawi, Extsb, Extsh, Cntlzw,
-    Mflr, Mtlr, Mfctr, Mtctr, Mfcr,
-    AndRc, Subfic, Rlwnm, RlwnmRc, Mfspr, Mtspr,  // Rlwnm: imm the mask; Mfspr/Mtspr: imm the spr (not lr or ctr)
-    // loads and stores, D-form with rA != 0 (imm the displacement) and X-form with rA != 0
-    Lwz, Lwzu, Lbz, Lbzu, Lhz, Lhzu, Lha, Stw, Stwu, Stb, Stbu, Sth, Sthu, Lmw, Stmw,
-    Lwzx, Lbzx, Lhzx, Stwx, Stbx, Sthx,
-    Lfs, Lfsu, Lfd, Lfdu, Stfs, Stfsu, Stfd, Stfdu, Lfsx, Stfsx,
-    PsqL, PsqLu, PsqSt, PsqStu,  // b = W << 3 | I
-    // floating point, no Rc: imm holds frC
-    Fadds, Fsubs, Fmuls, Fdivs, Fmadds, Fmsubs, Fnmsubs, Fnmadds,
-    Fadd, Fsub, Fmul, Fdiv, Fmadd, Fmsub, Fneg, Fabs, Fmr, Frsp, Fcmpu,
-    PsAdd, PsSub, PsMul, PsMadd, PsMsub, PsNmadd, PsNmsub, PsMuls0, PsMuls1, PsMadds0, PsMadds1, PsSum0, PsSum1,
-    PsMerge00, PsMerge01, PsMerge10, PsMerge11, PsMr, PsNeg, PsAbs,
-    // bc without LK: d = BO, a = BI, imm = the target; leaves the block when taken
-    Bc,
-    // a compare (or rlwinm.) and the bc after it, in one dispatch: this op has the compare's operands, the next op is
-    // the bc (which the handler runs too and steps over)
-    CmpwiBc, CmplwiBc, CmpwBc, CmplwBc, RlwinmRcBc,
-    // b to untranslated code, followed at decode: the block goes on at the target (imm)
-    Jmp,
-    // block ends, each Exec's case for the word with what it can work out once done at decode (imm = the target)
-    B,      // b: a jump, or a tail call when the target is translated (then Exec)
-    Bl,     // bl: a call
-    Blr,    // blr (unconditional): the frame's return, or a jump through lr
-    Bclr,   // bclr without LK, conditional (d = BO, a = BI): Blr when taken, else the next op
-    Bctr,   // bctr: a jump through ctr, or a tail call when the target is translated (then Exec)
-    Bctrl,  // bctrl: a call through ctr
-    End,    // after a block's last op (not counted in it): leave for imm, where the block falls through
-};
+}  // namespace detail
 
-// Kinds before Bc have a handler that only reads and writes registers and memory (the verifier's subjects).
-inline bool Plain(K k) { return k != K::Generic && k < K::Bc; }
-inline K Unfused(K k) {
-    switch (k) {
-    case K::CmpwiBc: return K::Cmpwi;
-    case K::CmplwiBc: return K::Cmplwi;
-    case K::CmpwBc: return K::Cmpw;
-    case K::CmplwBc: return K::Cmplw;
-    case K::RlwinmRcBc: return K::RlwinmRc;
-    default: return k;
-    }
+namespace {
+
+constexpr size_t kMaxCacheBytes = 32u << 20;
+// The same rule for compiled code: past this much the whole cache is dropped at the next outermost Run (the JIT's code
+// goes with its blocks). BRAWL_JIT_CODE_LIMIT=<bytes> overrides it (the tests use a small one).
+size_t MaxJitCodeBytes() {
+    static const size_t limit = [] {
+        const char* text = std::getenv("BRAWL_JIT_CODE_LIMIT");
+        return text != nullptr && *text != '\0' ? static_cast<size_t>(std::strtoull(text, nullptr, 10)) : size_t{64} << 20;
+    }();
+    return limit;
 }
 
-constexpr const char* kKindNames[] = {"Generic", "Li", "Addi", "Lis", "Addis", "Mulli", "Ori", "Oris", "Xori", "Xoris", "AndiRc", "AndisRc", "Rlwinm", "RlwinmRc", "Rlwimi", "Cmpwi", "Cmplwi", "Cmpw", "Cmplw", "Add", "Subf", "Neg", "Mullw", "Or", "OrRc", "And", "Xor", "Andc", "Nor", "Slw", "Srw", "Srawi", "Extsb", "Extsh", "Cntlzw", "Mflr", "Mtlr", "Mfctr", "Mtctr", "Mfcr", "AndRc", "Subfic", "Rlwnm", "RlwnmRc", "Mfspr", "Mtspr", "Lwz", "Lwzu", "Lbz", "Lbzu", "Lhz", "Lhzu", "Lha", "Stw", "Stwu", "Stb", "Stbu", "Sth", "Sthu", "Lmw", "Stmw", "Lwzx", "Lbzx", "Lhzx", "Stwx", "Stbx", "Sthx", "Lfs", "Lfsu", "Lfd", "Lfdu", "Stfs", "Stfsu", "Stfd", "Stfdu", "Lfsx", "Stfsx", "PsqL", "PsqLu", "PsqSt", "PsqStu", "Fadds", "Fsubs", "Fmuls", "Fdivs", "Fmadds", "Fmsubs", "Fnmsubs", "Fnmadds", "Fadd", "Fsub", "Fmul", "Fdiv", "Fmadd", "Fmsub", "Fneg", "Fabs", "Fmr", "Frsp", "Fcmpu", "PsAdd", "PsSub", "PsMul", "PsMadd", "PsMsub", "PsNmadd", "PsNmsub", "PsMuls0", "PsMuls1", "PsMadds0", "PsMadds1", "PsSum0", "PsSum1", "PsMerge00", "PsMerge01", "PsMerge10", "PsMerge11", "PsMr", "PsNeg", "PsAbs", "Bc", "CmpwiBc", "CmplwiBc", "CmpwBc", "CmplwBc", "RlwinmRcBc", "Jmp", "B", "Bl", "Blr", "Bclr", "Bctr", "Bctrl", "End"};
-constexpr uint32_t kKinds = sizeof(kKindNames) / sizeof(kKindNames[0]);
-
-struct Op {
-    K kind;
-    uint8_t d, a, b;
-    uint32_t imm;  // Generic: the instruction word
-};
-
-// A straight run of guest code: Build follows a b to untranslated code (a Jmp op), so a block can be up to
-// kMaxSegments runs of consecutive words.
-struct Segment {
-    uint32_t start, count;
-    uint32_t firstMark, lastMark;  // its dirty marks (BrawlDirtyMemory::leanBlocks), one per 64 guest bytes
-};
-// The dirty marks a block's code lies under, as one 8-byte load each: the marks from `at` that `mask` keeps. A block
-// usually needs one or two (its segments are near each other); unused ones keep no marks.
-struct MarkCheck {
-    uint64_t mask;
-    uint32_t at;
-};
-struct Block {
-    uint32_t start;
-    uint32_t count;
-    uint32_t end;           // the last op's pc
-    uint32_t segments;
-    const uint32_t* words;  // the guest words decoded, as FlatRead32 returns them
-    const Op* ops;          // count of them, then End
-    const uint32_t* pcs;    // each op's pc
-    const CallSite* calls;  // its bls' targets (a Bl op's b: index + 1; 0: resolved at the call)
-    const Segment* segment;
-    uint32_t epoch;         // the BrawlDirtyMemory::markEpoch it last matched guest memory in (0: compare again)
-    uint32_t lastNext;      // BRAWL_INTERP_STATS: where it went last time
-    Block* link[2];         // the blocks it went on to last (most recent first), tried before the table
-    uint32_t checks;        // the mark loads it needs (Current always does the first two)
-    bool hook;              // it starts where Run has a hook: entered through Run's loop, never a link
-    MarkCheck check[kMaxSegments < 2 ? 2 : kMaxSegments];
-};
 
 bool EndsBlock(uint32_t w) {
     const uint32_t op = w >> 26;
@@ -1296,6 +1465,7 @@ struct BlockCache {
     size_t chunkLeft = 0;
     size_t bytes = 0;
     unsigned depth = 0;  // Runs active on this thread: blocks they may still hold must stay
+    JitCodeCache* jit = nullptr;  // the backend's code for the blocks, made when the first one is compiled
 
     uint64_t built = 0, rebuilt = 0, clears = 0, runs = 0, blocksRun = 0, opsRun = 0, genericRun = 0, slotMisses = 0, current = 0;
     uint64_t linked = 0, claims = 0, retired = 0, epochs = 0;
@@ -1323,8 +1493,11 @@ struct BlockCache {
         BrawlDirtyMemory::restoredMarks = &RestoredMarks;
     }
     ~BlockCache() {
-        std::lock_guard<std::mutex> lock(CachesMutex());
-        Caches().erase(std::find(Caches().begin(), Caches().end(), this));
+        {
+            std::lock_guard<std::mutex> lock(CachesMutex());
+            Caches().erase(std::find(Caches().begin(), Caches().end(), this));
+        }
+        DestroyJit();
     }
     BlockCache(const BlockCache&) = delete;
     BlockCache& operator=(const BlockCache&) = delete;
@@ -1545,6 +1718,7 @@ struct BlockCache {
         ++clears;
         Report();
         for (Slot& s : slots) s = Slot{};
+        for (const auto& [pc, b] : blocks) Retire(*b);
         blocks.clear();
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
         {
@@ -1557,12 +1731,29 @@ struct BlockCache {
             builtAt.clear();
         }
 #endif
+        DestroyJit();  // after the blocks are dropped: all their code goes
         storage.clear();
         chunkAt = nullptr;
         chunkLeft = 0;
         bytes = 0;
     }
 
+    // A block that is being replaced or dropped, before its replacement is published: the backend resets the link slots
+    // aimed at it. Its own code stays (a block revalidated by Refresh runs it again) until the cache's goes.
+    static void Retire(Block& b) {
+        if (b.jitEntry == nullptr && b.jitIncoming == nullptr) return;
+        if (const JitBackend* const backend = Backend()) backend->retire(b);
+    }
+    size_t JitBytes() const {
+        if (jit == nullptr) return 0;
+        const JitBackend* const backend = Backend();
+        return backend != nullptr && backend->codeBytes != nullptr ? backend->codeBytes(*jit) : 0;
+    }
+    void DestroyJit() {
+        if (jit == nullptr) return;
+        Backend()->destroyCache(jit);
+        jit = nullptr;
+    }
     // The block's words are still the ones in guest memory. Lean memory compares the bytes in place (the block was
     // decoded from one contiguous host range); other memory models read word by word.
     // The block matched guest memory in the current mark epoch and nothing has written its code since: every guest
@@ -1828,6 +2019,11 @@ struct BlockCache {
         b->link[0] = b->link[1] = nullptr;
         b->hook = IsHookPc(pc);
         b->checks = 0;
+        b->entries = 0;
+        b->jitState = 0;
+        b->jitEntry = nullptr;
+        b->jitChecked = nullptr;
+        b->jitIncoming = nullptr;
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
         {
             // every mark under the block's words, ascending; then the fewest 8-mark windows over them, each starting at
@@ -1890,6 +2086,7 @@ struct BlockCache {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 64) LogChange(*b, epoch);
                 b->epoch = 0;
+                Retire(*b);
                 b = Build(pc);
                 ++rebuilt;
             }
@@ -1903,12 +2100,22 @@ struct BlockCache {
             if (!Refresh(*b, epoch)) {
                 NoteStale(*b);
                 b->epoch = 0;
+                Retire(*b);
                 b = Build(pc);
                 ++rebuilt;
             }
         }
         slot = Slot{pc, b};
         return b;
+    }
+
+    // Find for the common case, with the statistics and BRAWL_INTERP_CHECK off (the caller has settled that): the block the table
+    // holds for pc when it is current, which is all Find does then (its counters are the statistics'). Any other case is Find.
+    MKW_PPC_FORCE_INLINE Block* FindCurrent(uint32_t pc) {
+        const uint32_t epoch = BrawlDirtyMemory::markEpoch.load(std::memory_order_acquire);
+        const Slot& slot = slots[SlotOf(pc)];
+        if (slot.pc == pc && slot.block != nullptr && Current(*slot.block, epoch)) return slot.block;
+        return Find(pc);
     }
 
     // The block to run after `from` leaves for pc: one of its links when that is still current, else Find's (which
@@ -1942,14 +2149,6 @@ struct BlockCache {
 // Handlers shared by the dispatch loop and the verifier. Each mirrors Exec's case for the same instruction.
 inline uint32_t BaseD(const CpuContext* c, const Op& o) { return c->gpr[o.a] + o.imm; }
 inline uint32_t BaseX(const CpuContext* c, const Op& o) { return c->gpr[o.a] + c->gpr[o.b]; }
-
-// What the dispatch loop does after an op.
-enum class Act : uint8_t {
-    Next,    // the next op
-    Exit,    // leave the block for `next`
-    Return,  // the frame returned
-    Exec,    // run Exec on the op's word (Generic, or a tail call)
-};
 
 // Where an op runs: its pc and position in the block, and the frame's return address. A handler that steps over the
 // next op (a fused bc) advances it.
@@ -2204,7 +2403,7 @@ inline void RunPlain(Frame& f, const Op& o, uint32_t pc) {
 void VerifyOp(Frame& f, const Op& o, uint32_t pc, uint32_t w) {
     if (IsStore(o.kind)) { RunPlain(f, o, pc); return; }
     CpuContext shadow = *f.ctx;
-    Frame g{&shadow, {}, pc};
+    Frame g(&shadow, pc);
     std::memcpy(g.form, f.form, sizeof(g.form));
     uint32_t next = pc + 4;
     (void)Exec(g, pc, w, next, 0);
@@ -2259,17 +2458,152 @@ MKW_PPC_NO_INLINE Step RunBlockVerify(Frame& f, const Block& b, uint32_t& next, 
     return RunBlock<true>(f, b, next, returnAddress);
 }
 
-enum class Mode : uint8_t { Cached, Classic, Verify };
+}  // namespace
 
-Mode InterpreterMode() {
+namespace detail {
+
+uint64_t JitFallbackOp(Frame* f, const Block* b, uint32_t index) noexcept {
+    const auto result = [](uint32_t what, uint32_t next) { return (uint64_t{what} << 32) | next; };
+    try {
+        // RunBlock<false>'s loop body for one op
+        Cursor at{b->ops + index, 0, 0, f->returnAddress, b};
+        switch (RunOp(*f, f->ctx, at)) {
+        case Act::Next: return result(0, static_cast<uint32_t>(at.op - b->ops) + 1);
+        case Act::Exit: return result(1, at.next);
+        case Act::Return: return result(2, 0);
+        case Act::Exec: break;
+        }
+        const uint32_t pc = PcOf(at);
+        f->ctx->pc = pc;
+        uint32_t to = pc + 4;
+        if (Exec(*f, pc, b->words[at.op - b->ops], to, f->returnAddress) == Step::Return) return result(2, 0);
+        if (to != pc + 4) return result(1, to);
+        return result(0, static_cast<uint32_t>(at.op - b->ops) + 1);
+    } catch (...) {
+        f->pending = std::current_exception();
+        return result(3, 0);
+    }
+}
+
+uint64_t JitCallOp(Frame* f, const Block* b, uint32_t index) noexcept {
+    const auto result = [](uint32_t what, uint32_t value) { return (uint64_t{what} << 32) | value; };
+    try {
+        const Op& o = b->ops[index];
+        const uint32_t pc = b->pcs[index];
+        f->ctx->pc = pc;
+        if (o.kind == K::Bl) {
+            if (!Call(*f, o.imm, pc + 4, o.b != 0 ? &b->calls[o.b - 1] : nullptr)) return result(1, o.imm);
+        } else {
+            const uint32_t target = f->ctx->ctr & ~3u;
+            if (!Call(*f, target, pc + 4)) return result(1, target);
+        }
+        return 0;
+    } catch (...) {
+        f->pending = std::current_exception();
+        return uint64_t{3} << 32;
+    }
+}
+
+uint64_t JitTailOp(Frame* f, const Block* b, uint32_t index) noexcept {
+    const auto result = [](uint32_t what, uint32_t value) { return (uint64_t{what} << 32) | value; };
+    try {
+        const Op& o = b->ops[index];
+        CpuContext* const c = f->ctx;
+        const uint32_t target = o.kind == K::B ? o.imm : c->ctr & ~3u;
+        if (TranslatedFunctionRegistry::FindByAddressPtr(target) == nullptr) {
+            return o.kind == K::B ? result(1, target) : result(4, target);
+        }
+        c->pc = b->pcs[index];
+        uint32_t next = 0;
+        if (LoopTailCall(*f, target, next)) return result(1, next);
+        if (TailCall(*f, target, f->returnAddress)) return uint64_t{2} << 32;
+        return result(1, c->lr & ~3u);
+    } catch (...) {
+        f->pending = std::current_exception();
+        return uint64_t{3} << 32;
+    }
+}
+
+void JitNormalizeF1(Frame* f) noexcept { SetScalar(*f, 1, Scalar(*f, 1)); }
+
+const void* const* JitRollbackLoopFrameCell() noexcept {
+    return reinterpret_cast<const void* const*>(&g_rollbackLoopFrame);
+}
+
+// The count of code variants this build links, or 0. A build without them (the interpreter tests) does not define the
+// symbol, which a weak reference tolerates; Windows' linker has no weak undefined references, so there the tests define
+// it themselves (tests/interpreter_test_support.cpp).
+#if defined(_WIN32)
+extern "C" const uint32_t g_mkwCodeVariantCount;
+#else
+extern "C" const uint32_t g_mkwCodeVariantCount __attribute__((weak));
+#endif
+
+bool JitContinuationsPossible() noexcept {
+    static const bool possible = [] {
+#if defined(_WIN32)
+        if (g_mkwCodeVariantCount == 0) return false;
+#else
+        if (&g_mkwCodeVariantCount == nullptr || g_mkwCodeVariantCount == 0) return false;
+#endif
+        return std::getenv("BRAWL_NO_CODE_VARIANTS") == nullptr && std::getenv("BRAWL_INTERPRET") == nullptr;
+    }();
+    return possible;
+}
+
+bool JitContinuationAt(uint32_t pc) noexcept { return GuestCodePatch::ContinuationAt(pc) != nullptr; }
+
+#if MKW_JIT
+const JitBackend* Backend() { return JitX64Backend(); }
+#else
+const JitBackend* Backend() { return nullptr; }
+#endif
+
+}  // namespace detail
+
+namespace {
+
+enum class Mode : uint8_t { Cached, Classic, Verify, Jit };
+
+// SetEngineOverride's engine (an Engine), or -1 for the environment's choice; SetJitThreshold's count.
+std::atomic<int> g_engineOverride{-1};
+std::atomic<uint32_t> g_jitThreshold{2};
+
+// The JIT's engine when this build has a backend, the cached interpreter otherwise.
+Mode JitOrCached() {
+    static const bool jit = Backend() != nullptr;
+    return jit ? Mode::Jit : Mode::Cached;
+}
+
+// The engine the environment chooses (what InterpreterMode answers with no override set).
+Mode DefaultMode() {
     static const Mode mode = [] {
         const char* interp = std::getenv("BRAWL_INTERP");
         if (interp != nullptr && std::strcmp(interp, "classic") == 0) return Mode::Classic;
         const char* verify = std::getenv("BRAWL_INTERP_VERIFY");
         if (verify != nullptr && *verify && *verify != '0') return Mode::Verify;
-        return Mode::Cached;
+        const char* jit = std::getenv("BRAWL_JIT");
+        if (jit != nullptr && std::strcmp(jit, "0") == 0) return Mode::Cached;
+        return JitOrCached();
     }();
     return mode;
+}
+
+Mode InterpreterMode() {
+    switch (g_engineOverride.load(std::memory_order_relaxed)) {
+    case static_cast<int>(Engine::Classic): return Mode::Classic;
+    case static_cast<int>(Engine::Verify): return Mode::Verify;
+    case static_cast<int>(Engine::Cached): return Mode::Cached;
+    case static_cast<int>(Engine::Jit): return JitOrCached();
+    default: break;
+    }
+    return DefaultMode();
+}
+
+// Compiles a block the dispatcher has entered often enough (once: a block the backend turns down stays interpreted).
+MKW_PPC_NO_INLINE void CompileBlock(BlockCache& cache, const JitBackend& backend, Block& b) {
+    if (cache.jit == nullptr) cache.jit = backend.createCache();
+    b.jitState = (cache.jit != nullptr && backend.compile(*cache.jit, b) && b.jitEntry != nullptr) ? 1 : 2;
 }
 
 // Everything Run keeps per thread, behind one plain thread_local pointer. A thread_local with a constructor or
@@ -2282,9 +2616,11 @@ struct ThreadState {
 };
 thread_local ThreadState* t_state = nullptr;
 
-inline ThreadState& State() {
+MKW_PPC_NO_INLINE ThreadState* NewState() { return t_state = new ThreadState; }
+
+MKW_PPC_FORCE_INLINE ThreadState& State() {
     ThreadState* s = t_state;
-    if (s == nullptr) t_state = s = new ThreadState;
+    if (s == nullptr) s = NewState();
     return *s;
 }
 
@@ -2302,6 +2638,10 @@ void DumpRecentBranches() {
 }
 
 bool Enabled() { return g_enabled.load(std::memory_order_relaxed); }
+bool JitAvailable() { return Backend() != nullptr; }
+void SetEngineOverride(Engine engine) { g_engineOverride.store(static_cast<int>(engine), std::memory_order_relaxed); }
+void ClearEngineOverride() { g_engineOverride.store(-1, std::memory_order_relaxed); }
+void SetJitThreshold(uint32_t entries) { g_jitThreshold.store(entries, std::memory_order_relaxed); }
 void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_relaxed); }
 uint64_t InstructionCount() {
     std::lock_guard<std::mutex> lock(g_countersMutex);
@@ -2314,13 +2654,29 @@ bool CanRun(uint32_t address) {
     return address >= 0x80000000u && (address & 3u) == 0 && Memory::Contains(address, 4);
 }
 
-void Run(CpuContext* ctx, uint32_t entry) {
-    HZ_EXCLUSIVE(kHzInterpTicks);
-    ThreadState& state = State();
-    // Each entry is logged once; the per-thread set keeps the lock off the path of every later call, and a small
-    // direct-mapped cache of recent entries keeps the set's hashing off it (0.66% of P+'s game thread).
-    uint32_t& recentEntry = state.recentEntries[(entry >> 2) & 1023u];
-    if (recentEntry != entry && (recentEntry = entry, state.seen.insert(entry).second)) {
+namespace {
+
+// The thread's rollback loop frames running (Run's, and what its RunLoop reads).
+thread_local unsigned t_rollbackLoopDepth = 0;
+
+// What Run decides once per process, at its first call (the function-local statics it used to hold).
+struct RunFlags {
+    bool coreEnabled, rollbackEnabled;
+};
+const RunFlags& RunFlagsOnce() {
+    static const RunFlags flags = [] {
+        RunFlags r{};
+        r.coreEnabled = BrawlOnlineCore::Enabled();
+        r.rollbackEnabled = std::getenv("BRAWL_ROLLBACK_INPUT") != nullptr || std::getenv("BRAWL_ONLINE_IPC") != nullptr || r.coreEnabled;
+        return r;
+    }();
+    return flags;
+}
+
+// Each entry is logged once; the per-thread set keeps the lock off the path of every later call, and a small
+// direct-mapped cache of recent entries keeps the set's hashing off it (0.66% of P+'s game thread).
+MKW_PPC_NO_INLINE void NoteNewEntry(ThreadState& state, CpuContext* ctx, uint32_t entry) {
+    if (state.seen.insert(entry).second) {
         static std::mutex logMutex;
         static std::unordered_set<uint32_t> logged;
         std::lock_guard<std::mutex> lock(logMutex);
@@ -2329,52 +2685,100 @@ void Run(CpuContext* ctx, uint32_t entry) {
                     entry, ctx->lr);
         }
     }
-    Frame f{ctx, {}, entry};
-    // Callers hand FPRs over in the scalar CpuContext form (the translator's entry contract), so a float argument
-    // consumed by a paired op is splatted to both lanes, as lfs/fadds leave it on the hardware.
-    for (auto& form : f.form) form = Form::Scalar;
-    const uint32_t returnAddress = ctx->lr;
-    uint64_t executed = 0;
-    const auto& tracePcs = TracePcs();
-    static thread_local unsigned rollbackLoopDepth=0;
-    static const bool coreEnabled=BrawlOnlineCore::Enabled();
-    static const bool rollbackEnabled=std::getenv("BRAWL_ROLLBACK_INPUT")!=nullptr || std::getenv("BRAWL_ONLINE_IPC")!=nullptr || coreEnabled;
-    // The per-instruction bookkeeping below touches these thread_locals on every guest instruction. Resolve each once
-    // per Run: with emulated TLS, every thread_local access is otherwise a runtime call.
-    unsigned& loopDepth = rollbackLoopDepth;
-    uint32_t* const recentBranches = t_recentBranches;
-    uint32_t& recentBranchCount = t_recentBranchCount;
-    uint32_t& lastPc = t_lastPc;
-    const bool rollbackLoopFrame = loopDepth && entry == 0x800171B4u;  // only on the game thread (loopDepth)
-    struct LoopFrameScope {
-        bool owner;
-        const Frame* saved;
-        ~LoopFrameScope() { if (owner) g_rollbackLoopFrame.store(saved, std::memory_order_relaxed); }
-    } loopFrameScope{rollbackLoopFrame, g_rollbackLoopFrame.load(std::memory_order_relaxed)};
-    if (rollbackLoopFrame) g_rollbackLoopFrame.store(&f, std::memory_order_relaxed);
-#if MKW_INTERP_PROFILE
-    std::optional<prof::Scope> profile;
-    if (prof::Prefix() != nullptr) profile.emplace(entry, returnAddress, executed);
-    prof::Table* const profileTable = profile ? profile->table : nullptr;
-#endif
-    // Tracing needs every pc: it decodes as it goes.
-    Mode mode = tracePcs.empty() ? InterpreterMode() : Mode::Classic;
-#if MKW_INTERP_PROFILE
-    // Exact per-PC diagnostics retain the instruction loop; ordinary builds use cached blocks.
-    if (profileTable != nullptr) mode = Mode::Classic;
-#endif
-    BlockCache* cache = nullptr;
-    const bool stats = BlockCache::Stats();
-    if (mode != Mode::Classic) {
-        cache = &state.cache;
-        if (cache->depth == 0 && cache->bytes > kMaxCacheBytes) cache->Clear();
-        ++cache->depth;
-        if (stats && (++cache->runs & 0xFFFFFu) == 0) cache->Report();
+}
+MKW_PPC_FORCE_INLINE void NoteEntry(ThreadState& state, CpuContext* ctx, uint32_t entry) {
+    uint32_t& recentEntry = state.recentEntries[(entry >> 2) & 1023u];
+    if (recentEntry != entry) {
+        recentEntry = entry;
+        NoteNewEntry(state, ctx, entry);
     }
-    struct DepthScope {
-        BlockCache* cache;
-        ~DepthScope() { if (cache) --cache->depth; }
-    } depthScope{cache};
+}
+
+// The frame a Run starts with. Callers hand FPRs over in the scalar CpuContext form (the translator's entry contract), so a float
+// argument consumed by a paired op is splatted to both lanes, as lfs/fadds leave it on the hardware.
+MKW_PPC_FORCE_INLINE void StartFrame(Frame& f, CpuContext* ctx) {
+    for (auto& form : f.form) form = Form::Scalar;
+    f.returnAddress = ctx->lr;
+}
+
+// The per-instruction bookkeeping touches these thread_locals on every guest instruction. Resolved once per Run: with emulated TLS,
+// every thread_local access is otherwise a runtime call.
+struct Trail {
+    uint32_t* const branches;
+    uint32_t& count;
+    uint32_t& lastPc;
+    Trail() : branches(t_recentBranches), count(t_recentBranchCount), lastPc(t_lastPc) {}
+};
+
+// The dispatcher's step for a block with code: compiled code runs this block and every one it is linked to, and counts its own
+// instructions. Rethrows what a helper compiled code called stored in the frame.
+MKW_PPC_FORCE_INLINE JitExit EnterCompiled(const JitBackend& backend, CpuContext* ctx, Frame& f, Block& b, uint64_t& executed, const Trail& trail) {
+    const uint32_t first = b.start;
+    ctx->pc = first;
+    if (first != trail.lastPc + 4) trail.branches[trail.count++ % kRecentBranches] = first;
+    trail.lastPc = b.end;
+    f.executed = 0;
+    const JitExit exit = backend.enter(f, b);
+    executed += f.executed;
+    if (exit.status == JitStatus::Pending) {
+        std::exception_ptr pending = std::move(f.pending);
+        f.pending = nullptr;
+        CountInstructions(executed);
+        std::rethrow_exception(pending);
+    }
+    return exit;
+}
+
+// After compiled code left for exit.next: the block to go on with, linked from the slot the exit left through; null when it starts
+// at a hook, which the dispatcher's outer loop handles (f.pc is then where to go on).
+MKW_PPC_FORCE_INLINE Block* FollowExit(BlockCache& cache, const JitBackend& backend, Frame& f, const JitExit& exit) {
+    Block* const following = cache.Find(exit.next);
+    if (following->hook) {
+        f.pc = exit.next;
+        return nullptr;
+    }
+    if (exit.link != nullptr && following->jitEntry != nullptr) backend.link(*exit.link, *following);
+    return following;
+}
+
+// What Run (and the lean entry, which has run the first block already) hands the dispatcher's loop.
+struct LoopEnv {
+    CpuContext* ctx;
+    Frame& f;
+    uint64_t& executed;
+    BlockCache* cache;
+    bool stats;
+    Mode mode;
+    const JitBackend* jitBackend;
+    uint32_t jitThreshold;
+    Block* first;  // a block already found, compiled and linked for the next pc (not a hook), or null: Find(f.pc)
+#if MKW_INTERP_PROFILE
+    prof::Table* profileTable;
+#endif
+};
+
+// The loop of Run: hook pcs, then blocks one after another until the frame returns.
+MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
+    CpuContext* const ctx = env.ctx;
+    Frame& f = env.f;
+    uint64_t& executed = env.executed;
+    BlockCache* const cache = env.cache;
+    const bool stats = env.stats;
+    const Mode mode = env.mode;
+    const JitBackend* const jitBackend = env.jitBackend;
+    const uint32_t jitThreshold = env.jitThreshold;
+    Block* first = env.first;
+#if MKW_INTERP_PROFILE
+    prof::Table* const profileTable = env.profileTable;
+#endif
+    const auto& tracePcs = TracePcs();
+    const RunFlags& flags = RunFlagsOnce();
+    const bool coreEnabled = flags.coreEnabled, rollbackEnabled = flags.rollbackEnabled;
+    unsigned& loopDepth = t_rollbackLoopDepth;
+    const Trail trail;
+    uint32_t* const recentBranches = trail.branches;
+    uint32_t& recentBranchCount = trail.count;
+    uint32_t& lastPc = trail.lastPc;
     for (;;) {
         const uint32_t pc = f.pc;
         if(pc==0x80949BC0u) BrawlOnline::Stage();
@@ -2384,7 +2788,7 @@ void Run(CpuContext* ctx, uint32_t entry) {
         if(rollbackEnabled && pc==0x800171B4u && !loopDepth) {
             MKW_INTERP_PROFILE_PAUSE();  // the rollback session's own time; each frame's Run below is its own entry
             BrawlRollback::RunLoop(ctx,[](CpuContext* c) {
-                ++rollbackLoopDepth;Run(c,0x800171B4u);--rollbackLoopDepth;
+                ++t_rollbackLoopDepth;Run(c,0x800171B4u);--t_rollbackLoopDepth;
             });
             for(auto& form:f.form) form=Form::Scalar;
             continue;
@@ -2411,7 +2815,7 @@ void Run(CpuContext* ctx, uint32_t entry) {
         if(coreEnabled && (pc==0x801C9AACu || pc==0x801C9B54u || pc==0x801C9BFCu || pc==0x801C9C70u || pc==0x801BC684u)) {
             const uint32_t to=BrawlOnlineCore::SoundHook(ctx,pc);
             if(to!=pc) {
-                if(pc==entry && (to&~3u)==(returnAddress&~3u)) {  // BasicSound::Stop declined: back to its caller
+                if(pc==f.entry && (to&~3u)==(f.returnAddress&~3u)) {  // BasicSound::Stop declined: back to its caller
                     SetScalar(f,1,Scalar(f,1));
                     CountInstructions(executed);
                     return;
@@ -2423,8 +2827,24 @@ void Run(CpuContext* ctx, uint32_t entry) {
         if (cache != nullptr) {
             // Blocks run one after another here, each found through the last one's links, until the frame returns
             // or the next block starts at a hook (which the loop above handles first).
-            Block* b = cache->Find(pc);
+            Block* b = first != nullptr ? first : cache->Find(pc);
+            first = nullptr;
             for (;;) {
+                if (jitBackend != nullptr) {
+                    if (b->jitEntry == nullptr && b->jitState == 0 && ++b->entries > jitThreshold)
+                        CompileBlock(*cache, *jitBackend, *b);
+                    if (b->jitEntry != nullptr) {
+                        const JitExit exit = EnterCompiled(*jitBackend, ctx, f, *b, executed, trail);
+                        if (exit.status == JitStatus::Return) {
+                            CountInstructions(executed);
+                            return;
+                        }
+                        Block* const following = FollowExit(*cache, *jitBackend, f, exit);
+                        if (following == nullptr) break;
+                        b = following;
+                        continue;
+                    }
+                }
                 const uint32_t start = b->start;
                 if (stats) {
                     ++cache->blocksRun;
@@ -2436,8 +2856,8 @@ void Run(CpuContext* ctx, uint32_t entry) {
                 lastPc = b->end;
                 executed += b->count;
                 uint32_t next = start;
-                const Step step = mode == Mode::Verify ? RunBlockVerify(f, *b, next, returnAddress)
-                                                       : RunBlock<false>(f, *b, next, returnAddress);
+                const Step step = mode == Mode::Verify ? RunBlockVerify(f, *b, next, f.returnAddress)
+                                                       : RunBlock<false>(f, *b, next, f.returnAddress);
                 if (stats) cache->Count(*b, step, next);
                 if (step == Step::Return) {
                     CountInstructions(executed);
@@ -2462,12 +2882,120 @@ void Run(CpuContext* ctx, uint32_t entry) {
         lastPc = pc;
         if (!tracePcs.empty() && std::find(tracePcs.begin(), tracePcs.end(), pc) != tracePcs.end()) TracePc(ctx, pc);
         uint32_t next = pc + 4;
-        if (Exec(f, pc, w, next, returnAddress) == Step::Return) {
+        if (Exec(f, pc, w, next, f.returnAddress) == Step::Return) {
             CountInstructions(executed);
             return;
         }
         f.pc = next;
     }
+}
+
+}  // namespace
+
+void Run(CpuContext* ctx, uint32_t entry) {
+    HZ_EXCLUSIVE(kHzInterpTicks);
+    ThreadState& state = State();
+    NoteEntry(state, ctx, entry);
+    Frame f(ctx, entry);
+    StartFrame(f, ctx);
+    uint64_t executed = 0;
+    const auto& tracePcs = TracePcs();
+    unsigned& loopDepth = t_rollbackLoopDepth;  // only on the game thread
+    const bool rollbackLoopFrame = loopDepth && entry == 0x800171B4u;
+    struct LoopFrameScope {
+        bool owner;
+        const Frame* saved;
+        ~LoopFrameScope() { if (owner) g_rollbackLoopFrame.store(saved, std::memory_order_relaxed); }
+    } loopFrameScope{rollbackLoopFrame, g_rollbackLoopFrame.load(std::memory_order_relaxed)};
+    if (rollbackLoopFrame) g_rollbackLoopFrame.store(&f, std::memory_order_relaxed);
+#if MKW_INTERP_PROFILE
+    std::optional<prof::Scope> profile;
+    if (prof::Prefix() != nullptr) profile.emplace(entry, f.returnAddress, executed);
+    prof::Table* const profileTable = profile ? profile->table : nullptr;
+#endif
+    // Tracing needs every pc: it decodes as it goes.
+    Mode mode = tracePcs.empty() ? InterpreterMode() : Mode::Classic;
+#if MKW_INTERP_PROFILE
+    // Exact per-PC diagnostics retain the instruction loop; ordinary builds use cached blocks.
+    if (profileTable != nullptr) mode = Mode::Classic;
+#endif
+    BlockCache* cache = nullptr;
+    const bool stats = BlockCache::Stats();
+    if (stats && mode == Mode::Jit) mode = Mode::Cached;  // the statistics count every op dispatched
+    const JitBackend* const jitBackend = mode == Mode::Jit ? Backend() : nullptr;
+    const uint32_t jitThreshold = jitBackend != nullptr ? g_jitThreshold.load(std::memory_order_relaxed) : 0;
+    if (mode != Mode::Classic) {
+        cache = &state.cache;
+        if (cache->depth == 0 && (cache->bytes > kMaxCacheBytes || cache->JitBytes() > MaxJitCodeBytes())) cache->Clear();
+        ++cache->depth;
+        if (stats && (++cache->runs & 0xFFFFFu) == 0) cache->Report();
+    }
+    struct DepthScope {
+        BlockCache* cache;
+        ~DepthScope() { if (cache) --cache->depth; }
+    } depthScope{cache};
+    const LoopEnv env{ctx, f, executed, cache, stats, mode, jitBackend, jitThreshold, nullptr
+#if MKW_INTERP_PROFILE
+                      , profileTable
+#endif
+    };
+    RunLoop(env);
+}
+
+// The entry for the common call from translated code (GuestCodePatch::RunPatched's last step): Run(ctx, entry) when `entry` is
+// the start of a block that has compiled code and is current, which is all the general entry does besides tests that cannot
+// apply then. True when it ran (and returned, or threw, as Run does). False when it did nothing, and the caller makes the
+// general call: the engine is not the JIT, tracing or statistics are on, the cache is over a limit (the outermost Run drops it),
+// `entry` has no compiled block yet (the dispatcher counts and compiles it), or it is a hook pc (the loop's tests are for it).
+// Everything the two entries share is one function (NoteEntry, StartFrame, EnterCompiled, FollowExit, RunLoop): a block that
+// leaves for the dispatcher continues in the general loop with the next block already found and linked.
+bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
+#if MKW_JIT && !MKW_INTERP_PROFILE
+    // What settles it for the process (the engine the environment chooses, the backend, no tracing, no statistics, no
+    // BRAWL_INTERP_CHECK); the flags Run reads are made here as its first call would make them.
+    struct Once {
+        const JitBackend* backend;
+        bool defaultJit;
+    };
+    static const Once once = [] {
+        RunFlagsOnce();
+        const bool on = Backend() != nullptr && TracePcs().empty() && !BlockCache::Stats() && !BlockCache::CheckMarks();
+        return Once{on ? Backend() : nullptr, on && DefaultMode() == Mode::Jit};
+    }();
+    if (once.backend == nullptr) return false;
+    const int engineOverride = g_engineOverride.load(std::memory_order_relaxed);
+    if (engineOverride == -1 ? !once.defaultJit : engineOverride != static_cast<int>(Engine::Jit)) return false;
+    const JitBackend& backend = *once.backend;
+    ThreadState& state = State();
+    BlockCache& cache = state.cache;
+    if (cache.depth == 0 && (cache.bytes > kMaxCacheBytes || cache.JitBytes() > MaxJitCodeBytes())) return false;
+    Block* const b = cache.FindCurrent(entry);
+    if (b->hook || b->jitEntry == nullptr) return false;
+    NoteEntry(state, ctx, entry);
+    Frame f(ctx, entry);
+    StartFrame(f, ctx);
+    uint64_t executed = 0;
+    // (no rollback loop frame: its entry is a hook pc)
+    ++cache.depth;
+    struct DepthScope {
+        BlockCache* cache;
+        ~DepthScope() { --cache->depth; }
+    } depthScope{&cache};
+    const Trail trail;
+    const JitExit exit = EnterCompiled(backend, ctx, f, *b, executed, trail);
+    if (exit.status == JitStatus::Return) {
+        CountInstructions(executed);
+        return true;
+    }
+    Block* const following = FollowExit(cache, backend, f, exit);
+    const LoopEnv env{ctx, f, executed, &cache, false, Mode::Jit, &backend, g_jitThreshold.load(std::memory_order_relaxed), following};
+    RunLoop(env);
+    return true;
+#else
+    (void)ctx;
+    (void)entry;
+    return false;
+#endif
 }
 
 #if MKW_INTERP_PROFILE

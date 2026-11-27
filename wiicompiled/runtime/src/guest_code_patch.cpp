@@ -9,6 +9,7 @@
 #include "hz_perf.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
+#include "ppc_interpreter_internal.h"
 #include "recomp_mod_loader.h"
 #include "runtime_log.h"
 
@@ -936,7 +937,7 @@ void RunPatched(CpuContext* ctx, uint32_t address) {
     HZ_PHASE(kHzPatchedTopTicks);
     {
         HZ_PERF_T0();
-        PpcInterpreter::Run(ctx, address);
+        if (!PpcInterpreter::detail::RunCompiledEntry(ctx, address)) PpcInterpreter::Run(ctx, address);
         HZ_PERF_SINCE(kHzPatchedTicks);
         HZ_PERF_SET(kHzInterpInstructions, PpcInterpreter::InstructionCount());
     }

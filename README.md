@@ -62,9 +62,10 @@ Brawl mods are installed the way they are on a Wii's SD card:
   `UserData\Codes\RSBE01.gct`, is installed with USB Loader GX's code handler, honouring a `gc.txt` beside it
   (code list address, hook type, pokes) exactly as the mods' own loaders do: the handler runs once before the
   game's first instruction and then at every frame.
-- Code the codes patch runs in a built-in PowerPC interpreter; everything else stays native. Modules a mod
-  replaces (every fighter in Project+, the character select and the whole melee engine in Project+Ex and REX)
-  run in the interpreter too, at full speed.
+- Code the codes patch runs in a built-in PowerPC interpreter, or, on x86-64 Linux and Windows, in PoyoJIT, which
+  compiles it to native code as it runs (`docs/jit-design.md`); everything else stays native. Modules a mod replaces
+  (every fighter in Project+, the character select and the whole melee engine in Project+Ex and REX) run the same way,
+  at full speed.
 
 Several builds can share one card; "Build to play" picks the one that runs, and "Vanilla Brawl (no mods)" plays
 the unmodded game whatever the card holds (no codes and no card). The builds tried, each copied from

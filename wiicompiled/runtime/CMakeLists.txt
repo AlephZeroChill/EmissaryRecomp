@@ -100,6 +100,36 @@ if(MKW_LEAN_MEMORY AND MKW_FLAT_MEMORY)
     message(FATAL_ERROR "MKW_LEAN_MEMORY replaces MKW_FLAT_MEMORY: configure with -DMKW_FLAT_MEMORY=OFF")
 endif()
 
+# MKW_JIT (src/jit, docs/jit-design.md): guest code with no translation (Gecko code, plugins, patched functions) is
+# compiled to host code at run time instead of interpreted. x86-64 on Linux and Windows, with lean memory (the compiled
+# code addresses guest memory through the window base). BRAWL_JIT=0 turns it off at run time, -DMKW_JIT=OFF at build
+# time.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$" AND (MKW_PLATFORM_WINDOWS OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        AND MKW_LEAN_MEMORY)
+    set(MKW_JIT_DEFAULT ON)
+    set(MKW_JIT_SUPPORTED TRUE)
+else()
+    set(MKW_JIT_DEFAULT OFF)
+    set(MKW_JIT_SUPPORTED FALSE)
+endif()
+option(MKW_JIT "Compile untranslated guest code to host code at run time" ${MKW_JIT_DEFAULT})
+if(MKW_JIT AND NOT MKW_JIT_SUPPORTED)
+    message(FATAL_ERROR "MKW_JIT needs an x86-64 host running Linux or Windows, with MKW_LEAN_MEMORY=ON "
+                        "(here: ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}, MKW_LEAN_MEMORY=${MKW_LEAN_MEMORY}). "
+                        "Configure with -DMKW_JIT=OFF.")
+endif()
+if(MKW_JIT)
+    set(MKW_JIT_XBYAK_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/xbyak")
+    file(GLOB MKW_JIT_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/jit/*.cpp")
+    # The compiler's sources include xbyak, whose headers don't mix with the Wii SDK's macros: no unity batch, no
+    # precompiled header.
+    set_source_files_properties(${MKW_JIT_SOURCES} PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        SKIP_PRECOMPILE_HEADERS ON)
+else()
+    set(MKW_JIT_SOURCES)
+endif()
+
 # MKW_LEAN_DIRTY_MARKS (include/brawl_dirty_memory.h): OFF drops rollback's per-store dirty marks. Only for builds that
 # never run rollback: the vanilla EABI translation (its rollback hooks need the mod-patched, interpreted main loop).
 # Rollback aborts if asked to track writes in such a build. -2.8% game-thread instructions on vanilla Training.
@@ -135,6 +165,9 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/Layout.cmake")
 set(MKW_PROJECT_COMPILE_DEFINITIONS NOMINMAX MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
 if(MKW_LEAN_MEMORY)
     list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_LEAN_MEMORY=1)
+endif()
+if(MKW_JIT)
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_JIT=1)
 endif()
 if(NOT MKW_LEAN_DIRTY_MARKS)
     list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_LEAN_DIRTY_MARKS=0)
@@ -322,6 +355,11 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
 # the original never does (a 4-lane divide padded with 0 raised divide-by-zero on every call), so it stays scalar.
 set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/hle/game_natives.cpp" APPEND PROPERTY
     COMPILE_OPTIONS -fno-slp-vectorize -fno-vectorize)
+# The run-time compiler's float code (src/jit) is checked against the interpreter's results bit for bit, and calls the same
+# inline functions: the same exact-float options, whatever the target.
+if(MKW_JIT)
+    set_property(SOURCE ${MKW_JIT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
+endif()
 # Match the optimization policy of the translated callers as well as their FP policy. guest_ops_outlined.cpp holds
 # operations translated code used to inline (MKW_OUTLINE_GUEST_OPS): the same options keep them bit-identical.
 set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" "${CMAKE_CURRENT_LIST_DIR}/src/guest_ops_outlined.cpp"
@@ -439,6 +477,10 @@ set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/lean_base.cpp" PROPER
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/display_timing_macos.cpp" PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON)
+if(NOT MKW_JIT)
+    file(GLOB MKW_JIT_UNUSED_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/jit/*.cpp")
+    list(REMOVE_ITEM SOURCES ${MKW_JIT_UNUSED_SOURCES})
+endif()
 if(NOT MKW_FLAT_MEMORY)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
 endif()
@@ -522,66 +564,150 @@ option(MKW_BUILD_INTERPRETER_TESTS "Build CPU-only interpreter regression tests"
 if(MKW_BUILD_INTERPRETER_TESTS)
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config/generated/RuntimeConfig.h"
         CONTENT "#pragma once\n#include <cstdint>\nnamespace RuntimeConfig { inline constexpr uint32_t SDA1_BASE = 0, SDA2_BASE = 0; }\n")
-    add_executable(mkw_interpreter_call_forms_tests
-        tests/interpreter_call_forms_tests.cpp tests/interpreter_test_support.cpp
-        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
-        src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
-    if(MKW_FLAT_MEMORY)
-        target_sources(mkw_interpreter_call_forms_tests PRIVATE src/guest_flat_memory.cpp)
-    endif()
-    target_compile_definitions(mkw_interpreter_call_forms_tests PRIVATE
-        MKW_LEAN_MEMORY=$<BOOL:${MKW_LEAN_MEMORY}> MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
-    target_include_directories(mkw_interpreter_call_forms_tests PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config"
-        "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
-    target_compile_features(mkw_interpreter_call_forms_tests PRIVATE cxx_std_20)
-    target_compile_options(mkw_interpreter_call_forms_tests PRIVATE
-        -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-        target_compile_options(mkw_interpreter_call_forms_tests PRIVATE -march=x86-64-v3)
-    endif()
-    if(APPLE)
-        target_link_options(mkw_interpreter_call_forms_tests PRIVATE -Wl,-dead_strip)
-    else()
-        target_link_options(mkw_interpreter_call_forms_tests PRIVATE -Wl,--gc-sections)
-    endif()
-    set_target_properties(mkw_interpreter_call_forms_tests PROPERTIES UNITY_BUILD OFF)
+    # What the targets that compile src/ppc_interpreter.cpp share: the runtime sources and stubs, the definitions, the
+    # include directories and the options. With MKW_JIT, the compiler's sources and xbyak too.
+    function(mkw_configure_interpreter_test target)
+        target_sources(${target} PRIVATE
+            tests/interpreter_test_support.cpp
+            src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
+            src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
+        if(MKW_FLAT_MEMORY)
+            target_sources(${target} PRIVATE src/guest_flat_memory.cpp)
+        endif()
+        target_compile_definitions(${target} PRIVATE
+            MKW_LEAN_MEMORY=$<BOOL:${MKW_LEAN_MEMORY}> MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
+        target_include_directories(${target} PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config"
+            "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
+        if(MKW_JIT)
+            target_sources(${target} PRIVATE ${MKW_JIT_SOURCES})
+            target_compile_definitions(${target} PRIVATE MKW_JIT=1)
+            target_include_directories(${target} SYSTEM PRIVATE "${MKW_JIT_XBYAK_DIR}")
+        endif()
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        target_compile_options(${target} PRIVATE
+            -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+            target_compile_options(${target} PRIVATE -march=x86-64-v3)
+        endif()
+        if(APPLE)
+            target_link_options(${target} PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(${target} PRIVATE -Wl,--gc-sections)
+        endif()
+        set_target_properties(${target} PROPERTIES UNITY_BUILD OFF)
+    endfunction()
+
+    add_executable(mkw_interpreter_call_forms_tests tests/interpreter_call_forms_tests.cpp)
+    mkw_configure_interpreter_test(mkw_interpreter_call_forms_tests)
     add_test(NAME mkw_interpreter_call_forms_tests COMMAND mkw_interpreter_call_forms_tests)
     foreach(interp_mode IN ITEMS cached classic verify)
         add_test(NAME mkw_interpreter_${interp_mode}_online_tests COMMAND mkw_interpreter_call_forms_tests)
         set_tests_properties(mkw_interpreter_${interp_mode}_online_tests PROPERTIES
             ENVIRONMENT "BRAWL_TEST_ONLINE_CORE=1;BRAWL_INTERP=${interp_mode}")
     endforeach()
+    if(MKW_JIT)
+        # The same tests with the run-time compiler off: the interpreter alone stays correct.
+        add_test(NAME mkw_interpreter_nojit_tests COMMAND mkw_interpreter_call_forms_tests)
+        set_tests_properties(mkw_interpreter_nojit_tests PROPERTIES ENVIRONMENT "BRAWL_JIT=0")
+    endif()
+
+    # Each op of the run-time compiler against the interpreter, on the same sources as the interpreter tests.
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_differential_tests.cpp")
+        add_executable(mkw_jit_differential_tests tests/jit_differential_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_differential_tests)
+        add_test(NAME mkw_jit_differential_tests COMMAND mkw_jit_differential_tests)
+        add_test(NAME mkw_jit_differential_interp_tests COMMAND mkw_jit_differential_tests)
+        set_tests_properties(mkw_jit_differential_interp_tests PROPERTIES ENVIRONMENT "BRAWL_JIT=0")
+        add_test(NAME mkw_jit_differential_jit_tests COMMAND mkw_jit_differential_tests)
+    endif()
+
+    # The floating point group of the run-time compiler against the classic interpreter, over edge values, forms, aliases and
+    # random bit patterns; the same again with every arithmetic kind forced to call its helper.
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_fp_tests.cpp")
+        add_executable(mkw_jit_fp_tests tests/jit_fp_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_fp_tests)
+        add_test(NAME mkw_jit_fp_tests COMMAND mkw_jit_fp_tests)
+        add_test(NAME mkw_jit_fp_helper_tests COMMAND mkw_jit_fp_tests)
+        set_tests_properties(mkw_jit_fp_helper_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_FP_HELPERS=1")
+    endif()
+
+    # The run-time compiler's core: links, retiring, replaced blocks, the code limit.
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_int_tests.cpp")
+        add_executable(mkw_jit_int_tests tests/jit_int_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_int_tests)
+        add_test(NAME mkw_jit_int_tests COMMAND mkw_jit_int_tests)
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_mem_tests.cpp")
+        add_executable(mkw_jit_mem_tests tests/jit_mem_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_mem_tests)
+        add_test(NAME mkw_jit_mem_tests COMMAND mkw_jit_mem_tests)
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_branch_tests.cpp")
+        add_executable(mkw_jit_branch_tests tests/jit_branch_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_branch_tests)
+        add_test(NAME mkw_jit_branch_tests COMMAND mkw_jit_branch_tests)
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_quality_tests.cpp")
+        add_executable(mkw_jit_quality_tests tests/jit_quality_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_quality_tests)
+        add_test(NAME mkw_jit_quality_tests COMMAND mkw_jit_quality_tests)
+        add_test(NAME mkw_jit_quality_far_tests COMMAND mkw_jit_quality_tests)
+        set_tests_properties(mkw_jit_quality_far_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_FAR_JUMPS=1")
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_generic_tests.cpp")
+        add_executable(mkw_jit_generic_tests tests/jit_generic_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_generic_tests)
+        add_test(NAME mkw_jit_generic_tests COMMAND mkw_jit_generic_tests)
+        add_test(NAME mkw_jit_generic_fallback_tests COMMAND mkw_jit_generic_tests)
+        set_tests_properties(mkw_jit_generic_fallback_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_GENERIC=0")
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_forms_tests.cpp")
+        add_executable(mkw_jit_forms_tests tests/jit_forms_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_forms_tests)
+        add_test(NAME mkw_jit_forms_tests COMMAND mkw_jit_forms_tests)
+        add_test(NAME mkw_jit_forms_helper_tests COMMAND mkw_jit_forms_tests)
+        set_tests_properties(mkw_jit_forms_helper_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_FP_HELPERS=1")
+        add_test(NAME mkw_jit_forms_fallback_tests COMMAND mkw_jit_forms_tests)
+        set_tests_properties(mkw_jit_forms_fallback_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_FALLBACK=fp,mem")
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_stale_tests.cpp")
+        add_executable(mkw_jit_stale_tests tests/jit_stale_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_stale_tests)
+        add_test(NAME mkw_jit_stale_tests COMMAND mkw_jit_stale_tests)
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_quality_tests.cpp")
+        add_test(NAME mkw_jit_quality_bookkeeping_tests COMMAND mkw_jit_quality_tests)
+        set_tests_properties(mkw_jit_quality_bookkeeping_tests PROPERTIES
+            ENVIRONMENT "BRAWL_JIT_EXEC_MEM=1;BRAWL_JIT_BLOCK_PC=1;BRAWL_JIT_NO_FUSED_FLAGS=1")
+    endif()
+    if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_core_tests.cpp")
+        add_executable(mkw_jit_core_tests tests/jit_core_tests.cpp)
+        mkw_configure_interpreter_test(mkw_jit_core_tests)
+        add_test(NAME mkw_jit_core_tests COMMAND mkw_jit_core_tests)
+    endif()
 
     # The memory map (include/guest_memory_map.h, Memory::Init) against Dolphin's decode, page by page, and MEM1's
     # mirrors and tail in use, on the same runtime sources and stubs as the interpreter tests.
-    add_executable(mkw_guest_memory_map_tests
-        tests/guest_memory_map_tests.cpp tests/interpreter_test_support.cpp
-        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
-        src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
-    if(MKW_FLAT_MEMORY)
-        target_sources(mkw_guest_memory_map_tests PRIVATE src/guest_flat_memory.cpp)
-    endif()
-    target_compile_definitions(mkw_guest_memory_map_tests PRIVATE
-        MKW_LEAN_MEMORY=$<BOOL:${MKW_LEAN_MEMORY}> MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
-    target_include_directories(mkw_guest_memory_map_tests PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config"
-        "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
-    target_compile_features(mkw_guest_memory_map_tests PRIVATE cxx_std_20)
-    target_compile_options(mkw_guest_memory_map_tests PRIVATE
-        -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-        target_compile_options(mkw_guest_memory_map_tests PRIVATE -march=x86-64-v3)
-    endif()
-    if(APPLE)
-        target_link_options(mkw_guest_memory_map_tests PRIVATE -Wl,-dead_strip)
-    else()
-        target_link_options(mkw_guest_memory_map_tests PRIVATE -Wl,--gc-sections)
-    endif()
+    add_executable(mkw_guest_memory_map_tests tests/guest_memory_map_tests.cpp)
+    mkw_configure_interpreter_test(mkw_guest_memory_map_tests)
     target_link_libraries(mkw_guest_memory_map_tests PRIVATE Threads::Threads)
-    set_target_properties(mkw_guest_memory_map_tests PROPERTIES UNITY_BUILD OFF)
     add_test(NAME mkw_guest_memory_map_tests COMMAND mkw_guest_memory_map_tests)
     set_tests_properties(mkw_guest_memory_map_tests PROPERTIES TIMEOUT 300)
+endif()
+
+# Executable memory for the run-time compiler, and xbyak emitting into it. Needs no interpreter.
+if(MKW_JIT)
+    add_executable(mkw_jit_exec_memory_tests tests/jit_exec_memory_tests.cpp src/jit/jit_exec_memory.cpp)
+    target_include_directories(mkw_jit_exec_memory_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_include_directories(mkw_jit_exec_memory_tests SYSTEM PRIVATE "${MKW_JIT_XBYAK_DIR}")
+    target_compile_definitions(mkw_jit_exec_memory_tests PRIVATE MKW_JIT=1)
+    target_compile_features(mkw_jit_exec_memory_tests PRIVATE cxx_std_20)
+    target_compile_options(mkw_jit_exec_memory_tests PRIVATE -UNDEBUG)
+    find_package(Threads REQUIRED)
+    target_link_libraries(mkw_jit_exec_memory_tests PRIVATE Threads::Threads)
+    set_target_properties(mkw_jit_exec_memory_tests PROPERTIES UNITY_BUILD OFF)
+    add_test(NAME mkw_jit_exec_memory_tests COMMAND mkw_jit_exec_memory_tests)
 endif()
 
 add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")
