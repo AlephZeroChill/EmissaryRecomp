@@ -597,7 +597,7 @@ inline void MarkStores(uint8_t* dirty, uint32_t canonical, uint32_t last)
     f8 = PairMsub(f0, f3, f8);
     f7 = PairMadd(f4, f11, f7);
     const int64_t cr0 = PpcCrvCompareFloat(PpcGetPs0Inline(f7), PpcGetPs0Inline(f6));  // fcmpu cr0, f7, f6
-    const bool singular = (cr & 0x20000000u) != 0;
+    const bool singular = PpcCrvEq(cr0);  // cr0's EQ bit (the packed word's 0x20000000)
     double stored0 = 0.0, stored1 = 0.0;
     if (!singular) {
         f0 = PPC_Fres(f7);
@@ -1003,10 +1003,14 @@ bool Verifiable(const GuestRanges& ranges)
 
 void DescribeContextWord(size_t offset, char* out, size_t outSize)
 {
-    if (offset < offsetof(CpuContext, cr)) { std::snprintf(out, outSize, "r%zu", offset / 4); return; }
+    if (offset < offsetof(CpuContext, crv)) { std::snprintf(out, outSize, "r%zu", offset / 4); return; }
+    if (offset < offsetof(CpuContext, lr)) {
+        std::snprintf(out, outSize, "crv%zu", (offset - offsetof(CpuContext, crv)) / 8);
+        return;
+    }
     if (offset < offsetof(CpuContext, fpr)) {
-        static const char* const names[] = {"cr", "lr", "ctr", "xer", "fpscr", "pc"};
-        std::snprintf(out, outSize, "%s", names[(offset - offsetof(CpuContext, cr)) / 4]);
+        static const char* const names[] = {"lr", "ctr", "xer", "fpscr", "pc"};
+        std::snprintf(out, outSize, "%s", names[(offset - offsetof(CpuContext, lr)) / 4]);
         return;
     }
     if (offset < offsetof(CpuContext, gqr)) {
