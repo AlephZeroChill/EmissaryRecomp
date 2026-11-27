@@ -256,11 +256,15 @@ void SetPresentPacing(bool on, bool lead) {
     DetClock::SetPresentPacing(on, on && lead ? &PacedLead : nullptr);
     if (on && !s_pacingMark.on) {
         DetClock::ResetSpeedRange();
+        char discard[8];
+        VI_HLE_DisplayReport(discard, sizeof discard, true);
         s_pacingMark = {true, std::chrono::steady_clock::now(), DetClock::Now(), DetClock::PacingNanoseconds(), DetClock::Stats(),
                         Audio_HLE_Stats(), AudioBackend::Instance().GetStats()};
     } else if (!on)
         s_pacingMark.on = false;
 }
+
+void DisplayReport(char* out, size_t size) { VI_HLE_DisplayReport(out, size, true); }
 
 void PacingReport(char* out, size_t size) {
     // Since the match's pacing went on: the emulated time against the real time it took (a timeline running slow or

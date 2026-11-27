@@ -153,6 +153,7 @@ void Watch(HWND window) {
             votes = 1;
         } else if (++votes >= 2 && vote != g_state.load(std::memory_order_relaxed)) {
             g_state.store(vote, std::memory_order_relaxed);
+            aurora_set_display_variable_refresh(vote);
             RT_LOGF(RT_TAG_CONFIG, "display: %ls at %.0f Hz %s (%d%% of %d samples in the vertical blank at %.0f fps)\n",
                     adapter.DeviceName, refresh, vote == 1 ? "follows the frames (G-Sync/FreeSync)" : "refreshes at a fixed rate",
                     static_cast<int>(std::lround(share * 100)), samples, fps);

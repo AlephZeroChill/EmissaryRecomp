@@ -64,6 +64,10 @@ void SetLoadWait(bool waiting) noexcept;
 bool ScheduledRealTime(std::chrono::steady_clock::time_point* out) noexcept;
 // How far behind its schedule the pacing was at worst since the last call.
 std::chrono::nanoseconds TakeMaxBehind() noexcept;
+// The real time the last frame boundary (PaceTo with `frameBoundary`) was due at, once: false when none came since the
+// last call, or the timeline was not paced there (no anchor yet, a load wait). The presented frame after it was due
+// then (its image is held to keep the frames' spacing, aurora_set_paced_present_schedule).
+bool TakeFrameDue(std::chrono::steady_clock::time_point* out) noexcept;
 // Frame pacing of a running match: on, a pacing wait may end early by `lead()` (the time a coming rollback's re-run
 // will take, 0 when none comes), so the rollback runs in the wait instead of after it (Dolphin's paced sleep lead).
 using LeadFn = std::chrono::nanoseconds (*)();

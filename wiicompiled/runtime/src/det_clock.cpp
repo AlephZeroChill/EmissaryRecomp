@@ -48,6 +48,9 @@ Clock::time_point g_burstDue{};
 bool g_loadWait = false;
 std::atomic<int64_t> g_maxBehindNs{0};
 bool g_presentPacing = false;
+// TakeFrameDue: the last frame boundary's due time, until taken.
+bool g_frameDueValid = false;
+Clock::time_point g_frameDue{};
 LeadFn g_lead = nullptr;
 WaitHook g_waitHook = nullptr;
 PacingStats g_stats;
@@ -195,9 +198,14 @@ void PaceTo(uint64_t ticks, bool frameBoundary) {
         // (While the session waits for loads, the timeline is not paced: it keeps re-anchoring, so the frames after the
         // wait are paced from then and do not race to make up for it.)
         Anchor(now, ticks);
+        if (frameBoundary) g_frameDueValid = false;
         return;
     }
     const auto target = Due(ticks);
+    if (frameBoundary) {
+        g_frameDue = target;
+        g_frameDueValid = true;
+    }
     if (now >= target) {
         if (frameBoundary) {
             const int64_t behind = std::chrono::duration_cast<std::chrono::nanoseconds>(now - target).count();
@@ -287,6 +295,12 @@ void SetLoadWait(bool waiting) noexcept {
 bool ScheduledRealTime(Clock::time_point* out) noexcept {
     if (!g_anchored || g_resimulating || g_loadWait) return false;
     *out = Due(Now());
+    return true;
+}
+
+bool TakeFrameDue(Clock::time_point* out) noexcept {
+    if (!std::exchange(g_frameDueValid, false)) return false;
+    *out = g_frameDue;
     return true;
 }
 

@@ -980,6 +980,8 @@ static void FinishEndedFrame(bool presentedXfb) {
     }
 }
 
+static void TickPacingWindow();
+
 void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     LogWatchedWords();
     GuestCodePatch::SyncFrame();  // code patches made outside the code handler (mod plugins)
@@ -1098,10 +1100,17 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         if (s_rollbackSincePresent.exchange(false, std::memory_order_relaxed)) {
             aurora_mark_frame_discontinuous();
         }
-        aurora_set_seal_present_schedule(
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()),
-            16'683'350);  // one NTSC field (59.94 Hz)
+        // A match's frame (paced on the schedule, DetClock::SetPresentPacing): Aurora holds its image to the time it
+        // was due plus the recent frames' lateness, so the frames stay one field apart on screen whatever this one
+        // cost (a rollback's re-run, a slower scene). Any other frame shows as soon as it is ready.
+        Clock::time_point due{};
+        const bool paced = DetClock::TakeFrameDue(&due) && DetClock::MatchPacing();
+        const auto nanos = [](Clock::time_point t) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+        };
+        if (paced) aurora_set_paced_present_schedule(nanos(due), 16'683'350);  // one NTSC field (59.94 Hz)
+        else aurora_set_seal_present_schedule(nanos(Clock::now()), 16'683'350);
     } else {
         // Retrace-context presents (VI black, boot) have no display period of
         // their own to subdivide; present as soon as the frame is ready. The
@@ -1271,8 +1280,86 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             times.lastPresentEndCycles = GameThreadCycles();
         }
     }
+    if (presentedXfb) TickPacingWindow();
     settings_overlay::AdvancePresentedFrame();
     FinishEndedFrame(presentedXfb);
+}
+
+// The display cadence (aurora_take_pacing_stats) in windows of about two seconds: a `pacing:` line each with
+// NSMBW_LOG_FPS, and the totals since the last VI_HLE_DisplayReport reset (a match's, for its log line).
+namespace {
+struct DisplayTotals {
+    double seconds = 0, shown = 0, uneven = 0;
+    uint64_t presents = 0, frames = 0, alone = 0, lateSlots = 0, superseded = 0, queueDrops = 0, holds = 0;
+    double holdMsSum = 0, holdMsMax = 0, intervals = 0, intervalSum = 0, intervalSq = 0, intervalMax = 0;
+    uint64_t intervalsOff = 0;
+    double refreshHz = 0;
+};
+std::mutex s_displayTotalsMutex;
+DisplayTotals s_displayTotals;
+}  // namespace
+
+static void TickPacingWindow() {
+    static Clock::time_point s_windowStart = Clock::now();
+    const Clock::time_point now = Clock::now();
+    if (now - s_windowStart < std::chrono::seconds(2)) return;
+    s_windowStart = now;
+    AuroraPacingStats p{};
+    aurora_take_pacing_stats(&p);
+    {
+        std::lock_guard<std::mutex> lock(s_displayTotalsMutex);
+        DisplayTotals& t = s_displayTotals;
+        t.seconds += p.seconds;
+        t.presents += p.presents;
+        t.frames += p.frames;
+        t.alone += p.framesAlone;
+        t.lateSlots += p.lateSlots;
+        t.superseded += p.superseded;
+        t.queueDrops += p.queueDrops;
+        t.holds += p.holds;
+        t.holdMsSum += p.holdMsSum;
+        t.holdMsMax = std::max(t.holdMsMax, p.holdMsMax);
+        const double n = p.frames > 1 ? double(p.frames - 1) : 0.0;
+        t.intervals += n;
+        t.intervalSum += p.frameIntervalMs * n;
+        t.intervalSq += (p.frameIntervalSdMs * p.frameIntervalSdMs + p.frameIntervalMs * p.frameIntervalMs) * n;
+        t.intervalMax = std::max(t.intervalMax, p.frameIntervalMaxMs);
+        t.intervalsOff += p.frameIntervalsOff;
+        const double shown = p.shownPerSecond * p.seconds;
+        t.shown += shown;
+        t.uneven += p.unevenShare * shown;
+        t.refreshHz = p.refreshHz;
+    }
+    if (LogFpsEnabled()) {
+        RT_LOGF(RT_TAG_VI,
+                "pacing: %.1f s, %llu presents (%llu game frames, %llu without inserted frames), frame to frame %.2f ms "
+                "sd %.2f max %.1f (%llu over 2 ms off), held %llu (avg %.2f max %.2f ms), late inserted %llu, "
+                "superseded %llu, queue drops %llu; at %.0f Hz shown %.1f/s, uneven %.1f%%\n",
+                p.seconds, (unsigned long long)p.presents, (unsigned long long)p.frames,
+                (unsigned long long)p.framesAlone, p.frameIntervalMs, p.frameIntervalSdMs, p.frameIntervalMaxMs,
+                (unsigned long long)p.frameIntervalsOff, (unsigned long long)p.holds,
+                p.holds ? p.holdMsSum / double(p.holds) : 0.0, p.holdMsMax, (unsigned long long)p.lateSlots,
+                (unsigned long long)p.superseded, (unsigned long long)p.queueDrops, p.refreshHz, p.shownPerSecond,
+                100.0 * p.unevenShare);
+    }
+}
+
+void VI_HLE_DisplayReport(char* out, size_t size, bool reset) {
+    std::lock_guard<std::mutex> lock(s_displayTotalsMutex);
+    const DisplayTotals& t = s_displayTotals;
+    const double mean = t.intervals > 0 ? t.intervalSum / t.intervals : 0.0;
+    const double sd = t.intervals > 0 ? std::sqrt(std::max(0.0, t.intervalSq / t.intervals - mean * mean)) : 0.0;
+    std::snprintf(out, size,
+                  "recomp display: %.1f s, %llu presents (%.1f/s), %llu game frames (%llu without inserted frames), "
+                  "frame to frame %.2f ms sd %.2f max %.1f (%llu over 2 ms off), held %llu (avg %.2f max %.2f ms), "
+                  "late inserted %llu, superseded %llu, queue drops %llu; at %.0f Hz shown %.1f/s, uneven %.1f%%",
+                  t.seconds, (unsigned long long)t.presents, t.seconds > 0 ? double(t.presents) / t.seconds : 0.0,
+                  (unsigned long long)t.frames, (unsigned long long)t.alone, mean, sd, t.intervalMax,
+                  (unsigned long long)t.intervalsOff, (unsigned long long)t.holds,
+                  t.holds ? t.holdMsSum / double(t.holds) : 0.0, t.holdMsMax, (unsigned long long)t.lateSlots,
+                  (unsigned long long)t.superseded, (unsigned long long)t.queueDrops, t.refreshHz,
+                  t.seconds > 0 ? t.shown / t.seconds : 0.0, t.shown > 0 ? 100.0 * t.uneven / t.shown : 0.0);
+    if (reset) s_displayTotals = DisplayTotals{};
 }
 
 // -----------------------------------------------------------------------------

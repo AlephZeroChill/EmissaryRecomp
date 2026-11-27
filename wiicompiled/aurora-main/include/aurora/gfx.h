@@ -103,6 +103,44 @@ void aurora_mark_frame_discontinuous();
 // pace to): `readyNanos` is when the frame being sealed was ready, `intervalNanos` the game frame. Interpolate's
 // slots start a short lead after it, Predict shows the frame at once and its inserted frames over the interval.
 void aurora_set_seal_present_schedule(uint64_t readyNanos, uint64_t intervalNanos);
+// aurora_set_seal_present_schedule for a frame of a paced producer (a network match's frames, each due at its own
+// time on the producer's schedule): `dueNanos` is when the frame being sealed was due, `intervalNanos` the game frame.
+// The frame's own image is held until its due time plus the 95th percentile of the recent frames' lateness after
+// theirs (the present hold, as Dolphin's PresentStats::PresentHoldUntil, at most 8 ms; a stall past the window's
+// median by a whole frame doesn't count), and its inserted frames follow it over the interval. A frame that rolls back
+// runs the re-run before it and comes that much later than one that doesn't; without the hold the screen showed that
+// jitter, and Predict's inserted frames, timed from each frame's own image, moved with it. AURORA_PRESENT_HOLD=0: no
+// hold (A/B runs).
+void aurora_set_paced_present_schedule(uint64_t dueNanos, uint64_t intervalNanos);
+// The screen the window is on follows the frames (1: G-Sync/FreeSync), refreshes at a fixed rate (0), or unknown (-1).
+// On a fixed-rate screen whose refresh is a whole multiple of 60 Hz, the inserted frames come down in steps that keep
+// every picture on screen for the same number of refreshes (240 Hz: 240 -> 120 -> 60, never 180).
+void aurora_set_display_variable_refresh(int state);
+
+// Presentation cadence since the last call (aurora_take_pacing_stats), for the logs and A/B runs.
+typedef struct {
+  double seconds;              // the window
+  uint64_t presents;           // pictures presented
+  uint64_t frames;             // game frames presented (their own image)
+  uint64_t framesAlone;        // of those, shown without inserted frames
+  uint64_t lateSlots;          // inserted frames presented over 2 ms after their time
+  uint64_t superseded;         // inserted frames dropped for a newer frame
+  uint64_t queueDrops;         // presentation jobs dropped because the presenter fell behind
+  uint64_t holds;              // game frames held (aurora_set_paced_present_schedule)
+  double holdMsSum, holdMsMax;
+  // The game frames' own images, one to the next: mean, standard deviation and largest gap, and how many were over
+  // 2 ms off one game frame (16.683 ms).
+  double frameIntervalMs, frameIntervalSdMs, frameIntervalMaxMs;
+  uint64_t frameIntervalsOff;
+  // A screen of the window's refresh rate without V-Sync, as modelled from the present times (each picture from the
+  // first refresh after its present, averaged over four refresh phases): pictures shown per second, and the share
+  // of them whose motion was uneven (what the picture showed moved on over 30% more or less than its time on screen,
+  // as a skipped or doubled picture does).
+  double refreshHz;
+  double shownPerSecond;
+  double unevenShare;
+} AuroraPacingStats;
+void aurora_take_pacing_stats(AuroraPacingStats* stats);
 // While true (a game's loading screens), late frames don't lower the interpolated frame rate.
 void aurora_set_frame_pacing_exempt(bool exempt);
 // NSMBW: V-Sync on (Fifo) or off (Immediate, else Mailbox); off by default.
