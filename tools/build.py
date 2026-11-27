@@ -86,6 +86,12 @@ def main():
     pgo.add_argument('--pgo-generate', action='store_true', help='build with frontend PGO instrumentation')
     pgo.add_argument('--pgo-profile', type=Path, help='build using a merged llvm-profdata training profile')
     args = parser.parse_args()
+    # EMISSARY_CODE_VARIANTS=<spec.txt>: the same as --code-variants, for builds made by scripts that don't pass it
+    # (release CI sets it to Project+'s spec when the game-data repository has one; docs/performance.md). Empty: none.
+    if args.code_variants is None and os.environ.get('EMISSARY_CODE_VARIANTS'):
+        args.code_variants = Path(os.environ['EMISSARY_CODE_VARIANTS'])
+    if args.code_variants:
+        print(f'build.py: code variants from {args.code_variants}', flush=True)
     if args.pgo_generate:
         args.native_arg += ['-DMKW_PGO_GENERATE=ON', '-DMKW_PGO_PROFILE=']
     elif args.pgo_profile:

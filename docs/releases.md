@@ -209,6 +209,17 @@ a public repository the logs and workflow artifacts can be seen by anyone (artif
 A new key: `game_code.py keygen` and pack again (and the secret updated); old caches then fail to
 decrypt and are built again.
 
+**Project+'s code variants** (optional; `docs/performance.md`): `pplus-variants.tar.gz.gpg` beside
+`game-code.tar.gz.gpg` in the same private repository, encrypted with the same key. With it each build job decrypts the
+spec into the runner's temporary folder (deleted with the game's code) and sets `EMISSARY_CODE_VARIANTS`, which
+`tools/build.py` takes as `--code-variants`: the functions Project+ patches are translated as it patches them, and a P+
+match runs them instead of the interpreter (about -20% of the game thread's time). Without the file the build has no
+variants, as before, and the job says so in a notice. Made with `tools/pplus_variants.py` (one Brawl Online replay
+played on a build of this repository with the card players have), then `game_code.py pack-variants --spec
+<out>/spec.txt --out pplus-variants.tar.gz.gpg`. Make it again when Project+'s card or Brawl Online's plugin changes:
+until then the variants whose code changed run in the interpreter (each is checked against guest memory when it is
+called, so an old spec is only slower, never wrong).
+
 ### Build caches
 
 Each job keeps its build folder (the translated game, the objects, the fetched core; not the .NET SDK or the downloads)

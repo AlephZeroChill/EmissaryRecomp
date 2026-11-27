@@ -9,6 +9,11 @@ and its objects) are encrypted with the same key.
     python tools/ci/game_code.py unpack --in game-code.tar.gz.gpg --out <DATA>      (key: EMISSARY_GAME_KEY)
     python tools/ci/game_code.py cache-save --dir build/linux --out build-linux.tar.gz.gpg
     python tools/ci/game_code.py cache-restore --in build-linux.tar.gz.gpg --dir build/linux
+    python tools/ci/game_code.py pack-variants --spec <dir>/spec.txt --out pplus-variants.tar.gz.gpg
+    python tools/ci/game_code.py unpack-variants --in pplus-variants.tar.gz.gpg --out <dir>
+
+Project+'s code-variant spec (tools/pplus_variants.py; docs/performance.md) travels the same way: its region dumps are
+P+'s code lists and Brawl Online's plugin as they sit in the game's memory, which stay out of this public repository.
 
 The key is EMISSARY_GAME_KEY or --key-file. gpg is GnuPG 2 (Ubuntu's, or Git for Windows' usr/bin/gpg.exe); it runs
 with a throwaway home folder, so no key ring is touched and nothing is cached.
@@ -191,6 +196,71 @@ def unpack(args):
     print(f'{out}: {len(seen)} files (main.dol {seen["sys/main.dol"][:16]})')
 
 
+def variant_files(spec: Path) -> list[tuple[str, Path]]:
+    """A code-variant spec (projects/brawl/tools/gen_variant_spec.py): spec.txt and the region dumps it names."""
+    if spec.name != 'spec.txt' or not spec.is_file():
+        raise RuntimeError(f'{spec}: not a code-variant spec (spec.txt)')
+    files = [('spec.txt', spec)]
+    files += [(p.name, p) for p in sorted(spec.parent.glob('region_*.bin'))]
+    return files
+
+
+def variant_name_ok(name: str) -> bool:
+    return name == 'spec.txt' or (name.startswith('region_') and name.endswith('.bin') and '/' not in name
+                                  and len(name) == len('region_00000000.bin'))
+
+
+def pack_variants(args):
+    files = variant_files(args.spec)
+    manifest = {'files': {}}
+    gpg = Gpg(read_key(args))
+    try:
+        # The archive goes to gpg as a file in its throwaway home, not through a pipe: Git for Windows' gpg sometimes
+        # never exited after a few hundred KB on stdin while it started its agent (the 25 MB game code never did).
+        plain = gpg.home / 'variants.tar.gz'
+        with tarfile.open(plain, mode='w:gz', compresslevel=9) as tar:
+            for name, path in files:
+                data = path.read_bytes()
+                manifest['files'][name] = sha256(data)
+                tar.addfile(plain_info(name, len(data)), io.BytesIO(data))
+            text = (json.dumps(manifest, indent=1, sort_keys=True) + '\n').encode()
+            tar.addfile(plain_info(MANIFEST, len(text)), io.BytesIO(text))
+        subprocess.run(gpg.command('--symmetric', '--cipher-algo', 'AES256', '--compress-algo', 'none',
+                                   '--output', gpg.path(args.out), gpg.path(plain)), check=True,
+                       stdin=subprocess.DEVNULL, timeout=120)
+    finally:
+        gpg.close()
+    print(f'{args.out}: {len(files)} files (spec.txt {manifest["files"]["spec.txt"][:16]}), '
+          f'encrypted ({args.out.stat().st_size / 1e3:.0f} KB)')
+
+
+def unpack_variants(args):
+    out = args.out
+    if out.exists() and any(out.iterdir()):
+        raise RuntimeError(f'{out} is not empty')
+    out.mkdir(parents=True, exist_ok=True)
+    gpg = Gpg(read_key(args))
+    seen, manifest = {}, None
+    try:
+        process = gpg.decrypt(args.input)
+        with reading(process), tarfile.open(fileobj=process.stdout, mode='r|gz') as tar:
+            for member in tar:
+                if not member.isfile() or not (member.name == MANIFEST or variant_name_ok(member.name)):
+                    raise RuntimeError(f'unexpected entry {member.name!r} in {args.input}')
+                data = tar.extractfile(member).read()
+                if member.name == MANIFEST:
+                    manifest = json.loads(data)
+                    continue
+                (out / member.name).write_bytes(data)
+                seen[member.name] = sha256(data)
+        finish(process, 'decrypt')
+    finally:
+        gpg.close()
+    if manifest is None or seen != manifest.get('files') or 'spec.txt' not in seen:
+        raise RuntimeError(f'{args.input}: the files do not match its manifest')
+    print(f'{out / "spec.txt"}: {len(seen)} files (spec.txt {seen["spec.txt"][:16]})')
+
+
 def cache_save(args):
     """The build folder (translated code, objects, the fetched core) as one encrypted file, times kept: Ninja builds
     only what changed once it is restored at the same path."""
@@ -235,6 +305,14 @@ def main():
     p.add_argument('--in', dest='input', type=Path, required=True)
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--key-file')
+    p = sub.add_parser('pack-variants')
+    p.add_argument('--spec', type=Path, required=True, help="the spec's spec.txt (its region_*.bin beside it)")
+    p.add_argument('--out', type=Path, required=True)
+    p.add_argument('--key-file')
+    p = sub.add_parser('unpack-variants')
+    p.add_argument('--in', dest='input', type=Path, required=True)
+    p.add_argument('--out', type=Path, required=True)
+    p.add_argument('--key-file')
     p = sub.add_parser('cache-save')
     p.add_argument('--dir', type=Path, required=True)
     p.add_argument('--out', type=Path, required=True)
@@ -245,12 +323,13 @@ def main():
     p.add_argument('--dir', type=Path, required=True)
     p.add_argument('--key-file')
     args = parser.parse_args()
-    {'keygen': keygen, 'pack': pack, 'unpack': unpack, 'cache-save': cache_save,
-     'cache-restore': cache_restore}[args.command](args)
+    {'keygen': keygen, 'pack': pack, 'unpack': unpack, 'pack-variants': pack_variants,
+     'unpack-variants': unpack_variants, 'cache-save': cache_save, 'cache-restore': cache_restore}[args.command](args)
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError, KeyError, ValueError) as error:
+    except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, tarfile.TarError, KeyError,
+            ValueError) as error:
         raise SystemExit(f'game_code: {error}')

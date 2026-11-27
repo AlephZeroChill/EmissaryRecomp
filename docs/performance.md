@@ -160,11 +160,25 @@ Saves and loads are not where the time goes (under 0.1 ms; lean's are ~0.04 ms s
 
 ## What to do next, by size
 
-1. **Code variants for Project+ in releases** (-0.4 to -0.5 ms a frame on this PC; most of what is left of the
-   interpreter). The mechanism is the runtime's own and checks itself; what's missing is a spec built in by release CI
-   (with the encrypted game data) and remade whenever the P+ card or the plugin changes. This replaces most of the
-   sheet's "JIT for modded code": after it, interpreted code is ~13K guest instructions a frame, mostly our PPOnline
-   plugin.
+1. **Code variants for Project+ in releases**: done after this write-up (Sarah: "you can ship P+ stuff ... use the
+   same game-key as before"). `tools/pplus_variants.py` makes the spec from a replay, `game_code.py pack-variants`
+   encrypts it with the game key, release CI builds with it when `pplus-variants.tar.gz.gpg` is in the game-data
+   repository (`docs/releases.md`), and staging builds with it when it is beside the CI's game code. A spec made from
+   the launcher's 11-26 card: 1,170 of 1,209 functions translated, the executable 9.9 MB larger (244.0 MB), 0.41-0.43
+   ms less game-thread time a frame in three same-time rounds against the same build without it.
+
+   What this is and isn't: the build translates, ahead of time and with the same translator as the rest of the game,
+   copies of the disc's functions *as Project+'s codes leave them* (hooks and all); each runs only while guest memory
+   holds exactly the words it was made from, else the interpreter does. It is native code chosen per function at run
+   time, not a JIT. It covers code a known mod writes into the disc's functions; it doesn't cover a mod nobody made a
+   spec for, a mod version after the spec, or code that only exists at run time (a mod's own modules linked in place,
+   our plugin), which still go to the interpreter. vBrawl needs none: with no codes, everything it runs is already
+   translated. REX, Cobalt and others would each need their own spec (the same script, one replay each); only the
+   variants of the mod that is running match, so several can be built in at once, each costing executable size.
+
+   A faster interpreter or a JIT (Bella's work) is the other half, not a rival: it would take exactly the calls that
+   fall back today (an unknown mod, an old spec, mod modules, the plugin). With variants in, a JIT also has far less
+   P+ code to compile at a match's start.
 2. **Lean memory (PR #5)** (-18% alone, -25 to -30% with a510744). Builds and plays on Windows; the display-list race it
    exposed is fixed by c221f8f. No write traps, inline dirty marks.
 3. a510744 (Sync) and c221f8f are in `brawlonline/perf`.
