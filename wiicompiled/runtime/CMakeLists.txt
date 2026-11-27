@@ -708,6 +708,15 @@ if(UNIX)
     endforeach()
     target_compile_definitions(mkw_lean_window_file_tests PRIVATE MKW_LEAN_WINDOW_NO_MEMFD=1)
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT MKW_PLATFORM_ANDROID)
+        # The executable's text on 2 MiB pages (src/platform/huge_text.cpp); the test carries a text filler to remap.
+        add_executable(mkw_huge_text_tests "${CMAKE_CURRENT_LIST_DIR}/tests/huge_text_tests.cpp")
+        target_include_directories(mkw_huge_text_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+        target_compile_features(mkw_huge_text_tests PRIVATE cxx_std_20)
+        add_test(NAME mkw_huge_text_tests COMMAND mkw_huge_text_tests)
+        set_tests_properties(mkw_huge_text_tests PROPERTIES TIMEOUT 60)
+    endif()
+
     add_executable(mkw_executable_range_tests "${CMAKE_CURRENT_LIST_DIR}/tests/executable_range_tests.cpp")
     target_include_directories(mkw_executable_range_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
     target_compile_features(mkw_executable_range_tests PRIVATE cxx_std_20)

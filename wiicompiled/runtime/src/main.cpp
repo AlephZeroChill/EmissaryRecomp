@@ -69,6 +69,7 @@ extern "C" int HorizonDisplaySize(unsigned* width, unsigned* height);  // platfo
 #include "netplay_start.h"
 #include "netplay_session.h"
 #include "platform/host_platform.h"
+#include "platform/huge_text.h"
 #include <optional>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_surface.h>
@@ -1332,9 +1333,26 @@ int RuntimeMain(int argc, char** argv) {
 #elif !defined(__SWITCH__)
     InstallPosixMemoryFaultHandler();
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+    // Still one thread (the transcript starts its tee threads next; static initialisers start none): put the
+    // executable's text on 2 MiB pages. BRAWL_HUGE_TEXT=0 skips it, =verify also measures it. The fault handler is
+    // already installed; the result is logged once the transcript exists.
+    const HugeText::Result hugeText = HugeText::RemapExecutableText();
+#endif
     HZ_TRACE("[horizon] RuntimeMain: transcript");
     InitializeProcessTranscript(argc, argv);
     HZ_TRACE("[horizon] RuntimeMain: transcript done");
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (hugeText.bytes != 0) {
+        if (hugeText.verified) {
+            RT_LOGF(RT_TAG_RUNTIME, "huge text: %zu MiB remapped, %zu MiB on huge pages\n", hugeText.bytes >> 20, hugeText.hugeBytes >> 20);
+        } else {
+            RT_LOGF(RT_TAG_RUNTIME, "huge text: %zu MiB remapped\n", hugeText.bytes >> 20);
+        }
+    } else {
+        RT_LOGF(RT_TAG_RUNTIME, "huge text: not remapped (%s)\n", hugeText.reason);
+    }
+#endif
 #if defined(_WIN32)
     PrefetchExecutableImage();
 #endif
