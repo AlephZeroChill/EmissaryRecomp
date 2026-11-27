@@ -522,7 +522,15 @@ void retire_finished_work_without_present() {
   const uint64_t requests = g_swapchainRequests.load(std::memory_order_relaxed);
   if (requests != s_requestsSeen) {
     s_requestsSeen = requests;
-    if (s_fence != nullptr) {
+    // A fence goes back to SDL's pool when it is released, and the next submit resets it and signals it again: one
+    // released before the GPU got to it was reset while still pending (VUID-vkResetFences-pFences-01123). The newer
+    // submit then counted as finished when the older one signaled, and SDL gave its uniform and transfer buffers to
+    // other work while the GPU still read them (the driver's fault report: "invalid write at 0x0"). A rollback's re-run
+    // frames are never presented, and frame interpolation drops frames a GPU that is behind can't show, so this ran
+    // all the time just when the GPU was several frames behind: the graphics device was lost a few seconds into
+    // online matches, on Vulkan and Direct3D 12 alike (Brawl Online bug reports #354 #364 #365 #369, all since
+    // v0.7.1). Released only once it has signaled; until then the next call checks it again.
+    if (s_fence != nullptr && SDL_QueryGPUFence(g_device, s_fence)) {
       SDL_ReleaseGPUFence(g_device, s_fence);
       s_fence = nullptr;
     }
