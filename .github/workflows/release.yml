@@ -194,7 +194,7 @@ jobs:
         if: runner.environment == 'self-hosted' && runner.os == 'macOS'
         run: |
           key="$(xcrun --show-sdk-build-version)-$(clang --version | head -1 | shasum | cut -c1-12)"
-          keep="${CI_CACHE:?the runner's .env sets CI_CACHE}/build-${{ matrix.name }}-$key"
+          keep="${CI_CACHE:?no CI_CACHE in the runner .env}/build-${{ matrix.name }}-$key"
           for old in "$CI_CACHE"/build-${{ matrix.name }}-*; do [[ $old == "$keep" ]] || rm -rf "$old"; done
           mkdir -p "$keep"
           rm -rf build && ln -s "$keep" build
