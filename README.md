@@ -169,7 +169,7 @@ Build-time switches (`build.cmake` passes `MKW_FLAT_MEMORY` itself; the others g
 | `-DMKW_ACCURATE_NANS=ON` | off | Gekko's own NaN results (which NaN operand an operation returns, the default NaN's sign), as Dolphin's Accurate NaN setting. Off, an operation returns the NaN the host CPU gives, as the Dolphin Brawl Online plays Project+ with; only NaN results differ, and off is faster. |
 | `-DMKW_LEAN_DIRTY_MARKS=OFF` | on | Drops rollback's per-store dirty marks. Only for builds that never use rollback. |
 | `-DMKW_PGO_GENERATE=ON`, then `-DMKW_PGO_PROFILE=<file.profdata>` | off | Profile-guided code layout: an instrumented build writes a clang profile, and the next build uses it. `-DMKW_SPLIT_FUNCTIONS=ON` and `-DMKW_SECTION_ORDERING_FILE=<file>` refine it. |
-| `-DCODE_VARIANTS=<spec.txt>` | none | Translates a mod's fixed code patches ahead of time (`wiicompiled/projects/brawl/tools/gen_variant_spec.py` makes the spec from memory dumps of the mod running). A variant runs only while guest memory holds exactly the code it was made from, otherwise the interpreter does. |
+| `-DCODE_VARIANTS=<spec.txt>` (or `EMISSARY_CODE_VARIANTS` in the environment) | none | Translates a mod's fixed code patches ahead of time (`wiicompiled/projects/brawl/tools/gen_variant_spec.py` makes the spec from memory dumps of the mod running; `tools/pplus_variants.py` does it for Project+ from a Brawl Online replay). A variant runs only while guest memory holds exactly the code it was made from, otherwise the interpreter does. Releases use Project+'s when CI has it (`docs/releases.md`). |
 | `-DMKW_HZ_PERF_HOT_COUNTERS=OFF` | on | Switch only: drops the per-call performance counters. |
 
 Run-time switches (environment variables; the default is the optimized path):

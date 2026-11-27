@@ -171,6 +171,15 @@ jobs:
           GIT_SSH_COMMAND="ssh -i '$ssh_dir/key' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$ssh_dir/known_hosts'" \
             git clone -q --depth 1 "git@github.com:$GAME_REPO.git" "$RUNNER_TEMP/encrypted"
           python tools/ci/game_code.py unpack --in "$RUNNER_TEMP/encrypted/game-code.tar.gz.gpg" --out "$RUNNER_TEMP/game/DATA"
+          # Project+'s code variants (docs/performance.md): its patched functions translated as it patches them, so a
+          # P+ match runs them instead of the interpreter. Optional: without the file the build has none, as before.
+          if [[ -f "$RUNNER_TEMP/encrypted/pplus-variants.tar.gz.gpg" ]]; then
+            python tools/ci/game_code.py unpack-variants --in "$RUNNER_TEMP/encrypted/pplus-variants.tar.gz.gpg" \
+              --out "$RUNNER_TEMP/game/variants"
+            echo "EMISSARY_CODE_VARIANTS=$RUNNER_TEMP/game/variants/spec.txt" >> "$GITHUB_ENV"
+          else
+            echo "::notice::no pplus-variants.tar.gz.gpg in the game-data repository: building without P+ code variants"
+          fi
           python -c "import os, shutil; [shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'], d), ignore_errors=True) for d in ('encrypted', 'game-ssh')]"
           echo "EMISSARY_GAME=$RUNNER_TEMP/game/DATA" >> "$GITHUB_ENV"
 
