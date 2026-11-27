@@ -86,6 +86,13 @@ install_name_tool -add_rpath @executable_path/../Frameworks "$program"
 foreign=$(otool -L "$program" | tail -n +2 | awk '{print $1}' |
     grep -v -e '^/usr/lib/' -e '^/System/Library/' -e '^@rpath/' || true)
 [[ -z $foreign ]] || { echo "the program links libraries other Macs do not have: $foreign" >&2; exit 1; }
+# Nothing from libSystem weakly: that is a function newer than the program's minimum macOS, found by a library's configure
+# check in a newer SDK, and null on older macOS (Brawl Online's Dolphin 0.2.12, built with the macOS 27 SDK on Sarah's
+# Mac, called libusb's pipe2 at start and crashed on macOS 26: Brawl Online bug report #366). __availability_version_check
+# is what @available calls, there since macOS 10.15.
+weak=$(nm -m "$program" | awk '/\(undefined\) weak external/ && /\(from libSystem\)/ { print $(NF - 2) }' |
+    grep -vx '__availability_version_check' || true)
+[[ -z $weak ]] || { echo "the program weakly imports from libSystem, newer than its minimum macOS: $weak" >&2; exit 1; }
 # Signed ad hoc (Apple silicon runs nothing unsigned; install_name_tool's changes undid the linker's signature): the
 # libraries, then the app (its program, Info.plist and icon). A copy the launcher downloads is not quarantined, so
 # Gatekeeper does not check it.
