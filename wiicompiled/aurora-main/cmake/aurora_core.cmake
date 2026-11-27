@@ -16,7 +16,7 @@ target_link_libraries(aurora_core PRIVATE absl::btree absl::flat_hash_map $<$<BO
 
 if (CMAKE_SYSTEM_NAME STREQUAL Windows)
     # stuff for fetching system info.
-    target_link_libraries(aurora_core PRIVATE ntdll dxgi advapi32 user32)
+    target_link_libraries(aurora_core PRIVATE ntdll dxgi advapi32 user32 psapi)
 elseif (APPLE)
     target_sources(aurora_core PRIVATE lib/system_info_mac.mm)
     target_link_libraries(aurora_core PRIVATE "-framework Foundation")

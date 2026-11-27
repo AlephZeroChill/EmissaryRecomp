@@ -12,8 +12,10 @@ inline constexpr size_t MaxAsyncReadbackSlots = 32;
 // strideWidth: a copy into part of a wider texture (the destination width set larger than what is
 // copied, e.g. NSMBW's animated tiles patching the 1024x1024 tile atlas): its block rows land that
 // texture's row pitch apart. These are read back every frame so the texture sees them.
+// keep: a one-shot color copy, read back into guest RAM too (asynchronously, up to a size), so the texture is still
+// there for a new device after a lost one (efb_ram_copy.cpp, kAsyncKeepMaxBytes).
 void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, TextureHandle texture,
-              uint32_t strideWidth = 0) noexcept;
+              uint32_t strideWidth = 0, bool keep = false) noexcept;
 bool has_pending(void* dest = nullptr) noexcept;
 bool prepare_downloads(void* dest = nullptr);
 void encode_downloads(gpu::Encoder& enc, void* dest = nullptr) noexcept;

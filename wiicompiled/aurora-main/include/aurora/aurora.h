@@ -215,6 +215,13 @@ AuroraMetalFXStatus aurora_get_metalfx_status();
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
 
+// A lost graphics device (a driver reset or a GPU fault) is replaced by a new one at the next frame, at most 3 times a
+// run; on Windows the second loss on Vulkan moves to Direct3D 12, which Automatic then picks first on this PC.
+// How many times a new device was made: a caller that shows it polls this.
+uint32_t aurora_get_device_recoveries();
+// The game is closing because the graphics device was lost for good (the 4th time, or no new one could be made).
+bool aurora_closing_for_lost_device();
+
 #ifdef __cplusplus
 }
 #endif

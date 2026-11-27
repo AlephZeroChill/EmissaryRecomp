@@ -10,6 +10,10 @@ namespace aurora::imgui {
 void create_context() noexcept;
 void initialize() noexcept;
 void shutdown() noexcept;
+// A lost device (gpu::device_lost): ImGui's GPU objects go with the old device, and are made again (the font atlas, the
+// add_texture images) on the new one. The ImGui context and its windows stay.
+void release_device_objects() noexcept;
+void restore_device_objects() noexcept;
 
 void process_event(const SDL_Event& event) noexcept;
 bool wants_capture_event(const SDL_Event& event) noexcept;

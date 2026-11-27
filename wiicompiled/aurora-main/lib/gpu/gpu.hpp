@@ -9,6 +9,7 @@
 
 #include <SDL3/SDL_gpu.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -19,8 +20,13 @@ struct SDL_Window;
 
 namespace aurora::gpu {
 extern SDL_GPUDevice* g_device;
+// Which device the objects below were made on. A lost device is replaced by a new one (recover_lost_device in
+// aurora.cpp); an object of an older device still held somewhere is not released on the new one (its handle means
+// nothing there, and destroying the old device freed it with everything else).
+extern std::atomic<uint32_t> g_deviceGeneration;
 
 struct TextureObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUTexture* handle = nullptr;
   SDL_GPUTextureFormat format = SDL_GPU_TEXTUREFORMAT_INVALID;
   SDL_GPUTextureUsageFlags usage = 0;
@@ -34,12 +40,14 @@ struct TextureObject {
 using Texture = std::shared_ptr<TextureObject>;
 
 struct SamplerObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUSampler* handle = nullptr;
   ~SamplerObject();
 };
 using Sampler = std::shared_ptr<SamplerObject>;
 
 struct BufferObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUBuffer* handle = nullptr;
   SDL_GPUBufferUsageFlags usage = 0;
   uint32_t size = 0;
@@ -48,6 +56,7 @@ struct BufferObject {
 using Buffer = std::shared_ptr<BufferObject>;
 
 struct TransferBufferObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUTransferBuffer* handle = nullptr;
   uint32_t size = 0;
   bool upload = true;
@@ -56,18 +65,21 @@ struct TransferBufferObject {
 using TransferBuffer = std::shared_ptr<TransferBufferObject>;
 
 struct ShaderObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUShader* handle = nullptr;
   ~ShaderObject();
 };
 using Shader = std::shared_ptr<ShaderObject>;
 
 struct GraphicsPipelineObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUGraphicsPipeline* handle = nullptr;
   ~GraphicsPipelineObject();
 };
 using GraphicsPipeline = std::shared_ptr<GraphicsPipelineObject>;
 
 struct ComputePipelineObject {
+  uint32_t generation = g_deviceGeneration.load(std::memory_order_relaxed);
   SDL_GPUComputePipeline* handle = nullptr;
   ~ComputePipelineObject();
 };
@@ -205,6 +217,20 @@ bool adapter_integrated() noexcept;
 const char* backend_name() noexcept;
 
 bool initialize(AuroraBackend backend);
+// ---- a lost device ----
+// A device the driver has taken away (VK_ERROR_DEVICE_LOST, DXGI_ERROR_DEVICE_REMOVED: a driver reset, a GPU fault, a
+// crash in the driver or in something hooked into it). Noted by whichever thread sees it first; the game thread then
+// rebuilds every GPU object on a new device at its next frame (recover_lost_device in aurora.cpp).
+bool device_lost() noexcept;
+// What the driver says about the fault (VK_EXT_device_fault, where the driver has it) and the DLLs loaded into the
+// game that are neither Windows' nor the game's own (overlays, capture hooks), logged: call it before shutdown().
+void log_device_lost_details() noexcept;
+// The backend of the device in use.
+AuroraBackend current_backend() noexcept;
+// Gives up on the device: closes the game the way its window's close button does, with the lost device as the
+// reason (aurora_quit_reason).
+void close_for_lost_device(const char* why) noexcept;
+bool closing_for_lost_device() noexcept;
 // The window claimed for the device's swapchain, or null while there is none.
 SDL_Window* swapchain_window() noexcept;
 bool has_surface() noexcept;

@@ -17,6 +17,7 @@
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
 
+#include <aurora/aurora.h>
 #include <dolphin/pad.h>
 
 #include "BrawlOnline/Config/OnlineSettings.h"
@@ -203,6 +204,18 @@ void CoreUiDraw(float top) {
     UI::InputDisplay::Display(1.0f);  // under the windows (the background draw list)
     ChatUI::Display(1.0f);
     VideoCommon::ReplayOverlayUI::Display(1.0f);  // while a replay or a spectated game plays
+    // A graphics device the driver took away and aurora made again (aurora_get_device_recoveries): the pause, and the
+    // models missing for a moment while their pipelines come back, have a reason on the screen.
+    static uint32_t s_recoveriesShown = 0;
+    static AuroraBackend s_backendShown = aurora_get_backend();
+    if (const uint32_t recoveries = aurora_get_device_recoveries(); recoveries != s_recoveriesShown) {
+        s_recoveriesShown = recoveries;
+        const AuroraBackend backend = aurora_get_backend();
+        const bool movedToD3D12 = backend == BACKEND_D3D12 && s_backendShown != BACKEND_D3D12;
+        s_backendShown = backend;
+        OSD::AddMessage(movedToD3D12 ? "Graphics driver reset: now on Direct3D 12" : "Graphics driver reset: recovered",
+                        OSD::Duration::VERY_LONG, OSD::Color::YELLOW);
+    }
     OSD::DrawMessages(std::max(top, ChatUI::CornerBarBottom()));
 
     ImGui::PopFont();

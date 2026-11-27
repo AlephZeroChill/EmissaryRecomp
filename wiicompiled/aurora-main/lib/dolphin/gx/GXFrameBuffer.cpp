@@ -692,7 +692,10 @@ static void copy_tex_decoded(void* dest, GXBool clear) {
     }
   }
   const u32 patchStride = patch && patchReadback ? g_gxState.texCopyDstWidth : 0;
-  aurora::gfx::efb_ram::schedule(dest, logicalDstWidth, logicalDstHeight, texCopyFmt, handle.handle, patchStride);
+  // A one-shot color copy is also read back into RAM (asynchronously): a new device after a lost one decodes it from
+  // there (efb_ram_copy.cpp, kAsyncKeepMaxBytes; Brawl's name tags are drawn once per match).
+  aurora::gfx::efb_ram::schedule(dest, logicalDstWidth, logicalDstHeight, texCopyFmt, handle.handle, patchStride,
+                                 persistentCopy);
   // NSMBW: a draw after this copy must not merge into one before it: merged primitives are recorded
   // with the earlier draw and would render before the copy reads the EFB.
   g_gxState.stateDirty = true;
