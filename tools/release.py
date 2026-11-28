@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Builds an EmissaryRecomp release with Brawl Online's online core: both Windows engines, the Linux program (in a WSL
-distro from Windows, or directly on Linux), the macOS program (on a Mac), the downloads and manifest.json; with
+"""Builds an EmissaryRecomp release with Brawl Online's online core: both Windows engines (the older CPUs' one in a
+download of its own), the Linux program (in a WSL distro from Windows, or directly on Linux), the macOS program (on a
+Mac), the downloads and manifest.json; with
 --publish, the GitHub release. The layout and the manifest are described in docs/releases.md.
 
     python tools/release.py --game <extracted disc DATA> [--prerelease rc.1] [--publish]
@@ -33,6 +34,11 @@ PLATFORMS = {
     'linux': {'asset': '{p}-{tag}-Linux.tar.gz', 'program': 'WiiCompiled'},
     'macos': {'asset': '{p}-{tag}-macOS.tar.gz', 'program': 'Emissary.app/Contents/MacOS/Emissary'},  # Apple silicon
 }
+# The Windows engine for processors without AVX2/FMA (x86-64-v2), made with the windows platform: only those processors
+# need it, so it is a download of its own, unzipped over the Windows one (Brawl Online's launcher fetches it when the
+# loader's `WiiCompiled.exe --engine` names it). Its name must not end in -Windows.zip: launchers and Brawl Online's
+# servers find the Windows download by that ending.
+OLD_CPU = {'key': 'windows-oldcpu', 'asset': '{p}-{tag}-Windows-OldCPU.zip', 'file': 'engine_usa_v2.dll'}
 TAG = re.compile(r'^v(\d+\.\d+\.\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$')
 
 
@@ -145,23 +151,37 @@ def guard(top: Path):
 
 
 def stage_windows(stage: Path, info: dict) -> Path:
+    """The Windows download: the loader, engine_usa.dll and everything beside them, without engine_usa_v2.dll (the
+    older CPUs' download, stage_windows_old_cpu)."""
     v3, v2 = ROOT / 'build/release/native', ROOT / 'build/release-v2/native'
     top = stage / TOP
     if stage.exists():
         shutil.rmtree(stage)
     top.mkdir(parents=True)
-    for need in (v3 / 'WiiCompiled.exe', v3 / 'engine_usa.dll', v2 / 'engine_usa_v2.dll', v3 / 'Sys/Rollback'):
+    for need in (v3 / 'WiiCompiled.exe', v3 / 'engine_usa.dll', v2 / OLD_CPU['file'], v3 / 'Sys/Rollback'):
         if not need.exists():
             raise RuntimeError(f'missing {need}: build both engines with the core (build-brawl.ps1 -BrawlOnline lock)')
     shutil.copyfile(v3 / 'WiiCompiled.exe', top / 'WiiCompiled.exe')  # the loader
     for dll in sorted(v3.glob('*.dll')):  # the engine and the libraries beside it (SDL3, libc++, libpng...)
-        if dll.name.lower() != 'engine_usa_v2.dll':
+        if dll.name.lower() != OLD_CPU['file']:
             shutil.copyfile(dll, top / dll.name)
-    shutil.copyfile(v2 / 'engine_usa_v2.dll', top / 'engine_usa_v2.dll')
     shutil.copyfile(v3 / 'dsp_coef.bin', top / 'dsp_coef.bin')
     copy_tree(v3 / 'wii_bootstrap', top / 'wii_bootstrap')
     copy_tree(v3 / 'Sys', top / 'Sys')  # Brawl Online's region sets (Sys/Rollback), read beside the program
     stage_common(top, info, '\r\n')
+    guard(top)
+    return top
+
+
+def stage_windows_old_cpu(stage: Path) -> Path:
+    """The older CPUs' download: engine_usa_v2.dll alone, in the same top folder as the Windows download, so it
+    unzips over it."""
+    v2 = ROOT / 'build/release-v2/native'
+    top = stage / TOP
+    if stage.exists():
+        shutil.rmtree(stage)
+    top.mkdir(parents=True)
+    shutil.copyfile(v2 / OLD_CPU['file'], top / OLD_CPU['file'])
     guard(top)
     return top
 
@@ -363,6 +383,15 @@ def main():
         assets.append(archive)
         manifest_platforms[platform] = {'asset': name, 'size': archive.stat().st_size, 'sha256': sha256(archive),
                                         'program': f'{TOP}/{PLATFORMS[platform]["program"]}'}
+        if platform == 'windows':
+            old_name = OLD_CPU['asset'].format(p=PRODUCT, tag=tag)
+            old_archive = out / old_name
+            log(f'{old_name}')
+            write_zip(stage_windows_old_cpu(out / 'stage-windows-oldcpu'), old_archive)
+            assets.append(old_archive)
+            # A platform entry without a program: the file it adds to the Windows download's folder.
+            manifest_platforms[OLD_CPU['key']] = {'asset': old_name, 'size': old_archive.stat().st_size,
+                                                  'sha256': sha256(old_archive), 'file': f'{TOP}/{OLD_CPU["file"]}'}
     manifest = {**info, 'prerelease': prerelease, 'platforms': manifest_platforms}
     # LF on every system (Python on Windows writes CRLF by default, and `sha256sum -c` reads the CR as part of the name).
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8', newline='\n')
