@@ -587,8 +587,13 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         target_compile_features(${target} PRIVATE cxx_std_20)
         target_compile_options(${target} PRIVATE
             -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
+        # The engine's own floor (MKW_HOST_ISA): with -DMKW_HOST_ISA=v2 these test the code the older CPUs' engine runs, the
+        # run-time compiler's paths without FMA, BMI2 and LZCNT included.
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-            target_compile_options(${target} PRIVATE -march=x86-64-v3)
+            target_compile_options(${target} PRIVATE ${MKW_BASELINE_ARCH_FLAG})
+        endif()
+        if(WIN32)
+            target_link_libraries(${target} PRIVATE dbghelp)  # memory.cpp's symbol lookup for fatal reports
         endif()
         if(APPLE)
             target_link_options(${target} PRIVATE -Wl,-dead_strip)

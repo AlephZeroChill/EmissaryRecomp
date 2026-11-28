@@ -4,6 +4,8 @@
 #include "fiber_manager.h"
 #include "hle/os/os_internal.h"
 #include "guest_code_patch.h"
+#include "guest_thread_guard.h"
+#include "axfx_async.h"
 #include <mutex>
 #include <algorithm>
 #include <unordered_set>
@@ -53,8 +55,9 @@ CpuContext& GetPersistentCpuContext() { return cpu; }
 size_t DvdPendingCallbackCount() { return 0; }
 namespace DetClock::detail { bool g_enabled = false; }
 namespace GuestCodePatch { void Sync() {} }
+namespace AxfxAsync { void Join() {} }
 namespace OsHleInternal {
-std::mutex gSleepTimerMutex, gOutstandingParkMutex;
+GuestThreadGuard gSleepTimerGuard{"gSleepTimerGuard"}, gOutstandingParkGuard{"gOutstandingParkGuard"};
 std::vector<SleepTimerEntry> gSleepTimers;
 std::unordered_set<uint32_t> gOutstandingParks;
 }

@@ -61,6 +61,13 @@ void MarkFatalErrorReported() __attribute__((weak));
 extern "C" void DumpRecentPcTrace(size_t) {}
 void MarkFatalErrorReported() {}
 extern "C" void DumpHostStackTraceForRuntimeHelper() {}
+// Called on fatal paths (abi_bridge.h's missing jump target, nand_path.h) and by the locked-cache DMA (ppc_helpers.cpp).
+// On Linux --gc-sections drops the code that calls them; Windows' linker still wants every one defined.
+void SetRuntimeExitCode(int) {}
+namespace RuntimeCrash {
+void WriteCrashArtifacts(std::string_view, std::string_view, const uint32_t*) noexcept {}
+}
+extern "C" void GxNotifyGuestRamDmaWrite(uint32_t, uint32_t) {}
 extern "C" void OS_HLE_ProcessAlarms(int) {}
 void ShowRuntimeFatalPopup(std::string_view, std::string_view) noexcept
 {

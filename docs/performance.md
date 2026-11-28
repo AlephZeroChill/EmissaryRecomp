@@ -158,6 +158,36 @@ Saves and loads are not where the time goes (under 0.1 ms; lean's are ~0.04 ms s
   and Display 4101 in the system log at the same minutes): a driver reset under the GPU load of several games
   presenting hundreds of frames a second, not these changes. Corpus runs go at normal speed for that reason.
 
+## Lean memory and the JIT on windows-build (2026-11-28)
+
+PR #5 (lean memory the desktop default) and PR #7 (PoyoJIT, `docs/jit-design.md`) are merged into windows-build. Measured
+before the merge with PR #7's head (053f987) on 5a3501a: the shipped variants spec (1,170 translated, 39 interpreted), the
+lock's core (051ceb8d8) with PR #3's probe, Brawl Online's current card, a quiet 9800X3D, builds interleaved over 4-5 rounds.
+"Stale" = a build without variants, which is what a P+ card or plugin change does to the spec until it is made again.
+
+| build | playback 004 / 012 / 027 (ms a frame) | re-run frame | update (distance 4) |
+|---|---|---|---|
+| flat + variants (v0.7.5) | 1.86 / 2.26 / 1.86 | 1.73 | 8.28 |
+| lean + variants + JIT (windows-build now) | 1.48 / 1.87 / 1.49 | 0.86 | 4.37 |
+| lean + variants, `BRAWL_JIT=0` | 1.51 / 1.91 / 1.51 | 0.90 | 4.52 |
+| lean + JIT, stale | 1.61 / 2.00 / 1.62 | 0.98 | 4.85 |
+| lean, stale, `BRAWL_JIT=0` | 1.82 / 2.20 / 1.83 | 1.23 | 5.88 |
+
+Lean memory is most of it (-19% a frame, -48% a re-run frame). With a current spec the JIT adds 2-5%: the variants already
+run nearly all of P+'s patched code. It matters when the spec is stale, where it gets back about two thirds of what the
+variants were worth. The spec is already part stale against the 11-27 card: 23 functions log "differs from its code
+variant" in a match (0x8015E410, the font fallback hook, is one).
+
+The JIT picks its FMA, BMI2 and LZCNT forms at compile time (`__FMA__`, `__BMI2__`, `__LZCNT__`), so the older CPUs'
+engine (`-DMKW_HOST_ISA=v2`) compiles guest code without them; the interpreter and JIT tests build at the engine's own
+ISA (`MKW_BASELINE_ARCH_FLAG`), so a v2 build tests those forms.
+
+Checked on Windows: the 50-replay corpus (556,690 frames) for each build in the table; PR #3's stress on ten replays
+each, no desync; a three-game crossplay Direct set through netsim `bad_wifi`, lean + variants + JIT against Dolphin, 0
+desyncs; the interpreter and JIT tests (MKW_BUILD_INTERPRETER_TESTS=ON) natively with llvm-mingw, at v3 and at v2.
+After the merge (windows-build with PR #5's macOS fix and the older CPUs' engine split), both engines' builds, v3 and v2
+with the JIT on, passed the corpus (50/50) and the stress on five replays with no desync.
+
 ## What to do next, by size
 
 1. **Code variants for Project+ in releases**: done after this write-up (Sarah: "you can ship P+ stuff ... use the
@@ -178,9 +208,9 @@ Saves and loads are not where the time goes (under 0.1 ms; lean's are ~0.04 ms s
 
    A faster interpreter or a JIT (Bella's work) is the other half, not a rival: it would take exactly the calls that
    fall back today (an unknown mod, an old spec, mod modules, the plugin). With variants in, a JIT also has far less
-   P+ code to compile at a match's start.
+   P+ code to compile at a match's start. Done: PR #7's PoyoJIT, merged 2026-11-28 (above).
 2. **Lean memory (PR #5)** (-18% alone, -25 to -30% with a510744). Builds and plays on Windows; the display-list race it
-   exposed is fixed by c221f8f. No write traps, inline dirty marks.
+   exposed is fixed by c221f8f. No write traps, inline dirty marks. Merged 2026-11-28 as the desktop default (above).
 3. a510744 (Sync) and c221f8f are in `brawlonline/perf`.
 4. After those, the game thread is ~half translated game code with no hotspot: the sheet's code-generation items
    (register spills, CR round trips, indirect calls) are where the rest is, plus the GX-thread syncs (PR #6).
