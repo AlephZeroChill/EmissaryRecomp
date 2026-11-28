@@ -1,5 +1,6 @@
 // CPU-only interpreter test support. Unexpected graphics or online calls fail.
 #include "brawl_rollback.h"
+#include "guest_code_patch.h"
 #include "guest_float_abi.h"
 #include "system_bridge.h"
 #include "ppc_runtime.h"
@@ -14,9 +15,35 @@
 #include <string_view>
 #include <stdexcept>
 
-// No translated functions here, so no float ABI facts (the generated table, guest_float_abi.h).
-extern "C" const uint32_t g_mkwGuestFloatAbiCount = 0u;
-extern "C" const MkwGuestFloatAbi g_mkwGuestFloatAbi[1] = {};
+// No translated functions here, so no float ABI facts (the generated table, guest_float_abi.h), except for the functions the
+// call tests register: 64 at 0x80040000 + 0x10 * i ("thin calls": every guard configuration with every float ABI) and 24 at
+// 0x80041000 + 0x10 * i (the patched functions of the call tests). Sorted by address, as the generated table is.
+namespace {
+constexpr uint16_t kTestArgMasks[6] = {0x0000, 0x0002, 0x0006, 0x2000, 0x3FFE, 0x0A0A};
+constexpr uint32_t kTestAbiCount = 64 + 24;
+struct TestAbiTable {
+    MkwGuestFloatAbi entries[kTestAbiCount];
+    constexpr TestAbiTable() : entries() {
+        for (uint32_t i = 0; i < 64; ++i)
+            entries[i] = {0x80040000u + 0x10u * i, kTestArgMasks[i % 6], static_cast<uint16_t>((i / 6) % 2)};
+        for (uint32_t i = 0; i < 24; ++i)
+            entries[64 + i] = {0x80041000u + 0x10u * i, kTestArgMasks[(i + 1) % 6], static_cast<uint16_t>((i / 3) % 2)};
+    }
+};
+constexpr TestAbiTable kTestAbi;
+}  // namespace
+extern "C" const uint32_t g_mkwGuestFloatAbiCount = kTestAbiCount;
+#if defined(_WIN32)
+// No code variants here. Elsewhere the interpreter reads the count through a weak reference; Windows needs the symbol.
+extern "C" const uint32_t g_mkwCodeVariantCount = 0u;
+#endif
+extern "C" const MkwGuestFloatAbi g_mkwGuestFloatAbi[kTestAbiCount] = {
+#define A(i) kTestAbi.entries[i]
+#define A8(i) A(i), A(i + 1), A(i + 2), A(i + 3), A(i + 4), A(i + 5), A(i + 6), A(i + 7)
+    A8(0), A8(8), A8(16), A8(24), A8(32), A8(40), A8(48), A8(56), A8(64), A8(72), A8(80)
+#undef A8
+#undef A
+};
 
 bool g_suppressSehReporting = false;
 thread_local jmp_buf* g_sehJumpTarget = nullptr;
@@ -92,4 +119,32 @@ static void TestContinuation(CpuContext* ctx) { ctx->gpr[3] = 0x55; }
 void (*ContinuationAt(uint32_t address))(CpuContext*) {
     return address == 0x8000d004u ? TestContinuation : nullptr;
 }
+
+// A double of the patch machinery for the call tests: a small table saying where a call of a "patched" registered function X runs
+// guest code (TestSetInterpreted(X, X'); X' 0: the function's own body runs). The test's function for X does what RunPatched does
+// with the answer: PpcInterpreter::Run(ctx, TestInterpretedAt(X)) and Sync() when it is not 0.
+namespace {
+struct TestPatched {
+    uint32_t address = 0, at = 0;
+};
+TestPatched g_testPatched[32];
+unsigned g_testPatchedCount = 0;
+std::atomic<unsigned> g_testSyncs{0};
+}  // namespace
+void TestSetInterpreted(uint32_t address, uint32_t at) {
+    for (unsigned i = 0; i < g_testPatchedCount; ++i)
+        if (g_testPatched[i].address == address) {
+            g_testPatched[i].at = at;
+            return;
+        }
+    if (g_testPatchedCount == 32) std::abort();
+    g_testPatched[g_testPatchedCount++] = {address, at};
+}
+uint32_t TestInterpretedAt(uint32_t address) {
+    for (unsigned i = 0; i < g_testPatchedCount; ++i)
+        if (g_testPatched[i].address == address) return g_testPatched[i].at;
+    return 0;
+}
+unsigned TestSyncCount() { return g_testSyncs.load(std::memory_order_relaxed); }
+void Sync() { g_testSyncs.store(g_testSyncs.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 }

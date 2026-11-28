@@ -107,6 +107,13 @@ vendored in `runtime/third_party/toml11`.
 Source: <https://github.com/ToruNiina/toml11/tree/v4.4.0>. Full license text:
 `runtime/third_party/toml11/LICENSE`.
 
+### xbyak 7.46 - BSD-3-Clause
+
+Copyright (c) 2007 MITSUNARI Shigeo.
+The run-time compiler for guest code (`runtime/src/jit`) emits x86-64 with xbyak, vendored in
+`runtime/third_party/xbyak` (the headers only) from tag v7.46, commit `707a5374562cf6c68843846a996de35f8f5ebc6c`.
+Source: <https://github.com/herumi/xbyak>. License: `runtime/third_party/xbyak/COPYRIGHT`.
+
 ### YamlDotNet - MIT
 
 Copyright (c) Antoine Aubry and contributors.

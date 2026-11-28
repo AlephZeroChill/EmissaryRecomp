@@ -133,6 +133,10 @@ target_compile_definitions(mkw_runtime_common PRIVATE
     _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
 target_link_libraries(mkw_runtime_common PRIVATE
     aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
+if(MKW_JIT)
+    # src/jit is part of SOURCES (CMakeLists.txt); every product takes its objects from this library.
+    target_include_directories(mkw_runtime_common SYSTEM PRIVATE "${MKW_JIT_XBYAK_DIR}")
+endif()
 target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls mkw::fatfs)
 # Save states compress their snapshots with zstd (aurora's pipeline cache brings it in).
 if(TARGET libzstd_static)
