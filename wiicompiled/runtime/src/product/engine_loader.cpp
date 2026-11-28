@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <string>
 
+#include "../../include/hang_dump_helper.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -32,6 +34,8 @@ bool HostHasV3() {
 }
 
 int main(int argc, char** argv) {
+    // The hang watchdog's dump of a running game (hang_dump_helper.h): no engine needed.
+    if (const int dumped = HangDumpHelper::Run(argc, argv); dumped >= 0) return dumped;
     const fs::path exeDir = ExeDirectory();
     fs::path module = exeDir / "engine_usa.dll";
     const fs::path oldCpu = exeDir / "engine_usa_v2.dll";

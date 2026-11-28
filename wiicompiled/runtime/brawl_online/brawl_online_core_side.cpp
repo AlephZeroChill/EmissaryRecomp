@@ -357,6 +357,7 @@ void CoreStart(const char* user_dir, const char* replay_comm) {
     B::CoreHoldWinsock();
     B::CoreWatchExit();
     B::CoreWatchCrashes();
+    B::CoreWatchHangs();
     BrawlOnline::SetEngine(&s_engine);
     BrawlOnline::SetHost(&s_host);
     CoreUiStart();

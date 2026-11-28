@@ -95,6 +95,9 @@ extern "C" uint8_t* aurora_load_png_rgba(const char* path, uint32_t* width, uint
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "recomp_mod_loader.h"
+#if defined(_WIN32)
+#include "hang_dump_helper.h"
+#endif
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <dolphin/gx/GXAurora.h>
@@ -1311,6 +1314,10 @@ static void TerminateHandler() {
 
 // Runtime entry point: loads the configuration, brings up aurora and runs the game.
 int RuntimeMain(int argc, char** argv) {
+#if defined(_WIN32)
+    // The hang watchdog's dump of a running game (hang_dump_helper.h), when this executable is the engine itself.
+    if (const int dumped = HangDumpHelper::Run(argc, argv); dumped >= 0) return dumped;
+#endif
 #if defined(__APPLE__)
     // Run from Emissary.app (Brawl Online's macOS release), the program's files are beside the bundle
     // (RuntimePlatform::ExecutableDirectory): files named relative to the working directory (the title card's

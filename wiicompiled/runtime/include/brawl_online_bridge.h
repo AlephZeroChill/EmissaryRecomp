@@ -126,6 +126,8 @@ void CoreHarnessStart();
 void CoreHoldWinsock();
 void CoreWatchExit();
 void CoreWatchCrashes();
+// The game's window "Not responding" for 8 s: the stuck thread's stack to the logs and a minidump (Windows).
+void CoreWatchHangs();
 // BRAWL_ONLINE_PROFILE: sample the calling thread (the game loop's).
 void CoreProfileStart();
 // The calling thread is the game loop's; its native stack from any thread (for the loop watch).

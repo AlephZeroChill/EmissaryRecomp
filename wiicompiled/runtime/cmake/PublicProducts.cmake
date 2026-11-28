@@ -435,7 +435,7 @@ if(MKW_PLATFORM_WINDOWS AND MKW_ENGINE_MODULE)
     add_executable(WiiCompiledLoader "${MKW_RUNTIME_SOURCE_DIR}/src/product/engine_loader.cpp")
     target_compile_features(WiiCompiledLoader PRIVATE cxx_std_20)
     set_target_properties(WiiCompiledLoader PROPERTIES OUTPUT_NAME WiiCompiled WIN32_EXECUTABLE TRUE)
-    target_link_libraries(WiiCompiledLoader PRIVATE user32)
+    target_link_libraries(WiiCompiledLoader PRIVATE user32 shell32)
     add_dependencies(WiiCompiled WiiCompiledLoader)  # building the engine also builds the program that starts it
 endif()
 target_precompile_headers(WiiCompiled PRIVATE

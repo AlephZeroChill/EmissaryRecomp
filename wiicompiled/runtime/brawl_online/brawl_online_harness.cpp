@@ -30,6 +30,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <dbghelp.h>
+
+#include "hang_dump_helper.h"
 using Socket = SOCKET;
 #else
 #include <arpa/inet.h>
@@ -957,14 +959,14 @@ void CoreNoteGameThread() {
 #endif
 }
 
-// The game's thread's native stack now, as module+offset (the executable's resolve with WiiCompiled.map):
-// for the core's loop watch, when the game's thread has not run a session frame for a second. The thread
-// is suspended only while its frames are unwound into a fixed array (nothing allocates meanwhile: it may
-// hold the heap's lock), then named after it runs again.
-void CoreGameThreadStack(char* out, size_t size) {
-    if (size) out[0] = 0;
 #ifdef _WIN32
-    const HANDLE target = s_gameThread.load();
+namespace {
+// A thread's native stack now, as "<label> <module>+0x<offset> < ..." (the executable's or engine DLL's offsets
+// resolve with its map, or llvm-symbolizer on the released engine_usa.dll, which keeps its symbol table). The thread
+// is suspended only while its frames are unwound into a fixed array (nothing allocates meanwhile: it may hold the
+// heap's lock), then named after it runs again.
+void ThreadStack(HANDLE target, const char* label, char* out, size_t size) {
+    if (size) out[0] = 0;
     if (!target || size == 0) return;
     std::array<uint64_t, 40> pcs{};
     size_t n = 0;
@@ -987,7 +989,7 @@ void CoreGameThreadStack(char* out, size_t size) {
         }
     }
     ResumeThread(target);
-    size_t used = std::snprintf(out, size, "game thread stack");
+    size_t used = std::snprintf(out, size, "%s", label);
     for (size_t i = 0; i < n && used + 1 < size; ++i) {
         HMODULE mod = nullptr;
         char name[MAX_PATH] = "?";
@@ -1000,9 +1002,133 @@ void CoreGameThreadStack(char* out, size_t size) {
         if (w < 0) break;
         used += size_t(w);
     }
+}
+
+// This process's visible top-level windows (the game's; the F10 Controllers window is Dolphin's own process).
+std::vector<HWND> OwnWindows() {
+    std::vector<HWND> found;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            DWORD owner = 0;
+            GetWindowThreadProcessId(hwnd, &owner);
+            if (owner == GetCurrentProcessId() && IsWindowVisible(hwnd))
+                reinterpret_cast<std::vector<HWND>*>(lp)->push_back(hwnd);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+// The minidump of this process by a second one (hang_dump_helper.h: this program with --write-hang-dump), into
+// <BRAWL_ONLINE_CORE>/Logs/recomp-<pid>.dmp, where the launcher's bug report takes the core's crash dumps from.
+// Its exit code (0 written), or -1 when it could not be started or did not finish in a minute.
+long WriteHangDump(std::wstring& path) {
+    const wchar_t* dir = _wgetenv(L"BRAWL_ONLINE_CORE");
+    if (!dir) return -1;
+    path = std::wstring(dir) + L"\\Logs\\recomp-" + std::to_wstring(GetCurrentProcessId()) + L".dmp";
+    wchar_t exe[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return -1;
+    std::wstring command = L"\"" + std::wstring(exe) + L"\" " + HangDumpHelper::kSwitchW + L" " +
+                           std::to_wstring(GetCurrentProcessId()) + L" \"" + path + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return -1;
+    long code = -1;
+    if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_OBJECT_0) {
+        DWORD exit = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exit)) code = static_cast<long>(exit);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+
+std::string Narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n > 0 ? n : 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+}  // namespace
+#endif
+
+// The game's thread's native stack now: for the core's loop watch, when the game's thread has not run a session
+// frame for a second.
+void CoreGameThreadStack(char* out, size_t size) {
+    if (size) out[0] = 0;
+#ifdef _WIN32
+    ThreadStack(s_gameThread.load(), "game thread stack", out, size);
 #endif
 }
 
+// The window watchdog. Windows calls a window "Not responding" once its thread has handled no message for 5 s, and a
+// player who then closes it ends the game with 0xCFFFFFFF, leaving nothing behind: no crash, no log line, the core's
+// loop watch only runs in a match (Brawl Online bug report #382: frozen on the character select after a game, while
+// chatting). The recomp handles its window's messages on the game's thread, so a window hung for HANG_SECONDS is the
+// game's thread stuck: that thread's native stack goes to the log (console.log and the core's dolphin.log), and once a
+// run a minidump of the process (every thread's stack) goes where the bug report takes the core's crash dumps from. A
+// window that responds again is logged too. Checked once a second, from its own thread.
+void CoreWatchHangs() {
+#ifdef _WIN32
+    static std::atomic<bool> started{false};
+    if (started.exchange(true) || std::getenv("BRAWL_NO_HANG_WATCH")) return;
+    std::thread([] {
+        constexpr int HANG_SECONDS = 8;  // as Dolphin's HangWatchdog: Windows says hung after 5 s, then 3 more
+        using Clock = std::chrono::steady_clock;
+        std::optional<Clock::time_point> hung_since;  // when IsHungAppWindow first said so (5 s into the hang)
+        bool reported = false, dumped = false;
+        for (;;) {
+            Sleep(1000);
+            HWND hung = nullptr;
+            for (HWND hwnd : OwnWindows()) {
+                if (IsHungAppWindow(hwnd)) {
+                    hung = hwnd;
+                    break;
+                }
+            }
+            const auto now = Clock::now();
+            if (!hung) {
+                if (reported) {
+                    const double s = std::chrono::duration<double>(now - *hung_since).count() + 5.0;
+                    std::fprintf(stderr, "[brawl-online] hang watch: the window responds again, after about %.0f s\n", s);
+                    std::fflush(stderr);
+                    WARN_LOG_FMT(BRAWLBACK, "hang watch: the window responds again, after about {:.0f} s", s);
+                }
+                hung_since.reset();
+                reported = false;
+                continue;
+            }
+            if (!hung_since) hung_since = now;
+            if (reported || now - *hung_since < std::chrono::seconds(HANG_SECONDS - 5)) continue;
+            reported = true;
+            const DWORD tid = GetWindowThreadProcessId(hung, nullptr);
+            char stack[2048];
+            const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                             FALSE, tid);
+            ThreadStack(thread, "window thread stack", stack, sizeof(stack));
+            if (thread) CloseHandle(thread);
+            const bool game = s_gameThread.load() && GetThreadId(s_gameThread.load()) == tid;
+            std::fprintf(stderr, "[brawl-online] hang watch: the window has not responded for %d s (thread %lu%s); %s\n",
+                         HANG_SECONDS, tid, game ? ", the game's" : "", stack);
+            std::fflush(stderr);
+            WARN_LOG_FMT(BRAWLBACK, "hang watch: the window has not responded for {} s (thread {}{}); {}", HANG_SECONDS,
+                         tid, game ? ", the game's" : "", stack);
+            if (dumped) continue;
+            dumped = true;
+            std::wstring path;
+            const long code = WriteHangDump(path);
+            std::fprintf(stderr, "[brawl-online] hang watch: minidump %s (%s, %ld)\n", Narrow(path).c_str(),
+                         code == 0 ? "written" : "failed", code);
+            std::fflush(stderr);
+            WARN_LOG_FMT(BRAWLBACK, "hang watch: minidump {} ({}, {})", Narrow(path), code == 0 ? "written" : "failed",
+                         code);
+        }
+    }).detach();
+#endif
+}
 namespace {
 // Dolphin's "record" session backend (Core/Harness/HarnessOnline.cpp), the same: for tests of the
 // game's online menus and the launcher's hand-offs, it records the hand-off and holds the P2P link
