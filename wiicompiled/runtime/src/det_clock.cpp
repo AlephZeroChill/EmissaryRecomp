@@ -56,6 +56,31 @@ LeadFn g_lead = nullptr;
 WaitHook g_waitHook = nullptr;
 PacingStats g_stats;
 
+#if defined(__APPLE__)
+// macOS: how long before a pacing deadline the wait stops sleeping and watches the clock. Not for precision (a
+// sleep there lands within a millisecond or two): it keeps the game's thread on a performance core at its clock.
+// macOS places a thread by how busy it has been, and the game's thread, about 1 ms of work in a 16.7 ms frame and
+// asleep the rest, ran on the efficiency cores (or a performance core at a low clock) for about half its frames,
+// where the same work took 3-9 ms instead of 1: the time from a frame's retrace to its present swung by more than a
+// 120 Hz refresh, so the frames reached the screen unevenly (M4 Max, replay 004 of the corpus: ~1,000 of 6,558 frames
+// over 20 ms apart, jitter 2.6 ms). QoS user-interactive and time-constraint (realtime) scheduling did not change
+// where it ran. A 1 ms tail made it worse, 1.5 ms mostly fixed it; with 2 ms the work stays on a performance core
+// (13-16 frames over 20 ms, jitter 0.16 ms), for a quarter to a third of a core more CPU (docs/frame-pacing.md).
+// BRAWL_PACE_NO_SPIN=1: plain sleeps, as before (measurement).
+Clock::duration SpinTail() {
+    static const Clock::duration tail = std::getenv("BRAWL_PACE_NO_SPIN") != nullptr
+                                            ? Clock::duration::zero()
+                                            : Clock::duration(std::chrono::milliseconds(2));
+    return tail;
+}
+
+inline void CpuRelax() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+#endif
+
 void SleepUntil(Clock::time_point deadline) {
 #if defined(_WIN32)
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -86,6 +111,12 @@ void SleepUntil(Clock::time_point deadline) {
     }
     while (Clock::now() < deadline) {
         YieldProcessor();
+    }
+#elif defined(__APPLE__)
+    const auto tail = SpinTail();
+    if (deadline - Clock::now() > tail) std::this_thread::sleep_until(deadline - tail);
+    while (Clock::now() < deadline) {
+        CpuRelax();
     }
 #else
     // clock_nanosleep is precise to well under a millisecond on Android and Linux; no spin, which
@@ -124,9 +155,31 @@ void Nap(Clock::time_point until) {
 // stretch as SleepUntil's own precise sleep.
 void HookedSleepUntil(Clock::time_point deadline) {
     constexpr auto kSlice = std::chrono::milliseconds(1);
+#if defined(__APPLE__)
+    // macOS's spin tail (SpinTail) is longer than the last slice: the hook still looks about once a millisecond in it.
+    const Clock::duration last = std::max<Clock::duration>(kSlice + kSlice / 2, SpinTail());
+#else
+    const Clock::duration last = kSlice + kSlice / 2;
+#endif
     while (g_waitHook != nullptr && g_waitHook()) {
         const auto now = Clock::now();
-        if (deadline - now <= kSlice + kSlice / 2) break;
+        if (deadline - now <= last) {
+#if defined(__APPLE__)
+            if (SpinTail() > Clock::duration::zero()) {
+                auto looked = now;
+                for (auto t = Clock::now(); t < deadline; t = Clock::now()) {
+                    if (t - looked >= kSlice) {
+                        looked = t;
+                        if (!g_waitHook()) break;
+                    }
+                    CpuRelax();
+                }
+                SleepUntil(deadline);
+                return;
+            }
+#endif
+            break;
+        }
         Nap(now + kSlice);
     }
     SleepUntil(deadline);

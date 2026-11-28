@@ -118,6 +118,49 @@ Predict across rollbacks only changes which transforms the inserted frames come 
 (two recomps, bad Wi-Fi, three games, about 650 rollbacks on each side) on the final build: 6,837 confirmed checksums compared, 0
 mismatches, frame traces identical.
 
+## macOS: the game's thread on an efficiency core (2026-11-28)
+
+Board card "Investigate EmissaryRecomp frame-time spikes on macOS (frames over 20 ms)", after PR #5's test on Sarah's
+Mac (M4 Max, 10 performance + 4 efficiency cores, macOS 27.2, 120 Hz built-in screen). Replay 004 of the corpus played
+at normal speed (core comm-file playback, player defaults), `NSMBW_LOG_FPS=1`:
+
+- **Cause.** Between its retrace and its present a frame is ~1 ms of work on a performance core; the game's thread
+  sleeps the rest of the 16.7 ms. macOS places a thread by how busy it has been, so it ran on the efficiency cores
+  (`pthread_cpu_number_np` 0-3, a loop there 2.5x slower) or a performance core at a low clock for about half its
+  frames: retrace to present 3-9 ms (mean 6.2), and each frame over 20 ms apart was one whose work took ~4.5 ms longer
+  than the frame before. Lean memory does less work per frame than flat, so it slept more and moved more. A busy Mac
+  hid it (the cores stay clocked up), which is why another recomp in the background "fixed" lean.
+- **Not the cause.** The sleeps: plain `sleep_until` lands 0.5-2 ms late, but with time-constraint (realtime) scheduling
+  they landed within 0.06 ms and the frames were just as uneven (1,156 / 1,141 over 20 ms). QoS user-interactive changed
+  nothing either; a test thread at either policy that works in bursts still ran on the efficiency cores. Disk, page
+  faults, the present (~1 ms) and SSH vs LaunchServices starts (an `open`ed Emissary.app, frontmost: 1,019) didn't
+  matter.
+- **Fix** (`det_clock.cpp` `SpinTail`, macOS only): a pacing wait sleeps until 2 ms before its deadline and watches the
+  clock for the rest (the wait hook still looks about once a millisecond in it). The thread then stays on a performance
+  core: retrace to present 1.0 ms (p99 1.6). A 1 ms tail, Dolphin's own on macOS (`Common::PrecisionTimer`), made it
+  worse (1,604 / 1,803 over 20 ms); 1.5 ms mostly fixed it (28); 3 ms or all of the wait was no better than 2.
+  `BRAWL_PACE_NO_SPIN=1` restores plain sleeps (how the "before" numbers below were taken, from the same program).
+- **Cost.** Process CPU per frame 11.2 -> 15.3 ms (lean) and 10.9 -> 16.2 ms (flat), ~13.6 ms with the input
+  suggestions' 1 ms looks in the wait: about a quarter to a third of a performance core, on a laptop's battery too.
+
+Replay 004 (6,558 frames), before -> after, two runs each where given; "uneven" is the `[vi] pacing:` line's modelled
+120 Hz screen (pictures whose motion was uneven):
+
+| Mac | build | over 20 ms | jitter | uneven at 120 Hz |
+|---|---|---|---|---|
+| quiet | lean | 907, 913 -> 13, 16 | 2.55 -> 0.16 ms | 22.4% -> 1.9% |
+| quiet | flat | 216, 198 -> 14, 15 | 1.36 -> 0.26 ms | 12.4% -> 3.1% |
+| quiet | v0.7.5 release (flat) | 175, 186 | 1.30 ms | 12.0% |
+| quiet, Emissary.app via `open`, frontmost | lean | 1,019 -> 15 | 2.68 -> 0.16 ms | 21.8% -> 2.0% |
+| quiet, wait hook on (as in a match) | lean | 1,106 -> 13 | 2.59 -> 0.16 ms | 23.1% -> 1.9% |
+| one unthrottled recomp beside it | lean | 34, 32 -> 16, 14 | 0.55 -> 0.22 ms | 6.0% -> 2.9% |
+| one unthrottled recomp beside it | flat | 49, 45 -> 15, 15 | 0.61 -> 0.38 ms | 7.6% -> 4.4% |
+| four unthrottled recomps (load ~9) | lean | 41 -> 17 | 0.68 -> 0.34 ms | 7.4% -> 3.9% |
+| four unthrottled recomps (load ~9) | flat | 20 -> 19 | 0.71 -> 0.61 ms | 7.9% -> 6.5% |
+
+(Windows lean on the same replay: 44 over 20 ms, jitter 0.86 ms.) Card 970's loaded Mac had flat at ~1,000 over 20 ms;
+one or four unthrottled flat recomps playing replay 012 did not reproduce that.
+
 ## Dolphin's frame-pacing work, and the recomp
 
 | Dolphin | the recomp |
@@ -127,7 +170,7 @@ mismatches, frame traces identical.
 | Hidden re-run layers (GitHub #26) | has its own (BRAWL_RESIM_HIDE light draws, BRAWL_RESIM_SKIP) |
 | Re-run frames not presented | has it (VI_HLE_SetPresentSuppressed, a460aa8) |
 | Timer resolution and no power throttling (Timer::IncreaseResolution) | has it (RaiseWindowsProcessPriority) |
-| Precise sleeps (1 ms slices, the last few ms precise) | has it (DetClock::PacedSleepUntil, wait_until_precise) |
+| Precise sleeps (1 ms slices, the last few ms precise) | has it (DetClock::PacedSleepUntil, wait_until_precise); macOS spins a wait's last 2 ms (below) |
 | Audio waits for re-runs | has it (card 783) |
 | Input suggestions, fresh pad reads at the loop top | has it (e4259e6b7, 2f8cad8) |
 | Shaders compiled before use / cached across updates | its own: the pipeline recipe cache in UserData (survives updates), boot prewarm on 22 workers (~0.6 s), unready pipelines skipped |
