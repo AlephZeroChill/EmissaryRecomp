@@ -45,11 +45,13 @@ extern std::unordered_set<uint32_t> gOutstandingParks;
 namespace SaveStates {
 namespace {
 
-constexpr std::pair<uint32_t, size_t> kMemoryRegions[] = {
-    {Memory::kMem1CachedBase, Memory::kMem1Size},
-    {Memory::kMem2CachedBase, Memory::kMem2Size},
-    {Memory::kLockedCacheBase, Memory::kLockedCacheSize},
-};
+// Every bank of guest_memory_map.h's table, whole: MEM1's 24-32 MiB tail and MEM2's module homes included.
+constexpr auto kMemoryRegions = [] {
+    std::array<std::pair<uint32_t, size_t>, std::size(GuestMemoryMap::kBanks)> regions{};
+    for (size_t i = 0; i < regions.size(); ++i)
+        regions[i] = {GuestMemoryMap::kBanks[i].primary, GuestMemoryMap::kBanks[i].size};
+    return regions;
+}();
 constexpr size_t kPad = 64u << 10;    // see SwitchFiber
 constexpr size_t kBelow = 512;        // bytes kept below a thread's resume point (its switch frame's spills)
 

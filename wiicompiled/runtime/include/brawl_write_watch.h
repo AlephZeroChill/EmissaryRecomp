@@ -1,6 +1,7 @@
 #pragma once
 #include "brawl_dirty_memory.h"
 #include "brawl_snapshot_jobs.h"
+#include "guest_memory_map.h"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -41,9 +42,13 @@ public:
     }
     WriteWatch(const WriteWatch&)=delete;
     WriteWatch& operator=(const WriteWatch&)=delete;
+    // A guest address's place in the snapshot's physical order and in the lean dirty map: its bank's primary view
+    // (guest_memory_map.h), masked as the lean window masks it, so every view of the same bytes (MEM1's mirrors, the
+    // uncached and physical views) is one key.
+    static uint32_t PhysicalKey(uint32_t guest){return GuestMemoryMap::Canonical(guest)&0x3fffffffu;}
     void Add(const void* host,size_t size,size_t packed,uint32_t guest=0) {
         if(!size)return;
-        const uint32_t physical=guest&0x3fffffffu;
+        const uint32_t physical=PhysicalKey(guest);
         for(const auto& s:spans)if(uint64_t(physical)<uint64_t(s.guest)+s.size && uint64_t(s.guest)<uint64_t(physical)+size)
             throw std::runtime_error("overlapping selected snapshot regions");
         spans.push_back({physical,size,packed});
@@ -55,25 +60,24 @@ public:
         bool registered=false;
         for(const auto& span:BrawlDirtyMemory::hosts) {
             if(hostStart<span.start || hostStart-span.start>span.size || size>span.size-(hostStart-span.start))continue;
-            if(((span.guest+uint32_t(hostStart-span.start))&0x3fffffffu)!=physical)
+            if(PhysicalKey(span.guest+uint32_t(hostStart-span.start))!=physical)
                 throw std::runtime_error("inconsistent guest mapping for host memory");
             registered=true;break;
         }
         if(!registered)BrawlDirtyMemory::hosts.push_back({hostStart,size,guest});
         for(uint64_t addr=uint64_t(guest)&~uint64_t(65535);addr<uint64_t(guest)+size;addr+=65536) {
-            // MEM1/MEM2 physical/cached/uncached aliases share the same mark.
-            const uint32_t canonical=uint32_t(addr)&0x3fffffffu;
-            auto& page=owned[canonical>>16];
-#if MKW_LEAN_MEMORY  // the marks live in BrawlDirtyMemory::leanBlocks at the canonical offset: no Page, no aliases
-            (void)page;
+            // Every view of the same bytes shares their mark (guest_memory_map.h's aliases).
+            auto& page=owned[PhysicalKey(uint32_t(addr))>>16];
+#if MKW_LEAN_MEMORY  // the marks live in BrawlDirtyMemory::leanBlocks at the window offset, which aliases share
+            (void)page;   // (memory.cpp maps one set of marks under every copy of a bank)
 #else
             if(!page)page=std::make_unique<BrawlDirtyMemory::Page>();
             BrawlDirtyMemory::pages[uint32_t(addr)>>16]=page.get();
-            if(canonical<0x20000000u) {
-                BrawlDirtyMemory::pages[canonical>>16]=page.get();
-                BrawlDirtyMemory::pages[(canonical|0x80000000u)>>16]=page.get();
-                BrawlDirtyMemory::pages[(canonical|0xc0000000u)>>16]=page.get();
-            }
+            const GuestMemoryMap::Location at=GuestMemoryMap::Decode(uint32_t(addr));
+            if(at.bank)
+                GuestMemoryMap::ForEachAlias(at.bank->bank,at.offset,[&](uint32_t alias){
+                    BrawlDirtyMemory::pages[alias>>16]=page.get();
+                });
 #endif
         }
         scanPages.clear();

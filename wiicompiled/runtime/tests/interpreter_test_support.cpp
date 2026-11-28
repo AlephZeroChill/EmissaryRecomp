@@ -46,7 +46,12 @@ std::atomic<uint8_t> g_executableWriteGuardPages[kExecutableWriteGuardPageCount]
 std::atomic<uint8_t> g_executableWriteGuardCoarsePages[kExecutableWriteGuardCoarsePageCount]{};
 std::atomic<uint8_t> g_executableWriteGuardMidPages[kExecutableWriteGuardMidPageCount]{};
 uint32_t CurrentTranslatedExecutionAddress() noexcept { return 0; }
-bool HandleExecutableWrite(uint32_t, size_t, uint64_t) { return false; }
+// The address of the last store the checked path reported as one into code (guest_memory_map_tests reads it).
+std::atomic<uint32_t> g_testLastExecutableWrite{0};
+bool HandleExecutableWrite(uint32_t address, size_t, uint64_t) {
+    g_testLastExecutableWrite.store(address, std::memory_order_relaxed);
+    return false;
+}
 void CheckExecutableWrite(uint32_t, size_t, uint64_t) {}
 }
 

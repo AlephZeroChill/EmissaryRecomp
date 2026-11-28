@@ -80,19 +80,20 @@ else()
     set(MKW_BASELINE_ARCH_FLAG "")
 endif()
 
-option(MKW_FLAT_MEMORY "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" ON)
+option(MKW_FLAT_MEMORY "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" OFF)
 if(MKW_PLATFORM_SWITCH AND MKW_FLAT_MEMORY)
     # Horizon has no fixed-address mappings or page-fault handlers for user code.
     set(MKW_FLAT_MEMORY OFF CACHE BOOL "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" FORCE)
 endif()
 
 # MKW_LEAN_MEMORY (include/memory_access.h): every guest access goes to one masked 1 GiB window, with no page table
-# and no fault handler. Horizon's default: src/memory.cpp reserves the window there and backs only the guest regions
-# and the runtime's tables in it (src/platform/horizon.c). Other builds may also define it in CMAKE_CXX_FLAGS.
-if(MKW_PLATFORM_SWITCH)
-    set(MKW_LEAN_MEMORY_DEFAULT ON)
-else()
+# and no fault handler. The default everywhere: src/memory.cpp reserves the window (src/lean_window.cpp) and backs only
+# the guest regions and the runtime's tables in it, MEM1's mirrors as views of MEM1 (Horizon: src/platform/horizon.c,
+# where they stay separate memory). An explicit flat-memory build (-DMKW_FLAT_MEMORY=ON) defaults it off.
+if(MKW_FLAT_MEMORY)
     set(MKW_LEAN_MEMORY_DEFAULT OFF)
+else()
+    set(MKW_LEAN_MEMORY_DEFAULT ON)
 endif()
 option(MKW_LEAN_MEMORY "Use one masked 1 GiB window for guest memory (needs MKW_FLAT_MEMORY=OFF)" ${MKW_LEAN_MEMORY_DEFAULT})
 if(MKW_LEAN_MEMORY AND MKW_FLAT_MEMORY)
@@ -523,7 +524,7 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         CONTENT "#pragma once\n#include <cstdint>\nnamespace RuntimeConfig { inline constexpr uint32_t SDA1_BASE = 0, SDA2_BASE = 0; }\n")
     add_executable(mkw_interpreter_call_forms_tests
         tests/interpreter_call_forms_tests.cpp tests/interpreter_test_support.cpp
-        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp
+        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
         src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
     if(MKW_FLAT_MEMORY)
         target_sources(mkw_interpreter_call_forms_tests PRIVATE src/guest_flat_memory.cpp)
@@ -551,6 +552,36 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         set_tests_properties(mkw_interpreter_${interp_mode}_online_tests PROPERTIES
             ENVIRONMENT "BRAWL_TEST_ONLINE_CORE=1;BRAWL_INTERP=${interp_mode}")
     endforeach()
+
+    # The memory map (include/guest_memory_map.h, Memory::Init) against Dolphin's decode, page by page, and MEM1's
+    # mirrors and tail in use, on the same runtime sources and stubs as the interpreter tests.
+    add_executable(mkw_guest_memory_map_tests
+        tests/guest_memory_map_tests.cpp tests/interpreter_test_support.cpp
+        src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
+        src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
+    if(MKW_FLAT_MEMORY)
+        target_sources(mkw_guest_memory_map_tests PRIVATE src/guest_flat_memory.cpp)
+    endif()
+    target_compile_definitions(mkw_guest_memory_map_tests PRIVATE
+        MKW_LEAN_MEMORY=$<BOOL:${MKW_LEAN_MEMORY}> MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
+    target_include_directories(mkw_guest_memory_map_tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config"
+        "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
+    target_compile_features(mkw_guest_memory_map_tests PRIVATE cxx_std_20)
+    target_compile_options(mkw_guest_memory_map_tests PRIVATE
+        -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+        target_compile_options(mkw_guest_memory_map_tests PRIVATE -march=x86-64-v3)
+    endif()
+    if(APPLE)
+        target_link_options(mkw_guest_memory_map_tests PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(mkw_guest_memory_map_tests PRIVATE -Wl,--gc-sections)
+    endif()
+    target_link_libraries(mkw_guest_memory_map_tests PRIVATE Threads::Threads)
+    set_target_properties(mkw_guest_memory_map_tests PROPERTIES UNITY_BUILD OFF)
+    add_test(NAME mkw_guest_memory_map_tests COMMAND mkw_guest_memory_map_tests)
+    set_tests_properties(mkw_guest_memory_map_tests PROPERTIES TIMEOUT 300)
 endif()
 
 add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")
@@ -636,7 +667,7 @@ if(MKW_TARGET_ARM64)
     add_test(NAME mkw_aarch64_context_abi_tests COMMAND mkw_aarch64_context_abi_tests)
 endif()
 
-if(UNIX)
+if(UNIX AND NOT MKW_LEAN_MEMORY)  # flat memory's fault handling (they build with MKW_FLAT_MEMORY=1)
     foreach(target IN ITEMS mkw_memory_fault_report_tests mkw_mod_fault_report_tests)
         add_executable(${target} "${CMAKE_CURRENT_LIST_DIR}/tests/fault_report_tests.cpp")
         target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
@@ -649,19 +680,6 @@ if(UNIX)
     target_compile_definitions(mkw_mod_fault_report_tests PRIVATE TEST_MOD_FAULT_REPORT=1)
     target_link_libraries(mkw_mod_fault_report_tests PRIVATE mkw::toml11)
 
-    add_executable(mkw_host_fault_context_tests "${CMAKE_CURRENT_LIST_DIR}/tests/host_fault_context_tests.cpp")
-    target_include_directories(mkw_host_fault_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_host_fault_context_tests PRIVATE cxx_std_20)
-    add_test(NAME mkw_host_fault_context_tests COMMAND mkw_host_fault_context_tests)
-    set_tests_properties(mkw_host_fault_context_tests PROPERTIES TIMEOUT 30)
-
-    add_executable(mkw_executable_range_tests "${CMAKE_CURRENT_LIST_DIR}/tests/executable_range_tests.cpp")
-    target_include_directories(mkw_executable_range_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_executable_range_tests PRIVATE cxx_std_20)
-    target_link_libraries(mkw_executable_range_tests PRIVATE Threads::Threads mkw::toml11)
-    add_test(NAME mkw_executable_range_tests COMMAND mkw_executable_range_tests)
-    set_tests_properties(mkw_executable_range_tests PROPERTIES TIMEOUT 30)
-
     add_executable(mkw_guest_flat_memory_tests
         "${CMAKE_CURRENT_LIST_DIR}/tests/guest_flat_memory_tests.cpp")
     target_include_directories(mkw_guest_flat_memory_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
@@ -670,6 +688,32 @@ if(UNIX)
     target_link_libraries(mkw_guest_flat_memory_tests PRIVATE Threads::Threads)
     add_test(NAME mkw_guest_flat_memory_tests COMMAND mkw_guest_flat_memory_tests)
     set_tests_properties(mkw_guest_flat_memory_tests PROPERTIES TIMEOUT 30)
+endif()
+
+if(UNIX)
+    add_executable(mkw_host_fault_context_tests "${CMAKE_CURRENT_LIST_DIR}/tests/host_fault_context_tests.cpp")
+    target_include_directories(mkw_host_fault_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_host_fault_context_tests PRIVATE cxx_std_20)
+    add_test(NAME mkw_host_fault_context_tests COMMAND mkw_host_fault_context_tests)
+    set_tests_properties(mkw_host_fault_context_tests PROPERTIES TIMEOUT 30)
+
+    # The lean window's OS calls (src/lean_window.cpp) with MEM1's mirror layout; the second variant takes the backing
+    # file path macOS uses instead of memfd.
+    foreach(target IN ITEMS mkw_lean_window_tests mkw_lean_window_file_tests)
+        add_executable(${target} "${CMAKE_CURRENT_LIST_DIR}/tests/lean_window_tests.cpp")
+        target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 30)
+    endforeach()
+    target_compile_definitions(mkw_lean_window_file_tests PRIVATE MKW_LEAN_WINDOW_NO_MEMFD=1)
+
+    add_executable(mkw_executable_range_tests "${CMAKE_CURRENT_LIST_DIR}/tests/executable_range_tests.cpp")
+    target_include_directories(mkw_executable_range_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_executable_range_tests PRIVATE cxx_std_20)
+    target_link_libraries(mkw_executable_range_tests PRIVATE Threads::Threads mkw::toml11)
+    add_test(NAME mkw_executable_range_tests COMMAND mkw_executable_range_tests)
+    set_tests_properties(mkw_executable_range_tests PROPERTIES TIMEOUT 30)
 endif()
 
 if(MKW_PLATFORM_MACOS)
