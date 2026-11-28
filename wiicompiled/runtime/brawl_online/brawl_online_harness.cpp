@@ -492,6 +492,31 @@ Object Dispatch(const std::string& cmd, const Object& a) {
         return r;
     }
     if (cmd == "gprb_status") return Gprb::Session::Status().get<Object>();
+    // Dolphin's HarnessServer.cpp CmdGprbSyncTest / CmdGprbStop, the same core calls: a GekkoNet stress session (or a
+    // pass log's replay) on this game, so the sync tests and rollback benchmarks run on both engines.
+    if (cmd == "gprb_synctest") {
+        Gprb::Session::SyncTestOptions o;
+        o.distance = int(U64(a, "distance", 2));
+        if (Find(a, "region_set")) o.region_set = Str(a, "region_set");
+        o.hash_regions = Bool(a, "hash_regions", true);
+        o.start_frame = static_cast<u32>(U64(a, "start_frame", o.start_frame));
+        o.ports = static_cast<u32>(U64(a, "ports", 3));
+        o.suppress_resim_sounds = Bool(a, "suppress_resim_sounds", false);
+        o.dedupe_resim_sounds = Bool(a, "dedupe_resim_sounds", false);
+        o.inject_input = Bool(a, "inject_input", false);
+        o.mispredict_ports = static_cast<u32>(U64(a, "mispredict_ports", 0));
+        if (const picojson::value* v = Find(a, "mispredict_offset"); v && v->is<double>())
+            o.mispredict_offset = int(v->get<double>());  // signed (U64 takes no negative numbers)
+        o.mispredict_every = int(U64(a, "mispredict_every", 1));
+        if (Find(a, "replay_path")) o.replay_path = Str(a, "replay_path");
+        o.no_rollback = Bool(a, "no_rollback", false);
+        if (const auto err = Gprb::Session::ArmSyncTest(o)) throw Error(*err);
+        return Gprb::Session::Status().get<Object>();
+    }
+    if (cmd == "gprb_stop") {
+        Gprb::Session::Stop();
+        return Gprb::Session::Status().get<Object>();
+    }
     // The online tests' comparisons (Dolphin's HarnessServer.cpp, the same core calls).
     if (cmd == "gprb_checksums")
         return Gprb::Session::Checksums(static_cast<s64>(U64(a, "since", 0))).get<Object>();

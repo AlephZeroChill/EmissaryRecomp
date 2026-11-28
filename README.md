@@ -186,6 +186,7 @@ Run-time switches (environment variables; the default is the optimized path):
 | `AXFX_ASYNC` | on with `MKW_EABI_REGS`, else off | `0`/`1` to run the reverb and delay on the game thread or a worker |
 | `BRAWL_GX_DMA_FULL` | off | `1` to check every DMA write against tracked GX data |
 | `BRAWL_RESIM_HIDE` | `2` | `0` to draw re-simulated rollback frames in full |
+| `BRAWL_UNTHROTTLED` | off | `1` to run online play's clock as fast as the game goes (benchmarks: `tools/rollback_bench`) |
 
 The translator's tests are described in [`wiicompiled/translator/tests/README.md`](wiicompiled/translator/tests/README.md).
 
