@@ -7,8 +7,9 @@
 //      A fused pair writes the compare's CR field, then branches on the host flags of the compare when the bc tests lt, gt or eq
 //      of the field just written (else it tests the CR bit in memory).
 //  B:  native when its target is no translated function and no code variant can continue there (ExitLinked); a tail call
-//      to a translated function is JitThinTail (JitTailOp in the rollback loop frame); with code variants possible, or the
-//      registry not yet published, the fallback (RunOp asks ContinuationAt on every execution, which a block cannot settle).
+//      to a translated function is JitThinTail (JitTailOp in the rollback loop frame); to a target a code variant is keyed at,
+//      or before the registry is published, the fallback (RunOp asks ContinuationAt on every execution, and its answer there
+//      follows guest memory).
 //  Bl: native when the site was resolved at decode, the target is untranslated and runnable: lr and the loop-frame test
 //      inline, then ExitLinked. A translated target with a raw dispatch record: lr, pc and the loop-frame test inline (the
 //      loop frame goes the general way), the callee's float arguments tested in line, then JitThinCall with the target's
@@ -526,9 +527,9 @@ void EmitTailResult(BlockEmitter& e) {
 uint32_t EmitB(BlockEmitter& e, uint32_t index) {
     CodeGenerator& a = e.a;
     const Op& o = e.block.ops[index];
-    // RunOp asks GuestCodePatch::ContinuationAt on every execution. Never non-null in a process without code variants
-    // (or with them switched off); an answer that is non-null now is for the fallback (a stub answers by address alone).
-    if (JitContinuationsPossible() || JitContinuationAt(o.imm)) return e.EmitFallback(index);
+    // RunOp asks GuestCodePatch::ContinuationAt on every execution, and its answer follows guest memory: a target some code
+    // variant is keyed at goes to the fallback; any other target can never be a continuation.
+    if (JitContinuationPossibleAt(o.imm)) return e.EmitFallback(index);
     bool translated;
     if (o.b != 0) translated = o.b == 1;
     else if (TranslatedFunctionRegistry::IsLookupPublished()) translated = TranslatedFunctionRegistry::FindByAddressPtr(o.imm) != nullptr;
