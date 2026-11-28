@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rollback benchmark of EmissaryRecomp against Brawl Online's Dolphin, driven by Brawl Online replays (.brep).
 
-Both engines run Brawl Online's core (brawlonline.net core/): Dolphin through DolphinEngine (the emissary-brawlonline
-branch builds Dolphin against core/), EmissaryRecomp through RecompEngine. The session code that decides every save,
+Both engines run Brawl Online's core (brawlonline.net core/): Dolphin through DolphinEngine (brawlonline.net main
+builds Dolphin against core/), EmissaryRecomp through RecompEngine. The session code that decides every save,
 load and re-run is the same; only the engine under it differs.
 
 A run plays a replay: the core's playback rebuilds the recorded match from the file (its setup, seeds and countdown),
@@ -821,7 +821,7 @@ def main():
     i = sub.add_parser("instrument", help="put the probe and the replay hand-over into a core checkout")
     i.add_argument("core", type=Path)
     b = sub.add_parser("dolphin-build")
-    b.add_argument("--ref", default="origin/emissary-brawlonline")
+    b.add_argument("--ref", default="origin/main")
     b.add_argument("--jobs", type=int, default=16)
     pr = sub.add_parser("prepare", help="set up both engines from a Brawl Online install")
     pr.add_argument("--recomp", type=Path, default=ROOT / "build/rbbench/native")

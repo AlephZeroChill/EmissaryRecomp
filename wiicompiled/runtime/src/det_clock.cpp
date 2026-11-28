@@ -151,7 +151,10 @@ void AdvanceTo(uint64_t ticks) noexcept {
 void PaceTo(uint64_t ticks, bool frameBoundary) {
     // BRAWL_UNTHROTTLED=1 (benchmarks): the timeline runs as fast as the game does, never waiting for real time, as
     // Dolphin's Core.EmulationSpeed = 0. Only when frames come to the screen changes, not what the game sees.
-    static const bool unthrottled = std::getenv("BRAWL_UNTHROTTLED") != nullptr;
+    static const bool unthrottled = [] {
+        const char* v = std::getenv("BRAWL_UNTHROTTLED");
+        return v != nullptr && *v != '\0' && *v != '0';  // BRAWL_UNTHROTTLED=0 (or empty) keeps real-time pacing
+    }();
     if (g_resimulating || unthrottled) return;
     const auto now = Clock::now();
     if (!g_anchored || ticks < g_anchorTicks || g_loadWait) {

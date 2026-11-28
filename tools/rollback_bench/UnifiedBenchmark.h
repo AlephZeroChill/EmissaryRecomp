@@ -1,10 +1,11 @@
 // Benchmark-only probe, copied into isolated historical Dolphin checkouts.
 // It changes no emulated state. All disk I/O occurs after the measurement window.
 //
-// EmissaryRecomp's tools/rollback_bench: brawlonline.net harness/tools/rollback_benchmark_probe.h (sha256 935f400b),
-// unchanged above TimedSave/TimedLoad at the end, which time the core's engine calls (Engine::SaveFrame/LoadFrame:
-// Dolphin's RollbackManager behind DolphinEngine, or EmissaryRecomp's snapshot store behind RecompEngine) with the
-// same Span the historical runs put inside RollbackManager::SaveFrame/LoadFrame.
+// EmissaryRecomp's tools/rollback_bench: bench.py copies this one file into both engines' core checkouts (the recomp's
+// and the Dolphin worktree's), so both are timed by the same code. TimedSave/TimedLoad at the end time the core's
+// engine calls (Engine::SaveFrame/LoadFrame: Dolphin's RollbackManager behind DolphinEngine, or EmissaryRecomp's
+// snapshot store behind RecompEngine) with the same Span the historical runs put inside
+// RollbackManager::SaveFrame/LoadFrame.
 #pragma once
 
 #include <utility>

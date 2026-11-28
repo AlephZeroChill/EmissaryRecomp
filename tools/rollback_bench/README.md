@@ -5,7 +5,7 @@
 them again with the recorded inputs. Both engines time this with the same probe (`UnifiedBenchmark.h`), and every run
 must match the replay's own checksums. See the docstring in `bench.py` for details.
 
-Linux only. It needs a brawlonline.net checkout at `../brawlonline.net` (with `origin/emissary-brawlonline` fetched
+Linux only. It needs a brawlonline.net checkout at `../brawlonline.net` (with `origin/main` fetched
 and its harness's `run/template-user`), and a Brawl Online install for its online card and netplay save.
 
 ```sh
