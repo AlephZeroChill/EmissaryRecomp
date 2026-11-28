@@ -48,6 +48,7 @@ Each release has these assets:
 | Asset | What it is |
 |---|---|
 | `EmissaryRecomp-<tag>-Windows.zip` | Windows x86-64 |
+| `EmissaryRecomp-<tag>-Windows-OldCPU.zip` | only `EmissaryRecomp/engine_usa_v2.dll`, the engine for processors without AVX2/FMA, unzipped over the Windows download (below) |
 | `EmissaryRecomp-<tag>-Linux.tar.gz` | Linux x86-64, glibc 2.38+ (Ubuntu 24.04, Debian 13, SteamOS 3.6, Fedora 39, Arch...) |
 | `EmissaryRecomp-<tag>-macOS.tar.gz` | macOS 12+ on Apple silicon (arm64); built on a Mac (`--platforms macos`; CI's `macos-15` job) |
 | `manifest.json` | what the release is, and the archives' sizes and sha256 |
@@ -62,7 +63,7 @@ the player's settings, saves and logs above the version folders):
 EmissaryRecomp/
   WiiCompiled.exe        Windows: the loader; it starts engine_usa.dll, or engine_usa_v2.dll on a CPU without AVX2/FMA
   engine_usa.dll         the game (x86-64-v3)                                       (Windows)
-  engine_usa_v2.dll      the game for older CPUs (x86-64-v2)                        (Windows)
+  engine_usa_v2.dll      the game for older CPUs (x86-64-v2): only in -Windows-OldCPU.zip (Windows)
   SDL3.dll, libc++.dll, libunwind.dll, libpng16.dll, libz.dll                      (Windows; Windows' own UCRT)
   WiiCompiled            Linux: the program (RUNPATH $ORIGIN)                        (Linux)
   lib*.so*               any library the build made itself (none today: it needs only libz, glibc, libstdc++) (Linux)
@@ -78,6 +79,19 @@ EmissaryRecomp/
   release.json           the manifest without the assets (what this folder is)
   README.txt, LICENSE.txt, CREDITS.txt, licenses/
 ```
+
+### The older CPUs' engine
+
+Each Windows engine is about 245 MB (84 MB compressed), and only processors without x86-64-v3 (before Intel's Haswell
+and AMD's Excavator: about 1% of Brawl Online's players) need `engine_usa_v2.dll`, so it is a download of its own.
+The loader decides with the same check the engines make of the processor themselves
+(`wiicompiled/runtime/include/host_isa_features.h`, used by `host_cpu_baseline.cpp` and `engine_loader.cpp`):
+
+- `WiiCompiled.exe --engine` prints the engine it starts on this computer (`engine_usa.dll` or `engine_usa_v2.dll`,
+  the second also with `BRAWL_ENGINE_V2` set) and exits without loading it. Brawl Online's launcher asks before every
+  start and downloads `-Windows-OldCPU.zip` when the answer is a file the version's folder lacks (or when the
+  loader gives no answer), so an install moved to another computer gets it too.
+- Started without the engine it needs, the loader says which file is missing and where it comes from.
 
 No disc data, settings, saves, SD card or `portable.txt` is in a download (`tools/release.py` refuses to package one):
 the player's own disc is extracted by the launcher, and the game reads it through `UserData/Config.toml`'s
@@ -101,6 +115,8 @@ the player's own disc is extracted by the launcher, and the game reads it throug
   "platforms": {
     "windows": { "asset": "EmissaryRecomp-v0.7.0-rc.1-Windows.zip", "size": 0, "sha256": "...",
                  "program": "EmissaryRecomp/WiiCompiled.exe" },
+    "windows-oldcpu": { "asset": "EmissaryRecomp-v0.7.0-rc.1-Windows-OldCPU.zip", "size": 0, "sha256": "...",
+                        "file": "EmissaryRecomp/engine_usa_v2.dll" },
     "linux": { "asset": "EmissaryRecomp-v0.7.0-rc.1-Linux.tar.gz", "size": 0, "sha256": "...",
                "program": "EmissaryRecomp/WiiCompiled" }
   }

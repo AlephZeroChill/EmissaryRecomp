@@ -1,12 +1,13 @@
 // Windows launcher for Brawl's engine_usa.dll and optional engine_usa_v2.dll.
 #include <windows.h>
-#include <cpuid.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 
 #include "../../include/hang_dump_helper.h"
+#include "../../include/host_isa_features.h"
 
 namespace fs = std::filesystem;
 
@@ -20,27 +21,48 @@ fs::path ExeDirectory() {
 
 } // namespace
 
-// The usual engine needs x86-64-v3 (AVX2, FMA, BMI2...); older processors get engine_<region>_v2.dll when it is there.
+// The usual engine needs x86-64-v3 (AVX2, FMA, BMI2...): exactly the check that engine makes of the processor itself
+// (host_isa_features.h). Older processors get engine_<region>_v2.dll.
 bool HostHasV3() {
-    unsigned a = 0, b = 0, c = 0, d = 0;
-    __cpuid_count(1, 0, a, b, c, d);
-    const bool fma = (c >> 12) & 1, osxsave = (c >> 27) & 1, avx = (c >> 28) & 1, movbe = (c >> 22) & 1, f16c = (c >> 29) & 1;
-    if (!(fma && osxsave && avx && movbe && f16c)) return false;
-    unsigned lo = 0, hi = 0;
-    __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-    if ((lo & 6u) != 6u) return false;
-    __cpuid_count(7, 0, a, b, c, d);
-    return ((b >> 5) & 1) && ((b >> 3) & 1) && ((b >> 8) & 1);  // AVX2, BMI1, BMI2
+    return host_isa::Check(3, [](const char*) {});
+}
+
+// The engine this processor plays with: engine_usa_v2.dll without x86-64-v3 or with BRAWL_ENGINE_V2 set, else
+// engine_usa.dll. Releases ship engine_usa_v2.dll on its own (EmissaryRecomp-<tag>-Windows-OldCPU.zip), so it may
+// not be in the folder.
+bool WantsOldCpuEngine() {
+    return std::getenv("BRAWL_ENGINE_V2") != nullptr || !HostHasV3();
 }
 
 int main(int argc, char** argv) {
     // The hang watchdog's dump of a running game (hang_dump_helper.h): no engine needed.
     if (const int dumped = HangDumpHelper::Run(argc, argv); dumped >= 0) return dumped;
+    const bool oldCpu = WantsOldCpuEngine();
+    const wchar_t* name = oldCpu ? L"engine_usa_v2.dll" : L"engine_usa.dll";
+    // `WiiCompiled --engine`: prints the engine's file name and exits, loading nothing. Brawl Online's launcher asks
+    // before every start and downloads engine_usa_v2.dll when this names it and the folder lacks it.
+    if (argc >= 2 && std::strcmp(argv[1], "--engine") == 0) {
+        const char* text = oldCpu ? "engine_usa_v2.dll\n" : "engine_usa.dll\n";
+        const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written = 0;
+        if (out == nullptr || out == INVALID_HANDLE_VALUE ||
+            !WriteFile(out, text, static_cast<DWORD>(std::strlen(text)), &written, nullptr)) {
+            return 2;
+        }
+        return 0;
+    }
     const fs::path exeDir = ExeDirectory();
-    fs::path module = exeDir / "engine_usa.dll";
-    const fs::path oldCpu = exeDir / "engine_usa_v2.dll";
+    const fs::path module = exeDir / name;
     std::error_code ec;
-    if ((std::getenv("BRAWL_ENGINE_V2") != nullptr || !HostHasV3()) && fs::exists(oldCpu, ec)) module = oldCpu;
+    if (oldCpu && !fs::exists(module, ec)) {
+        const std::wstring message =
+            L"This processor plays with engine_usa_v2.dll (the engine for processors without AVX2), which is not in "
+            L"this folder:\n" + exeDir.wstring() +
+            L"\n\nBrawl Online's launcher downloads it before it starts the game. If you downloaded EmissaryRecomp "
+            L"yourself, unzip EmissaryRecomp-<version>-Windows-OldCPU.zip from the same release into this folder too.";
+        MessageBoxW(nullptr, message.c_str(), L"Emissary", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     HMODULE engine = LoadLibraryExW(module.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     auto entry = engine ? reinterpret_cast<int (*)(int, char**)>(GetProcAddress(engine, "SDL_main")) : nullptr;
     if (!entry) {

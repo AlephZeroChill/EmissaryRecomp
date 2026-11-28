@@ -16,66 +16,18 @@
 #include <unistd.h>
 #endif
 
+#include "../include/host_isa_features.h"
+
 namespace {
 
-void HostCpuId(unsigned leaf, unsigned subleaf, unsigned regs[4]) {
-    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-    __cpuid_count(leaf, subleaf, eax, ebx, ecx, edx);
-    regs[0] = eax;
-    regs[1] = ebx;
-    regs[2] = ecx;
-    regs[3] = edx;
-}
-
-unsigned HostCpuIdMaxLeaf(unsigned base) {
-    unsigned regs[4] = {0, 0, 0, 0};
-    HostCpuId(base, 0, regs);
-    return regs[0];
-}
-
-// XGETBV through inline assembly rather than the _xgetbv intrinsic: the GNU
-// driver gates that intrinsic behind -mxsave, which this file is specifically
-// compiled without. Only reachable once CPUID has reported OSXSAVE.
-uint64_t ReadXcr0() {
-    unsigned eax = 0, edx = 0;
-    __asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
-    return (static_cast<uint64_t>(edx) << 32) | eax;
-}
-
-struct CpuFeature {
-    const char* name;
-    unsigned leaf;
-    unsigned subleaf;
-    unsigned reg;  // index into the eax/ebx/ecx/edx array filled by HostCpuId
-    unsigned bit;
-    bool isOsXsave;
-};
-
-// Match the selected compiler baseline and name each missing feature.
-// SSE2 is architectural in x86-64; v2 and v3 add optional feature groups.
-constexpr CpuFeature kRequiredFeatures[] = {
-    {"SSE2", 1, 0, 3, 26, false},
-#if !defined(MKW_HOST_ISA_V1)
-    {"SSE3", 1, 0, 2, 0, false},
-    {"SSSE3", 1, 0, 2, 9, false},
-    {"CMPXCHG16B", 1, 0, 2, 13, false},
-    {"SSE4.1", 1, 0, 2, 19, false},
-    {"SSE4.2", 1, 0, 2, 20, false},
-    {"POPCNT", 1, 0, 2, 23, false},
-    {"LAHF-SAHF", 0x80000001u, 0, 2, 0, false},
-#if !defined(MKW_HOST_ISA_V2)
-    {"FMA", 1, 0, 2, 12, false},
-    {"MOVBE", 1, 0, 2, 22, false},
-    {"OSXSAVE", 1, 0, 2, 27, true},
-    {"AVX", 1, 0, 2, 28, false},
-    {"F16C", 1, 0, 2, 29, false},
-    {"BMI1", 7, 0, 1, 3, false},
-    {"AVX2", 7, 0, 1, 5, false},
-    {"BMI2", 7, 0, 1, 8, false},
-    {"LZCNT", 0x80000001u, 0, 2, 5, false},
+// The selected compiler baseline (host_isa_features.h names each level's features).
+#if defined(MKW_HOST_ISA_V1)
+constexpr int kHostIsaLevel = 1;
+#elif defined(MKW_HOST_ISA_V2)
+constexpr int kHostIsaLevel = 2;
+#else
+constexpr int kHostIsaLevel = 3;
 #endif
-#endif
-};
 
 // Fixed-capacity text accumulation: no allocation, no exceptions, nothing that
 // could route through code this file is trying to stay ahead of.
@@ -97,48 +49,14 @@ struct TextBuffer {
 // True when the host can run this build. Otherwise `missing` holds the absent
 // feature names, comma separated.
 bool CollectMissingBaselineFeatures(TextBuffer& missing) {
-    const unsigned maxBasic = HostCpuIdMaxLeaf(0);
-    const unsigned maxExtended = HostCpuIdMaxLeaf(0x80000000u);
-
-    bool ok = true;
-    bool haveOsXsave = false;
-
-    for (const CpuFeature& feature : kRequiredFeatures) {
-        const bool leafAvailable = (feature.leaf & 0x80000000u) != 0
-                                       ? feature.leaf <= maxExtended
-                                       : feature.leaf <= maxBasic;
-
-        bool present = false;
-        if (leafAvailable) {
-            unsigned regs[4] = {0, 0, 0, 0};
-            HostCpuId(feature.leaf, feature.subleaf, regs);
-            present = (regs[feature.reg] & (1u << feature.bit)) != 0;
-        }
-
-        if (present) {
-            haveOsXsave = haveOsXsave || feature.isOsXsave;
-            continue;
-        }
-
-        if (!ok) {
+    bool first = true;
+    return host_isa::Check(kHostIsaLevel, [&](const char* name) {
+        if (!first) {
             missing.Append(", ");
         }
-        missing.Append(feature.name);
-        ok = false;
-    }
-
-    // CPUID reporting AVX is not sufficient: the OS also has to have enabled
-    // XMM and YMM state saving or every VEX-encoded instruction faults. This is
-    // the same guard a compiler's own runtime feature dispatch applies.
-    if (ok && haveOsXsave) {
-        constexpr uint64_t kXmmAndYmmState = 0x6u;
-        if ((ReadXcr0() & kXmmAndYmmState) != kXmmAndYmmState) {
-            missing.Append("operating system support for AVX register state (XCR0 YMM bits)");
-            ok = false;
-        }
-    }
-
-    return ok;
+        missing.Append(name);
+        first = false;
+    });
 }
 
 // stdio is NOT usable from a .CRT$XIC initializer - the UCRT has not stood it

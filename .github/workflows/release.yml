@@ -1,6 +1,6 @@
 # EmissaryRecomp releases with Brawl Online's online core (docs/releases.md): both Windows engines, the Linux program
 # and the macOS one (Apple silicon), built on GitHub's own runners (macOS: Sarah's Mac when it is there, see mac-runner); the downloads EmissaryRecomp-<tag>-Windows.zip /
-# -Linux.tar.gz / -macOS.tar.gz,
+# -Windows-OldCPU.zip (engine_usa_v2.dll alone) / -Linux.tar.gz / -macOS.tar.gz,
 # manifest.json and SHA256SUMS, published as the GitHub release <tag>. A tag with a suffix (v0.7.0-rc.1) is a
 # prerelease; a release is published without becoming /releases/latest (what launchers install) until a maintainer
 # makes it so (gh release edit <tag> --latest).
