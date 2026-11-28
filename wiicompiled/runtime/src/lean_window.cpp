@@ -21,6 +21,10 @@ extern "C" uint32_t HorizonLeanWindowBack(uint8_t* target, uint64_t size);
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #endif
 
 namespace LeanWindow {
@@ -127,11 +131,23 @@ bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* e
     const int fd = memfd_create("lean-guest-memory", MFD_CLOEXEC);
     if (fd < 0) return fail("memfd_create", fd);
 #else
-    // POSIX hosts without memfd_create (macOS): an unlinked temporary file.
-    char path[] = "/tmp/lean-guest-memory-XXXXXX";
-    const int fd = mkstemp(path);
-    if (fd < 0) return fail("mkstemp", fd);
-    if (unlink(path) != 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return fail("preparing the backing file", fd);
+    // POSIX hosts without memfd_create (macOS): a POSIX shared memory object, unlinked at once, as Dolphin's
+    // MemArenaUnix backs its views. A file would do too, but its pages are the disk's: paged out to the file under memory
+    // pressure, and a SIGBUS when the disk is too full to give them blocks. A temporary file only if shm_open fails.
+    static std::atomic<unsigned> s_objects{0};
+    char name[32];  // macOS allows 31 characters
+    std::snprintf(name, sizeof(name), "/lean-%d-%u", static_cast<int>(getpid()), s_objects.fetch_add(1));
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        shm_unlink(name);
+    } else {
+        const char* const tmp = std::getenv("TMPDIR");
+        std::string path = std::string(tmp != nullptr && *tmp != '\0' ? tmp : "/tmp") + "/lean-guest-memory-XXXXXX";
+        fd = mkstemp(path.data());
+        if (fd < 0) return fail("shm_open and mkstemp", fd);
+        unlink(path.c_str());
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return fail("preparing the shared memory", fd);
 #endif
     if (ftruncate(fd, static_cast<off_t>(size)) != 0) return fail("ftruncate", fd);
     for (int i = 0; i < count; ++i) {

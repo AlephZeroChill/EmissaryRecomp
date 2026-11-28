@@ -697,8 +697,8 @@ if(UNIX)
     add_test(NAME mkw_host_fault_context_tests COMMAND mkw_host_fault_context_tests)
     set_tests_properties(mkw_host_fault_context_tests PROPERTIES TIMEOUT 30)
 
-    # The lean window's OS calls (src/lean_window.cpp) with MEM1's mirror layout; the second variant takes the backing
-    # file path macOS uses instead of memfd.
+    # The lean window's OS calls (src/lean_window.cpp) with MEM1's mirror layout; the second variant takes the shared memory
+    # object (or temporary file) macOS uses instead of memfd.
     foreach(target IN ITEMS mkw_lean_window_tests mkw_lean_window_file_tests)
         add_executable(${target} "${CMAKE_CURRENT_LIST_DIR}/tests/lean_window_tests.cpp")
         target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
